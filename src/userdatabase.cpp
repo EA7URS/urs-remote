@@ -8,6 +8,7 @@
 #include <QRegularExpression>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QSet>
 #include <QVariant>
 #include <cstring>
 
@@ -78,6 +79,44 @@ QString queryError(const QSqlQuery &query)
 {
     return query.lastError().text();
 }
+
+bool validProfile(const QJsonObject &profile, bool includeEmail, QString *error)
+{
+    static const QRegularExpression validEmail(QStringLiteral("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"));
+    const QString userId = UserDatabase::normalizedUserId(profile.value(QStringLiteral("userId")).toString());
+    static const QRegularExpression validId(QStringLiteral("^[A-Z0-9][A-Z0-9._-]{0,31}$"));
+    if (!validId.match(userId).hasMatch()) {
+        if (error) *error = QStringLiteral("El indicativo debe tener entre 1 y 32 letras, números, puntos, guiones o guiones bajos.");
+        return false;
+    }
+    const QStringList required = {QStringLiteral("firstName"), QStringLiteral("lastName"),
+                                  QStringLiteral("street"), QStringLiteral("city"),
+                                  QStringLiteral("postalCode")};
+    for (const QString &field : required) {
+        const QString value = profile.value(field).toString().trimmed();
+        if (value.isEmpty() || value.size() > 120) {
+            if (error) *error = QStringLiteral("Completa los campos obligatorios del perfil (máximo 120 caracteres por campo).");
+            return false;
+        }
+    }
+    if (profile.value(QStringLiteral("province")).toString().trimmed().size() > 120) {
+        if (error) *error = QStringLiteral("La provincia no puede superar 120 caracteres.");
+        return false;
+    }
+    if (includeEmail) {
+        const QString email = profile.value(QStringLiteral("email")).toString().trimmed();
+        if (email.size() > 254 || !validEmail.match(email).hasMatch()) {
+            if (error) *error = QStringLiteral("Introduce una dirección de correo válida.");
+            return false;
+        }
+    }
+    const QString role = profile.value(QStringLiteral("operationalProfile")).toString();
+    if (!role.isEmpty() && role != QLatin1String("licensed") && role != QLatin1String("capture")) {
+        if (error) *error = QStringLiteral("El perfil operativo no es válido.");
+        return false;
+    }
+    return true;
+}
 }
 
 UserDatabase::~UserDatabase()
@@ -114,6 +153,7 @@ bool UserDatabase::open(const QString &path, QString *error)
     pragma.exec(QStringLiteral("PRAGMA foreign_keys = ON"));
     pragma.exec(QStringLiteral("PRAGMA journal_mode = WAL"));
     pragma.exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
+    pragma.finish();
 
     if (!createSchema(error) || !seedInitialAdmin(error)) return false;
     QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
@@ -131,6 +171,14 @@ bool UserDatabase::createSchema(QString *error)
             "password_hash TEXT NOT NULL, "
             "is_admin INTEGER NOT NULL DEFAULT 0, "
             "must_change_password INTEGER NOT NULL DEFAULT 0, "
+            "operational_profile TEXT NOT NULL DEFAULT 'licensed', "
+            "first_name TEXT NOT NULL DEFAULT '', "
+            "last_name TEXT NOT NULL DEFAULT '', "
+            "email TEXT NOT NULL DEFAULT '', "
+            "street TEXT NOT NULL DEFAULT '', "
+            "city TEXT NOT NULL DEFAULT '', "
+            "postal_code TEXT NOT NULL DEFAULT '', "
+            "province TEXT NOT NULL DEFAULT '', "
             "created_at INTEGER NOT NULL)"))) {
         if (error) *error = queryError(query);
         return false;
@@ -138,12 +186,93 @@ bool UserDatabase::createSchema(QString *error)
     if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS sessions ("
             "token_hash BLOB PRIMARY KEY, "
-            "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, "
+            "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, "
             "expires_at INTEGER NOT NULL)"))) {
         if (error) *error = queryError(query);
         return false;
     }
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id)"));
+    return migrateSchema(error);
+}
+
+bool UserDatabase::migrateSchema(QString *error)
+{
+    QSet<QString> columns;
+    QSqlQuery info(db_);
+    if (!info.exec(QStringLiteral("PRAGMA table_info(users)"))) {
+        if (error) *error = queryError(info);
+        return false;
+    }
+    while (info.next()) columns.insert(info.value(1).toString());
+    info.finish();
+
+    const QList<QPair<QString, QString>> additions = {
+        {QStringLiteral("operational_profile"), QStringLiteral("TEXT NOT NULL DEFAULT 'licensed'")},
+        {QStringLiteral("first_name"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("last_name"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("email"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("street"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("city"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("postal_code"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("province"), QStringLiteral("TEXT NOT NULL DEFAULT ''")}
+    };
+    for (const auto &column : additions) {
+        if (columns.contains(column.first)) continue;
+        QSqlQuery alter(db_);
+        if (!alter.exec(QStringLiteral("ALTER TABLE users ADD COLUMN %1 %2")
+                        .arg(column.first, column.second))) {
+            if (error) *error = queryError(alter);
+            return false;
+        }
+    }
+
+    QSqlQuery tableSql(db_);
+    tableSql.exec(QStringLiteral("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"));
+    const QString currentSql = tableSql.next() ? tableSql.value(0).toString() : QString();
+    tableSql.finish();
+    if (currentSql.contains(QStringLiteral("ON UPDATE CASCADE"), Qt::CaseInsensitive))
+        return true;
+
+    // User IDs are editable callsigns. Rebuild sessions once with a cascading
+    // foreign key so those changes preserve valid session tokens.
+    QSqlQuery foreignKeysOff(db_);
+    if (!foreignKeysOff.exec(QStringLiteral("PRAGMA foreign_keys = OFF"))) {
+        if (error) *error = queryError(foreignKeysOff);
+        return false;
+    }
+    foreignKeysOff.finish();
+    if (!db_.transaction()) {
+        if (error) *error = db_.lastError().text();
+        QSqlQuery on(db_); on.exec(QStringLiteral("PRAGMA foreign_keys = ON"));
+        return false;
+    }
+    const QStringList migration = {
+        QStringLiteral("ALTER TABLE sessions RENAME TO sessions_before_profile_migration"),
+        QStringLiteral("CREATE TABLE sessions (token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, expires_at INTEGER NOT NULL)"),
+        QStringLiteral("INSERT INTO sessions(token_hash, user_id, expires_at) SELECT token_hash, user_id, expires_at FROM sessions_before_profile_migration"),
+        QStringLiteral("DROP TABLE sessions_before_profile_migration"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id)")
+    };
+    for (const QString &statement : migration) {
+        QSqlQuery step(db_);
+        if (!step.exec(statement)) {
+            if (error) *error = queryError(step);
+            db_.rollback();
+            QSqlQuery on(db_); on.exec(QStringLiteral("PRAGMA foreign_keys = ON"));
+            return false;
+        }
+    }
+    if (!db_.commit()) {
+        if (error) *error = db_.lastError().text();
+        db_.rollback();
+        QSqlQuery on(db_); on.exec(QStringLiteral("PRAGMA foreign_keys = ON"));
+        return false;
+    }
+    QSqlQuery foreignKeysOn(db_);
+    if (!foreignKeysOn.exec(QStringLiteral("PRAGMA foreign_keys = ON"))) {
+        if (error) *error = queryError(foreignKeysOn);
+        return false;
+    }
     return true;
 }
 
@@ -201,7 +330,7 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
 {
     const QString id = normalizedUserId(userId);
     QSqlQuery query(db_);
-    query.prepare(QStringLiteral("SELECT user_id, password_hash, is_admin, must_change_password "
+    query.prepare(QStringLiteral("SELECT user_id, password_hash, is_admin, must_change_password, operational_profile "
                                  "FROM users WHERE user_id = ?"));
     query.addBindValue(id);
     if (!query.exec()) return false;
@@ -218,6 +347,7 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
         user->userId = query.value(0).toString();
         user->isAdmin = query.value(2).toInt() != 0;
         user->mustChangePassword = query.value(3).toInt() != 0;
+        user->operationalProfile = query.value(4).toString();
         user->authenticated = true;
     }
     return true;
@@ -255,7 +385,7 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     if (token.isEmpty()) return user;
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
-        "SELECT u.user_id, u.is_admin, u.must_change_password, s.expires_at "
+        "SELECT u.user_id, u.is_admin, u.must_change_password, s.expires_at, u.operational_profile "
         "FROM sessions s JOIN users u ON u.user_id = s.user_id "
         "WHERE s.token_hash = ? AND s.expires_at > ?"));
     query.addBindValue(tokenHash(token));
@@ -265,6 +395,7 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     user.isAdmin = query.value(1).toInt() != 0;
     user.mustChangePassword = query.value(2).toInt() != 0;
     user.sessionExpiresAt = query.value(3).toLongLong();
+    user.operationalProfile = query.value(4).toString();
     user.authenticated = true;
     return user;
 }
@@ -283,26 +414,32 @@ bool UserDatabase::changePassword(const QString &userId, const QString &password
     return true;
 }
 
-bool UserDatabase::createUser(const QString &userId, const QString &password,
+bool UserDatabase::createUser(const QJsonObject &profileData, const QString &password,
                               bool makeAdmin, QString *error)
 {
-    const QString id = normalizedUserId(userId);
-    static const QRegularExpression validId(QStringLiteral("^[A-Z0-9][A-Z0-9._-]{0,31}$"));
-    if (!validId.match(id).hasMatch()) {
-        if (error) *error = QStringLiteral("User ID must use 1-32 letters, numbers, dots, underscores, or hyphens.");
-        return false;
-    }
+    if (!validProfile(profileData, true, error)) return false;
+    const QString id = normalizedUserId(profileData.value(QStringLiteral("userId")).toString());
     if (!validPassword(password)) {
         if (error) *error = QStringLiteral("Password must be at least 12 characters and no more than 256 UTF-8 bytes.");
         return false;
     }
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
-        "INSERT INTO users(user_id, password_hash, is_admin, must_change_password, created_at) "
-        "VALUES(?, ?, ?, 1, ?)"));
+        "INSERT INTO users(user_id, password_hash, is_admin, must_change_password, operational_profile, "
+        "first_name, last_name, email, street, city, postal_code, province, created_at) "
+        "VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(id);
     query.addBindValue(passwordHash(password));
     query.addBindValue(makeAdmin ? 1 : 0);
+    const QString role = profileData.value(QStringLiteral("operationalProfile")).toString();
+    query.addBindValue(role.isEmpty() ? QStringLiteral("licensed") : role);
+    query.addBindValue(profileData.value(QStringLiteral("firstName")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("lastName")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("email")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("street")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("city")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("postalCode")).toString().trimmed());
+    query.addBindValue(profileData.value(QStringLiteral("province")).toString().trimmed());
     query.addBindValue(QDateTime::currentSecsSinceEpoch());
     if (!query.exec()) {
         if (error) *error = query.lastError().text().contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)
@@ -329,15 +466,113 @@ QJsonArray UserDatabase::users() const
 {
     QJsonArray result;
     QSqlQuery query(db_);
-    if (!query.exec(QStringLiteral("SELECT user_id, is_admin, must_change_password "
+    if (!query.exec(QStringLiteral("SELECT user_id, is_admin, must_change_password, operational_profile, "
+                                   "first_name, last_name, email, street, city, postal_code, province "
                                    "FROM users ORDER BY user_id COLLATE NOCASE")))
         return result;
     while (query.next()) {
         result.append(QJsonObject{{"userId", query.value(0).toString()},
                                   {"isAdmin", query.value(1).toInt() != 0},
-                                  {"mustChangePassword", query.value(2).toInt() != 0}});
+                                  {"mustChangePassword", query.value(2).toInt() != 0},
+                                  {"operationalProfile", query.value(3).toString()},
+                                  {"firstName", query.value(4).toString()},
+                                  {"lastName", query.value(5).toString()},
+                                  {"email", query.value(6).toString()},
+                                  {"street", query.value(7).toString()},
+                                  {"city", query.value(8).toString()},
+                                  {"postalCode", query.value(9).toString()},
+                                  {"province", query.value(10).toString()}});
     }
     return result;
+}
+
+QJsonObject UserDatabase::profile(const QString &userId) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT user_id, operational_profile, first_name, last_name, email, "
+                                 "street, city, postal_code, province FROM users WHERE user_id = ?"));
+    query.addBindValue(normalizedUserId(userId));
+    if (!query.exec() || !query.next()) return QJsonObject();
+    return QJsonObject{{"userId", query.value(0).toString()},
+                       {"operationalProfile", query.value(1).toString()},
+                       {"firstName", query.value(2).toString()},
+                       {"lastName", query.value(3).toString()},
+                       {"email", query.value(4).toString()},
+                       {"street", query.value(5).toString()},
+                       {"city", query.value(6).toString()},
+                       {"postalCode", query.value(7).toString()},
+                       {"province", query.value(8).toString()}};
+}
+
+bool UserDatabase::updateOwnProfile(const QString &userId, const QJsonObject &profileData,
+                                    QString *newUserId, QString *error)
+{
+    return updateProfile(userId, profileData, false, newUserId, error);
+}
+
+bool UserDatabase::updateAdminUser(const QString &userId, const QJsonObject &profileData,
+                                   QString *newUserId, QString *error)
+{
+    return updateProfile(userId, profileData, true, newUserId, error);
+}
+
+bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profileData,
+                                 bool administrator, QString *newUserId, QString *error)
+{
+    if (!validProfile(profileData, administrator, error)) return false;
+    const QString oldId = normalizedUserId(userId);
+    const QString newId = normalizedUserId(profileData.value(QStringLiteral("userId")).toString());
+    const QString role = profileData.value(QStringLiteral("operationalProfile")).toString();
+    if (administrator && role.isEmpty()) {
+        if (error) *error = QStringLiteral("Selecciona un perfil operativo.");
+        return false;
+    }
+    if (!db_.transaction()) {
+        if (error) *error = db_.lastError().text();
+        return false;
+    }
+    QSqlQuery update(db_);
+    QString sql = QStringLiteral("UPDATE users SET user_id = ?, first_name = ?, last_name = ?, "
+                                 "street = ?, city = ?, postal_code = ?, province = ?");
+    if (administrator)
+        sql += QStringLiteral(", email = ?, operational_profile = ?");
+    sql += QStringLiteral(" WHERE user_id = ?");
+    update.prepare(sql);
+    update.addBindValue(newId);
+    update.addBindValue(profileData.value(QStringLiteral("firstName")).toString().trimmed());
+    update.addBindValue(profileData.value(QStringLiteral("lastName")).toString().trimmed());
+    update.addBindValue(profileData.value(QStringLiteral("street")).toString().trimmed());
+    update.addBindValue(profileData.value(QStringLiteral("city")).toString().trimmed());
+    update.addBindValue(profileData.value(QStringLiteral("postalCode")).toString().trimmed());
+    update.addBindValue(profileData.value(QStringLiteral("province")).toString().trimmed());
+    if (administrator) {
+        update.addBindValue(profileData.value(QStringLiteral("email")).toString().trimmed());
+        update.addBindValue(role);
+    }
+    update.addBindValue(oldId);
+    if (!update.exec() || update.numRowsAffected() != 1) {
+        const QString dbError = queryError(update);
+        if (error) *error = dbError.contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)
+                ? QStringLiteral("Ese indicativo ya está asignado a otra cuenta.")
+                : (dbError.isEmpty() ? QStringLiteral("No se encontró la cuenta.") : dbError);
+        db_.rollback();
+        return false;
+    }
+    if (!db_.commit()) {
+        if (error) *error = db_.lastError().text();
+        db_.rollback();
+        return false;
+    }
+    if (newUserId) *newUserId = newId;
+    return true;
+}
+
+bool UserDatabase::canTransmit(const QString &userId) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT operational_profile FROM users WHERE user_id = ?"));
+    query.addBindValue(normalizedUserId(userId));
+    return query.exec() && query.next() && query.value(0).toString() == QLatin1String("licensed");
 }
 
 void UserDatabase::revokeSessions(const QString &userId)

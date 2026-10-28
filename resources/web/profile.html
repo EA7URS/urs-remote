@@ -8,7 +8,7 @@
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
     * { box-sizing: border-box; }
     body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 1rem; }
-    main { width: min(100%, 30rem); padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    main { width: min(100%, 42rem); padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
     h1 { margin: 0; color: #38d1c5; font-size: 1.5rem; }
     a { color: #48cfc4; }
@@ -23,6 +23,28 @@
 <main>
   <header><h1>Administrar perfil</h1><a href="/home.html">Volver al inicio</a></header>
   <p>Usuario: <strong id="user"></strong></p>
+  <h2>Datos del perfil</h2>
+  <form id="profileForm">
+    <label for="profileUserId">Indicativo / ID</label>
+    <input id="profileUserId" name="userId" required maxlength="32" autocomplete="username">
+    <label for="firstName">Nombre</label>
+    <input id="firstName" name="firstName" required maxlength="120" autocomplete="given-name">
+    <label for="lastName">Apellidos</label>
+    <input id="lastName" name="lastName" required maxlength="120" autocomplete="family-name">
+    <label for="email">Email (solo lectura)</label>
+    <input id="email" name="email" type="email" readonly aria-readonly="true">
+    <label for="street">Calle</label>
+    <input id="street" name="street" required maxlength="120" autocomplete="street-address">
+    <label for="city">Población</label>
+    <input id="city" name="city" required maxlength="120" autocomplete="address-level2">
+    <label for="postalCode">Código postal</label>
+    <input id="postalCode" name="postalCode" required maxlength="120" autocomplete="postal-code">
+    <label for="province">Provincia (opcional)</label>
+    <input id="province" name="province" maxlength="120" autocomplete="address-level1">
+    <p>Perfil operativo: <strong id="operationalProfile"></strong></p>
+    <button type="submit">Guardar datos del perfil</button>
+  </form>
+  <hr>
   <form id="passwordForm">
     <label for="currentPassword">Contraseña actual</label>
     <input id="currentPassword" type="password" autocomplete="current-password" required>
@@ -40,7 +62,31 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   if (!response.ok) { location.replace('/login.html'); return; }
   const user = await response.json();
   document.getElementById('user').textContent = user.userId;
+  const profile = user.profile;
+  document.getElementById('profileUserId').value = profile.userId || '';
+  for (const [field, value] of Object.entries(profile)) {
+    const input = document.getElementById(field);
+    if (input) input.value = value || '';
+  }
+  document.getElementById('operationalProfile').textContent = profile.operationalProfile === 'capture'
+    ? 'Usuario de captación (sin transmisión)' : 'Usuario con licencia';
 }).catch(() => location.replace('/login.html'));
+document.getElementById('profileForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  notice.textContent = '';
+  const data = Object.fromEntries(new FormData(event.target).entries());
+  delete data.email;
+  try {
+    const response = await fetch('/api/v1/auth/profile', {
+      method: 'PUT', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'No se pudo guardar el perfil.');
+    document.getElementById('user').textContent = result.profile.userId;
+    notice.textContent = 'Se han guardado los datos del perfil.';
+  } catch (error) { notice.textContent = error.message; }
+});
 document.getElementById('passwordForm').addEventListener('submit', async event => {
   event.preventDefault();
   notice.textContent = '';

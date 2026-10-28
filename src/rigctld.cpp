@@ -1047,6 +1047,14 @@ int rigCtlClient::getCommand(QStringList& response, bool extended, const command
             return -RIG_EINVAL;
         }
 
+        // rigctld is an unauthenticated TCP protocol and has no account
+        // identity with which to check the web user's operational profile.
+        // Keep it from becoming a transmission bypass for capture accounts.
+        if (func == funcSendCW && !val.toString().isEmpty())
+            return -RIG_ERJCTED;
+        if (func == funcTunerStatus && val.toInt() > 0)
+            return -RIG_ERJCTED;
+
         if (func == funcTransceiverStatus) {
             // Route PTT through webserver so RADE EOO synthesis,
             // packet TX gating and ALC meter polling stay coherent.
