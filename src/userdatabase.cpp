@@ -242,6 +242,15 @@ bool UserDatabase::createSchema(QString *error)
         if (error) *error = queryError(query);
         return false;
     }
+    if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS radio_usage_resets ("
+            "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, "
+            "period TEXT NOT NULL CHECK(period IN ('daily', 'weekly', 'monthly')), "
+            "reset_at INTEGER NOT NULL, "
+            "PRIMARY KEY(user_id, period))"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id)"));
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_usage_user_start ON radio_usage_sessions(user_id, started_at)"));
     if (!migrateSchema(error)) return false;
@@ -816,7 +825,7 @@ qint64 UserDatabase::usageSeconds(const QString &userId, qint64 periodStart,
 QJsonObject UserDatabase::usageStatus(const QString &userId) const
 {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    QJsonObject status{{"allowed", true}, {"profileId", QJsonValue(QJsonValue::Null)},
+    QJsonObject status{{"found", false}, {"allowed", true}, {"profileId", QJsonValue(QJsonValue::Null)},
                        {"profileName", QStringLiteral("Sin límite")}};
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("SELECT p.profile_id, p.name, p.daily_limit_minutes, "
@@ -829,6 +838,7 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
         status.insert(QStringLiteral("message"), QStringLiteral("No se ha encontrado la cuenta de usuario."));
         return status;
     }
+    status.insert(QStringLiteral("found"), true);
     if (query.value(0).isNull()) return status;
 
     const QString profileName = query.value(1).toString();
@@ -842,9 +852,6 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
         {QStringLiteral("weekly"), weekStart},
         {QStringLiteral("monthly"), QDate(date.year(), date.month(), 1)}
     };
-    const QStringList limitFields = {QStringLiteral("dailyLimitMinutes"),
-                                     QStringLiteral("weeklyLimitMinutes"),
-                                     QStringLiteral("monthlyLimitMinutes")};
     const QStringList titles = {QStringLiteral("diario"), QStringLiteral("semanal"), QStringLiteral("mensual")};
     const qint64 limits[] = {query.value(2).isNull() ? -1 : query.value(2).toLongLong() * 60,
                              query.value(3).isNull() ? -1 : query.value(3).toLongLong() * 60,
@@ -856,7 +863,20 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
         else if (i == 1) nextDate = nextDate.addDays(7);
         else nextDate = nextDate.addMonths(1);
         const QDateTime periodEnd(nextDate, QTime(0, 0), Qt::LocalTime);
-        const qint64 used = usageSeconds(userId, periodStart.toSecsSinceEpoch(),
+        const QString periodKey = starts.at(i).first;
+        QSqlQuery resetQuery(db_);
+        resetQuery.prepare(QStringLiteral("SELECT reset_at FROM radio_usage_resets WHERE user_id = ? AND period = ?"));
+        resetQuery.addBindValue(normalizedUserId(userId));
+        resetQuery.addBindValue(periodKey);
+        if (!resetQuery.exec()) {
+            status.insert(QStringLiteral("allowed"), false);
+            status.insert(QStringLiteral("message"), QStringLiteral("No se puede comprobar el tiempo autorizado. Inténtalo de nuevo."));
+            break;
+        }
+        const bool hasReset = resetQuery.next();
+        const qint64 resetAt = hasReset ? resetQuery.value(0).toLongLong() : 0;
+        const qint64 effectiveStart = qMax(periodStart.toSecsSinceEpoch(), resetAt);
+        const qint64 used = usageSeconds(userId, effectiveStart,
                                          periodEnd.toSecsSinceEpoch(), now);
         if (used < 0) {
             status.insert(QStringLiteral("allowed"), false);
@@ -864,12 +884,13 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
             break;
         }
         const qint64 limit = limits[i];
-        QJsonObject period{{"limitMinutes", limit < 0 ? QJsonValue(QJsonValue::Null)
+        QJsonObject periodStatus{{"limitMinutes", limit < 0 ? QJsonValue(QJsonValue::Null)
                                                        : QJsonValue(limit / 60)},
                            {"usedSeconds", used},
+                           {"resetAt", hasReset ? QJsonValue(resetAt) : QJsonValue(QJsonValue::Null)},
                            {"remainingSeconds", limit < 0 ? QJsonValue(QJsonValue::Null)
                                                            : QJsonValue(qMax<qint64>(0, limit - used))}};
-        status.insert(starts.at(i).first, period);
+        status.insert(periodKey, periodStatus);
         if (limit >= 0 && used >= limit && status.value(QStringLiteral("allowed")).toBool()) {
             status.insert(QStringLiteral("allowed"), false);
             status.insert(QStringLiteral("message"),
@@ -878,6 +899,44 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
         }
     }
     return status;
+}
+
+bool UserDatabase::resetUsagePeriod(const QString &userId, const QString &period,
+                                    QString *error)
+{
+    const QStringList validPeriods = {QStringLiteral("daily"), QStringLiteral("weekly"),
+                                      QStringLiteral("monthly")};
+    const QString id = normalizedUserId(userId);
+    if (id.isEmpty() || !validPeriods.contains(period)) {
+        if (error) *error = QStringLiteral("El periodo de uso no es válido.");
+        return false;
+    }
+    const QJsonObject usage = usageStatus(id);
+    if (!usage.value(QStringLiteral("found")).toBool()) {
+        if (error) *error = QStringLiteral("No se ha encontrado la cuenta de usuario.");
+        return false;
+    }
+    if (!usage.value(period).isObject()) {
+        if (error) *error = QStringLiteral("El usuario no tiene un límite asignado para ese periodo.");
+        return false;
+    }
+    const QJsonObject periodStatus = usage.value(period).toObject();
+    if (periodStatus.value(QStringLiteral("limitMinutes")).isNull()) {
+        if (error) *error = QStringLiteral("El perfil asignado no tiene límite para ese periodo.");
+        return false;
+    }
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral(
+        "INSERT INTO radio_usage_resets(user_id, period, reset_at) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id, period) DO UPDATE SET reset_at = excluded.reset_at"));
+    query.addBindValue(id);
+    query.addBindValue(period);
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    if (!query.exec()) {
+        if (error) *error = queryError(query);
+        return false;
+    }
+    return true;
 }
 
 QString UserDatabase::startUsageSession(const QString &userId, QJsonObject *status,

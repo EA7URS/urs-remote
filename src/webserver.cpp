@@ -1380,6 +1380,40 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             return;
         }
         const QString userPrefix = QStringLiteral("/api/v1/admin/users/");
+        const QString userUsageSuffix = QStringLiteral("/usage");
+        const QString userUsageResetSuffix = QStringLiteral("/usage-reset");
+        if (p.startsWith(userPrefix) && p.endsWith(userUsageSuffix)) {
+            const QString userId = p.mid(userPrefix.size(),
+                                         p.size() - userPrefix.size() - userUsageSuffix.size());
+            if (method != "GET") {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            } else {
+                const QJsonObject usage = userDatabase_.usageStatus(userId);
+                if (!usage.value(QStringLiteral("found")).toBool()) {
+                    sendRestResponse(socket, 404, QJsonObject{{"error", "No se ha encontrado la cuenta de usuario."}});
+                } else {
+                    sendRestResponse(socket, 200, QJsonObject{{"usage", usage}});
+                }
+            }
+            return;
+        }
+        if (p.startsWith(userPrefix) && p.endsWith(userUsageResetSuffix)) {
+            if (method != "POST") {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+                return;
+            }
+            const QString userId = p.mid(userPrefix.size(),
+                                         p.size() - userPrefix.size() - userUsageResetSuffix.size());
+            QString error;
+            const QString period = parseBody().value(QStringLiteral("period")).toString();
+            if (!userDatabase_.resetUsagePeriod(userId, period, &error)) {
+                const int status = error == QLatin1String("No se ha encontrado la cuenta de usuario.") ? 404 : 400;
+                sendRestResponse(socket, status, QJsonObject{{"error", error}});
+                return;
+            }
+            sendRestResponse(socket, 200, QJsonObject{{"usage", userDatabase_.usageStatus(userId)}});
+            return;
+        }
         if (method == "PUT" && p.startsWith(userPrefix)) {
             const QString userId = p.mid(userPrefix.size());
             QString newUserId;
