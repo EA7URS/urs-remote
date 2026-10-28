@@ -3,6 +3,9 @@
 #include "audio/resampler/speex_resampler.h"
 
 extern "C" {
+#ifdef RADE_EXPORT
+#undef RADE_EXPORT
+#endif
 #include <rade_api.h>
 #include <rade_dsp.h>
 #include "rade_text.h"

@@ -18,9 +18,19 @@ struct LPCNetEncState;
 
 // FARGANState is a typedef'd struct in fargan.h; we need the full
 // definition for sizeof, so include it rather than forward-declaring.
+// The vendored Opus header emits a CPU-tuning #warning here. This application
+// only needs its public state type; Opus selects its optimized kernels in its
+// own build, so suppress that header-local advisory for this include.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcpp"
+#endif
 extern "C" {
 #include <fargan.h>
 }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 class RadeProcessor : public QObject {
     Q_OBJECT
