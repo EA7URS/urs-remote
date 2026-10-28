@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Project Scope & Target Hardware
+
+The target transceiver for project-specific changes is the ICOM IC-7610. The wfweb base supports other radios, but that broader support does not expand this project's target. Scope new behavior, configuration, and documentation to the IC-7610; include the model in issue acceptance criteria and verify radio-specific behavior against IC-7610 documentation or hardware when available. Do not infer IC-7610 behavior solely from another model's support.
+
 ## Project Structure & Module Organization
 
 This project uses [wfweb](https://github.com/adecarolis/wfweb) as its software base; retain its GPL-3.0 license and third-party notices. The Qt/C and C++ server is in `src/`, public headers in `include/`, radio definitions in `rigs/`, and browser UI and assets in `resources/web/`. Tests are in `tests/`; supporting code is in `launcher/`, `scripts/`, `tools/`, and `docker/`. Initialize required dependencies with `git submodule update --init`.
