@@ -2286,6 +2286,20 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
     .ptt-hint { font-size: 10px; margin-top: 3px; }
 }
 </style>
+<style>
+#transmitDeniedDialog {
+    position: fixed;
+    inset: auto;
+    top: 50%;
+    left: 50%;
+    margin: 0;
+    transform: translate(-50%, -50%);
+    width: min(90vw, 26rem);
+    max-height: min(85vh, 32rem);
+    overflow: auto;
+}
+#transmitDeniedDialog::backdrop { background: rgba(0, 0, 0, .72); }
+</style>
 <!-- JS8 messenger panel styles — shared with the standalone build via
      resources/web-shared/js8-panel.css. -->
 <link rel="stylesheet" href="js8-panel.css">
@@ -2368,6 +2382,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
         <span class="flex-space"></span>
         <span id="rigTag" title="Rig"></span>
         <span id="accountUser" title="Signed-in user"></span>
+        <a class="account-link" href="/home.html" aria-label="Volver al inicio">INICIO</a>
         <a id="adminLink" class="account-link" href="/admin.html" hidden>USERS</a>
         <button id="logoutBtn" type="button">OUT</button>
         <button id="recBtn" class="rec-btn" title="Record">REC</button>
