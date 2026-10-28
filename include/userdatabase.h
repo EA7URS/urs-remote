@@ -49,6 +49,8 @@ public:
                             QString *error = nullptr);
     bool deleteUsageProfile(qint64 profileId, QString *error = nullptr);
     QJsonObject usageStatus(const QString &userId) const;
+    bool resetUsagePeriod(const QString &userId, const QString &period,
+                          QString *error = nullptr);
     QString startUsageSession(const QString &userId, QJsonObject *status,
                               QString *error = nullptr);
     void endUsageSession(const QString &sessionId);
