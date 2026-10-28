@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Acceso denegado</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 1rem; }
+    main { width: min(100%, 32rem); padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; text-align: center; }
+    h1 { margin: 0; color: #38d1c5; font-size: 1.6rem; }
+    p { color: #a9bfc2; line-height: 1.5; }
+    nav { display: flex; justify-content: center; flex-wrap: wrap; gap: .75rem; margin-top: 1.5rem; }
+    a, button { padding: .7rem 1rem; border: 1px solid #28545b; border-radius: .45rem; background: transparent; color: #48cfc4; font: inherit; font-weight: 650; cursor: pointer; text-decoration: none; }
+    a.primary { border-color: #12a99f; background: #12a99f; color: #031415; }
+    a:hover, button:hover { border-color: #38d1c5; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Acceso denegado</h1>
+  <p>Tu cuenta no tiene permiso para administrar usuarios.</p>
+  <nav aria-label="Opciones">
+    <button type="button" onclick="if (history.length > 1) history.back(); else location.href='/home.html'">Volver atrás</button>
+    <a href="/home.html">Inicio</a>
+    <a class="primary" href="/index.html">Control de radio</a>
+  </nav>
+</main>
+</body>
+</html>

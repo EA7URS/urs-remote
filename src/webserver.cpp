@@ -878,11 +878,16 @@ void webServer::onHttpReadyRead()
         if (!pageUser.authenticated || pageUser.mustChangePassword)
             path = "/login.html";
     }
-    if (path == "/admin.html") {
+    const bool adminPage = path == "/admin.html" || path == "/admin-create.html"
+            || path == "/admin-edit.html";
+    if (adminPage) {
         if (!pageUser.authenticated || pageUser.mustChangePassword) {
             path = "/login.html";
         } else if (!pageUser.isAdmin) {
-            sendHttpResponse(socket, 403, "Forbidden", "text/plain", "Administrator access required");
+            QFile deniedPage(":/web/access-denied.html");
+            const QByteArray body = deniedPage.open(QIODevice::ReadOnly)
+                    ? deniedPage.readAll() : QByteArray("<!doctype html><html lang=\"es\"><meta charset=\"utf-8\"><title>Acceso denegado</title><p>No tienes permiso para administrar usuarios.</p></html>");
+            sendHttpResponse(socket, 403, "Forbidden", "text/html; charset=utf-8", body);
             return;
         }
     }
