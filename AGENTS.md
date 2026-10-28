@@ -18,7 +18,7 @@ Match the existing Qt/C++, JavaScript, and Python conventions in nearby files. N
 
 ## Issues & Work Tracking
 
-Write every issue and child issue as a user story, such as “As a [user], I want [capability], so that [benefit].” Keep scope clear. In the description, include the original request verbatim under **Original prompt**, context, acceptance criteria, and an unchecked task checklist. Check items off as work progresses. Split independently trackable work into child issues and link them to the parent with GitHub’s sub-issue relationship.
+Write all issue and child-issue titles, descriptions, and comments in Spanish. Preserve the original prompt verbatim under **Original prompt**; the user will provide future prompts in Spanish. Write every issue and child issue as a user story, such as “Como [usuario], quiero [capacidad] para [beneficio].” Keep scope clear. In the description, include context, acceptance criteria, and an unchecked task checklist. Check items off as work progresses. Split independently trackable work into child issues and link them to the parent with GitHub’s sub-issue relationship.
 
 Record all Codex work—progress, decisions, blockers, completed work, and validation—in issue comments. Keep comments chronological and link commits or pull requests. Before closing, finish the checklist and comment with a result summary. Label and categorize every issue and child issue, reusing fitting repository labels; use work-type and relevant-area labels, and set priority or milestone when applicable.
 
