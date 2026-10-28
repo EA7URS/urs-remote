@@ -1,0 +1,8474 @@
+#include "webserver.h"
+#include "freedvprocessor.h"
+#include <QtMath>
+#include <codec2/freedv_api.h>
+#include "logcategories.h"
+#include "wfweb_version.h"
+#include "wsjtxmessage.h"
+
+#include <QStandardPaths>
+#include <QDir>
+#include <QDirIterator>
+#include <QCryptographicHash>
+#include <QProcess>
+#include <QSettings>
+#include <QSslConfiguration>
+#include <QTimer>
+#include <QThread>
+#include <QDateTime>
+#include <QHostInfo>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <objbase.h>
+#endif
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/bn.h>
+#endif
+
+#ifdef Q_OS_MACOS
+#include "tlsproxy.h"
+#endif
+
+// Fixed TX gain applied to RADE modem output (and the EOO frame) in the
+// webserver before writing to the USB CODEC. Combined with RADE_TX_SCALE
+// in radeprocessor.cpp, this gives a stable drive level that hits ~100%
+// power on a full-duty signal. Kept separate from freedvTxGain so the
+// classic-FreeDV ALC loop can't affect RADE.
+static constexpr float RADE_TX_GAIN = 0.4f;
+
+// Repeater duplex direction on the wire. The browser and the REST clients
+// speak these three names; the parser only ever caches simplex / DUP- / DUP+,
+// so the default arm is just a guard.
+// The rig's make for the browser (its CW keyer model keys Icom timing).
+static QString manufacturerName(manufacturersType_t m)
+{
+    switch (m) {
+    case manufIcom: return QStringLiteral("Icom");
+    case manufKenwood: return QStringLiteral("Kenwood");
+    case manufYaesu: return QStringLiteral("Yaesu");
+    case manufFlexRadio: return QStringLiteral("FlexRadio");
+    }
+    return QStringLiteral("Unknown");
+}
+
+static QString duplexModeName(duplexMode_t dm)
+{
+    switch (dm) {
+    case dmDupMinus: return QStringLiteral("DUP-");
+    case dmDupPlus:  return QStringLiteral("DUP+");
+    default:         return QStringLiteral("OFF");
+    }
+}
+
+// Inverse of duplexModeName(). Returns dmSimplex for anything unrecognised,
+// which is the safe direction: it turns the repeater shift off.
+static duplexMode_t duplexModeFromName(const QString &name)
+{
+    if (name.compare(QLatin1String("DUP-"), Qt::CaseInsensitive) == 0) return dmDupMinus;
+    if (name.compare(QLatin1String("DUP+"), Qt::CaseInsensitive) == 0) return dmDupPlus;
+    return dmSimplex;
+}
+
+// Repeater access tone on the wire. The names follow the labels Icom prints on
+// the rig itself, so what the browser shows matches the front panel. The UI
+// only offers the first four; the combined modes exist because a rig with the
+// "Tone Squelch Type" register can be left in one from its front panel and we
+// must be able to report that faithfully rather than lie about it.
+static QString toneModeName(rptAccessTxRx_t m)
+{
+    switch (m) {
+    case ratrTN: return QStringLiteral("TONE");
+    case ratrNT: return QStringLiteral("TSQL");
+    case ratrDD: return QStringLiteral("DTCS");
+    case ratrDN: return QStringLiteral("DTCS(T)");
+    case ratrTD: return QStringLiteral("TONE(T)/DTCS(R)");
+    case ratrDT: return QStringLiteral("DTCS(T)/TSQL(R)");
+    case ratrTT: return QStringLiteral("TONE(T)/TSQL(R)");
+    default:     return QStringLiteral("OFF");
+    }
+}
+
+// Inverse of toneModeName(). Anything unrecognised turns the tone off, which
+// is the safe direction — it can only stop us keying a repeater, never start.
+static rptAccessTxRx_t toneModeFromName(const QString &name)
+{
+    const QString n = name.trimmed().toUpper();
+    if (n == QLatin1String("TONE"))            return ratrTN;
+    if (n == QLatin1String("TSQL"))            return ratrNT;
+    if (n == QLatin1String("DTCS"))            return ratrDD;
+    if (n == QLatin1String("DTCS(T)"))         return ratrDN;
+    if (n == QLatin1String("TONE(T)/DTCS(R)")) return ratrTD;
+    if (n == QLatin1String("DTCS(T)/TSQL(R)")) return ratrDT;
+    if (n == QLatin1String("TONE(T)/TSQL(R)")) return ratrTT;
+    return ratrNN;
+}
+
+// Look a tone / DTCS register up in the rig's own table. The toneInfo we hand
+// the queue carries the rig's label as well as the register, because the
+// memory writer matches stored channels by name.
+static bool findToneByReg(const std::vector<toneInfo> &table, ushort reg, toneInfo *out)
+{
+    for (const toneInfo &t : table) {
+        if (t.tone == reg) { *out = t; return true; }
+    }
+    return false;
+}
+
+// Does the mode transmit a CTCSS tone / squelch on one?
+static bool toneModeUsesTone(rptAccessTxRx_t m)
+{
+    return m == ratrTN || m == ratrTD || m == ratrTT;
+}
+static bool toneModeUsesTsql(rptAccessTxRx_t m)
+{
+    return m == ratrNT || m == ratrDT || m == ratrTT;
+}
+static bool toneModeUsesDtcs(rptAccessTxRx_t m)
+{
+    return m == ratrDD || m == ratrDN || m == ratrTD || m == ratrDT;
+}
+
+webServer::webServer(QObject *parent) :
+    QObject(parent)
+{
+    // wfweb's own memory channels (issue #114), next to the generated TLS
+    // cert. Opened unconditionally: whether it gets used is decided per rig
+    // by memoryContentsSupported(), which needs rigCaps we don't have yet.
+    memStore.open(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                  + "/memories.json");
+}
+
+webServer::~webServer()
+{
+    wsjtxSendClose();
+    // A digital over cut short by the shutdown: put the compressor back.
+    // Same dispatch-before-close guarantee as the DATA MOD OFF restore below.
+    releaseCompressorHold();
+    // Restore DATA MOD OFF setting if mic was active.  ~servermain() waits
+    // for the queue to dispatch this before it closes the rig port.
+    if (dataOffModSaved && queue) {
+        queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(savedDataOffMod), false, 0));
+        dataOffModSaved = false;
+        micActiveClient = nullptr;
+        qInfo() << "Web: Restored DATA MOD OFF setting (server shutting down)";
+    }
+    if (statusTimer) {
+        statusTimer->stop();
+    }
+    usbTxReset();
+    if (usbAudioOutput) {
+        usbAudioOutput->stop();
+        delete usbAudioOutput;
+        usbAudioOutput = nullptr;
+        usbAudioOutputDevice = nullptr;
+    }
+    if (usbAudioPollTimer) {
+        usbAudioPollTimer->stop();
+        delete usbAudioPollTimer;
+        usbAudioPollTimer = nullptr;
+    }
+    if (usbAudioInput) {
+        usbAudioInput->stop();
+        delete usbAudioInput;
+        usbAudioInput = nullptr;
+    }
+    if (freedvTxDrainTimer) {
+        freedvTxDrainTimer->stop();
+    }
+    if (freedvThread) {
+        freedvThread->quit();
+        freedvThread->wait();
+    }
+    if (radeThread) {
+        if (radeProcessor) radeProcessor->stopRequested.store(true);
+        radeThread->quit();
+        radeThread->wait();
+    }
+    if (dwThread) {
+        dwThread->quit();
+        dwThread->wait();
+    }
+    if (txConverterThread) {
+        txConverterThread->quit();
+        txConverterThread->wait();
+    }
+    if (rxConverterThread) {
+        rxConverterThread->quit();
+        rxConverterThread->wait();
+    }
+#ifdef Q_OS_MACOS
+    if (tlsProxyWorker) {
+        tlsProxyWorker->stop();
+    }
+    if (tlsProxyThread) {
+        tlsProxyThread->quit();
+        tlsProxyThread->wait();
+    }
+#endif
+    if (wsServer) {
+        wsServer->close();
+    }
+    if (restServer) {
+        restServer->close();
+    }
+    if (httpServer) {
+        httpServer->close();
+    }
+    audioClients.clear();
+    qDeleteAll(wsClients);
+    wsClients.clear();
+}
+
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+// Generate a self-signed PEM certificate and key using the OpenSSL C API.
+// Returns true on success, writing PEM files to certPath and keyPath.
+static bool generateSelfSignedCert(const QString &certPath, const QString &keyPath)
+{
+    bool ok = false;
+    EVP_PKEY *pkey = nullptr;
+    X509 *x509 = nullptr;
+    BIO *certBio = nullptr;
+    BIO *keyBio = nullptr;
+    RSA *rsa = nullptr;
+    BIGNUM *bn = nullptr;
+
+    // Generate 2048-bit RSA key
+    pkey = EVP_PKEY_new();
+    if (!pkey) goto cleanup;
+
+    rsa = RSA_new();
+    bn = BN_new();
+    if (!rsa || !bn) goto cleanup;
+    if (!BN_set_word(bn, RSA_F4)) goto cleanup;
+    if (!RSA_generate_key_ex(rsa, 2048, bn, nullptr)) goto cleanup;
+    if (!EVP_PKEY_assign_RSA(pkey, rsa)) goto cleanup;
+    rsa = nullptr; // now owned by pkey
+
+    // Create X509 certificate
+    x509 = X509_new();
+    if (!x509) goto cleanup;
+
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 365L * 10 * 24 * 3600); // 10 years
+    X509_set_pubkey(x509, pkey);
+
+    {
+        X509_NAME *name = X509_get_subject_name(x509);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char *>("wfweb"), -1, -1, 0);
+        X509_set_issuer_name(x509, name); // self-signed
+    }
+
+    if (!X509_sign(x509, pkey, EVP_sha256())) goto cleanup;
+
+    // Write certificate PEM
+    certBio = BIO_new_file(certPath.toLocal8Bit().constData(), "wb");
+    if (!certBio) goto cleanup;
+    if (!PEM_write_bio_X509(certBio, x509)) goto cleanup;
+
+    // Write private key PEM (unencrypted)
+    keyBio = BIO_new_file(keyPath.toLocal8Bit().constData(), "wb");
+    if (!keyBio) goto cleanup;
+    if (!PEM_write_bio_PrivateKey(keyBio, pkey, nullptr, nullptr, 0, nullptr, nullptr)) goto cleanup;
+
+    ok = true;
+
+cleanup:
+    if (certBio) BIO_free(certBio);
+    if (keyBio) BIO_free(keyBio);
+    if (x509) X509_free(x509);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (rsa) RSA_free(rsa);
+    if (bn) BN_free(bn);
+    return ok;
+}
+#endif // Q_OS_WIN || Q_OS_MACOS
+
+bool webServer::setupSsl()
+{
+    if (!QSslSocket::supportsSsl()) {
+        qInfo() << "Web: SSL not supported on this system, using plain HTTP";
+        return false;
+    }
+
+    QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dataDir);
+    QString certPath = dataDir + "/wfweb-web.crt";
+    QString keyPath = dataDir + "/wfweb-web.key";
+
+    // Generate self-signed cert if not present
+    if (!QFile::exists(certPath) || !QFile::exists(keyPath)) {
+        qInfo() << "Web: Generating self-signed SSL certificate...";
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+        // Use OpenSSL C API directly (openssl CLI not available on Windows,
+        // avoids Secure Transport issues on macOS)
+        if (!generateSelfSignedCert(certPath, keyPath)) {
+            qWarning() << "Web: Failed to generate SSL certificate via OpenSSL API";
+            return false;
+        }
+#else
+        QProcess proc;
+        proc.start("openssl", QStringList()
+            << "req" << "-x509" << "-newkey" << "rsa:2048"
+            << "-keyout" << keyPath << "-out" << certPath
+            << "-days" << "3650" << "-nodes"
+            << "-subj" << "/CN=wfweb");
+        if (!proc.waitForFinished(10000) || proc.exitCode() != 0) {
+            qWarning() << "Web: Failed to generate SSL certificate:" << proc.readAllStandardError();
+            return false;
+        }
+#endif
+        qInfo() << "Web: SSL certificate generated at" << certPath;
+    }
+
+#ifdef Q_OS_MACOS
+    sslCertPath = certPath;
+    sslKeyPath = keyPath;
+    // On macOS, Qt5 uses Secure Transport which always sends CertificateRequest
+    // to clients, causing Safari to prompt for a client certificate.
+    // Use an OpenSSL-based TLS proxy instead.
+    if (!QSslSocket::sslLibraryVersionString().contains("OpenSSL")) {
+        useOpenSslProxy = true;
+        qInfo() << "Web: Will use OpenSSL TLS proxy (Secure Transport workaround)";
+        return true;
+    }
+#endif
+
+    // Load certificate into Qt types (non-proxy path)
+    QFile certFile(certPath);
+    if (!certFile.open(QIODevice::ReadOnly)) {
+        qWarning() << "Web: Cannot read SSL certificate";
+        return false;
+    }
+    sslCert = QSslCertificate(&certFile, QSsl::Pem);
+    certFile.close();
+    if (sslCert.isNull()) {
+        qWarning() << "Web: Invalid SSL certificate";
+        return false;
+    }
+
+    // Load private key
+    QFile keyFile(keyPath);
+    if (!keyFile.open(QIODevice::ReadOnly)) {
+        qWarning() << "Web: Cannot read SSL private key";
+        return false;
+    }
+    sslKey = QSslKey(&keyFile, QSsl::Rsa, QSsl::Pem);
+    keyFile.close();
+    if (sslKey.isNull()) {
+        qWarning() << "Web: Invalid SSL private key";
+        return false;
+    }
+
+    qInfo() << "Web: SSL certificate loaded successfully";
+    return true;
+}
+
+void webServer::init(quint16 httpPort, quint16 wsPort)
+{
+    webHttpsPort = httpPort; // remembered for the REST-port signpost (#69)
+    this->setObjectName("Web Server");
+    queue = cachingQueue::getInstance();
+    rigCaps = queue->getRigCaps();
+
+    connect(queue, SIGNAL(rigCapsUpdated(rigCapabilities*)), this, SLOT(receiveRigCaps(rigCapabilities*)));
+    connect(queue, SIGNAL(cacheUpdated(cacheItem)), this, SLOT(receiveCache(cacheItem)));
+
+    // A rig that keeps refusing the tuner-status read has nothing to tune (an
+    // IC-705 declares the command for the optional AH-705 and answers FA
+    // without one): pull the TUNE tile once the queue gives up on the read.
+    // receiveCache() restores it the moment a real value arrives.
+    connect(queue, &cachingQueue::cacheRejected, this, [this](cacheItem item) {
+        if (item.command != funcTunerStatus || tunerRejected) return;
+        tunerRejected = true;
+        QJsonObject update;
+        update["type"] = "update";
+        update["hasTuner"] = false;
+        sendJsonToAll(update);
+    });
+
+    sslEnabled = setupSsl();
+    httpsActive_ = sslEnabled;
+
+    if (sslEnabled) {
+#ifdef Q_OS_MACOS
+        if (useOpenSslProxy) {
+            // macOS: plain HTTP server on localhost, TLS proxy on the real port
+            httpServer = new QTcpServer(this);
+            if (httpServer->listen(QHostAddress::LocalHost, 0)) {
+                internalHttpPort = httpServer->serverPort();
+                qInfo() << "Web: Internal HTTP server on localhost:" << internalHttpPort;
+                connect(httpServer, &QTcpServer::newConnection, this, &webServer::onHttpConnection);
+            } else {
+                qWarning() << "Web: Internal HTTP server failed to listen";
+            }
+
+            // Start OpenSSL TLS proxy in its own thread
+            tlsProxyWorker = new TlsProxyWorker(httpPort, internalHttpPort, sslCertPath, sslKeyPath);
+            tlsProxyThread = new QThread(this);
+            tlsProxyThread->setObjectName("TlsProxy");
+            tlsProxyWorker->moveToThread(tlsProxyThread);
+            connect(tlsProxyThread, &QThread::started, tlsProxyWorker, &TlsProxyWorker::start);
+            connect(tlsProxyThread, &QThread::finished, tlsProxyWorker, &QObject::deleteLater);
+            connect(tlsProxyWorker, &TlsProxyWorker::error, this, [this](const QString &msg) {
+                qWarning() << "Web: TLS proxy error:" << msg;
+                webListen_ = ListenFailed;
+            });
+            webListen_ = ListenOk;
+            tlsProxyThread->start();
+        } else
+#endif
+        {
+            // HTTPS + WSS on a single port (Linux/Windows: QSslSocket with OpenSSL backend)
+            SslTcpServer *sslServer = new SslTcpServer(this);
+            sslServer->cert = sslCert;
+            sslServer->key = sslKey;
+            httpServer = sslServer;
+
+            if (httpServer->listen(QHostAddress::Any, httpPort)) {
+                qInfo() << "Web HTTPS server listening on port" << httpPort;
+                webListen_ = ListenOk;
+                connect(httpServer, &QTcpServer::newConnection, this, &webServer::onHttpConnection);
+            } else {
+                qWarning() << "Web HTTPS server failed to listen on port" << httpPort;
+                webListen_ = ListenFailed;
+            }
+        }
+
+        // WebSocket server in NonSecureMode (SSL handled by SslTcpServer or TLS proxy)
+        wsServer = new QWebSocketServer(QStringLiteral("wfweb Web"), QWebSocketServer::NonSecureMode, this);
+        connect(wsServer, &QWebSocketServer::newConnection, this, &webServer::onWsNewConnection);
+
+        // Plain HTTP server on wsPort for microcontrollers/scripts that don't support TLS
+        restServer = new QTcpServer(this);
+        if (restServer->listen(QHostAddress::Any, wsPort)) {
+            qInfo() << "Web plain HTTP REST server listening on port" << wsPort
+                    << "(use http:// on this port for scripts/microcontrollers)";
+            restListen_ = ListenOk;
+            connect(restServer, &QTcpServer::newConnection, this, &webServer::onHttpConnection);
+        } else {
+            qWarning() << "Web plain HTTP REST server failed to listen on port" << wsPort;
+            restListen_ = ListenFailed;
+        }
+    } else {
+        // Plain HTTP + WS on separate ports (fallback)
+        httpServer = new QTcpServer(this);
+        if (httpServer->listen(QHostAddress::Any, httpPort)) {
+            qInfo() << "Web HTTP server listening on port" << httpPort;
+            webListen_ = ListenOk;
+            connect(httpServer, &QTcpServer::newConnection, this, &webServer::onHttpConnection);
+        } else {
+            qWarning() << "Web HTTP server failed to listen on port" << httpPort;
+            webListen_ = ListenFailed;
+        }
+
+        wsServer = new QWebSocketServer(QStringLiteral("wfweb Web"), QWebSocketServer::NonSecureMode, this);
+        if (wsServer->listen(QHostAddress::Any, wsPort)) {
+            qInfo() << "Web WebSocket server listening on port" << wsPort;
+            connect(wsServer, &QWebSocketServer::newConnection, this, &webServer::onWsNewConnection);
+        } else {
+            qWarning() << "Web WebSocket server failed to listen on port" << wsPort;
+        }
+    }
+
+    // Periodic status updates (meters, etc.) every 200ms
+    statusTimer = new QTimer(this);
+    connect(statusTimer, &QTimer::timeout, this, &webServer::sendPeriodicStatus);
+    statusTimer->start(200);
+
+    // Fingerprint the embedded SPA so an already-open tab can detect a
+    // server upgrade.  The SPA's WebSocket auto-reconnects across server
+    // restarts, so without this a tab keeps running pre-upgrade JS forever
+    // (HTTP no-store only helps on a fresh page load).  The browser
+    // compares this id on every getStatus reply and reloads itself when
+    // it changes — see the 'status' handler in index.html.
+    {
+        QStringList paths;
+        QDirIterator it(":/web", QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            it.next();
+            if (it.fileInfo().isFile()) paths.append(it.filePath());
+        }
+        paths.sort();
+        QCryptographicHash h(QCryptographicHash::Sha1);
+        for (const QString &p : paths) {
+            QFile f(p);
+            if (f.open(QIODevice::ReadOnly)) h.addData(f.readAll());
+        }
+        spaBuildId = QString::fromLatin1(h.result().toHex().left(12));
+        qInfo() << "Web: SPA build id" << spaBuildId;
+    }
+}
+
+// Icom documents the IC-7600's power-on command (18 01) as accepted only at
+// the [REMOTE] jack, and the rig leaves its USB interface unpowered in
+// standby.  A wfweb session on the USB port can therefore switch that radio
+// off but can never switch it back on — the user has to walk over and press
+// POWER (issue #104).  Wired through [REMOTE] instead, power control works
+// normally, and nothing on the wire tells the two cable paths apart, so this
+// is a warning for the confirm dialog rather than a lost capability.
+static bool powerOnNeedsRemoteJack(const rigCapabilities *caps)
+{
+    return caps != Q_NULLPTR && caps->modelName == QLatin1String("IC-7600");
+}
+
+void webServer::receiveRigCaps(rigCapabilities *caps)
+{
+    rigCaps = caps;
+    tunerRejected = false;   // new rig, new evidence
+    // Each rig keeps its own local channel list, so swapping radios doesn't
+    // hand an IC-718's memories to an IC-706.
+    memStore.setRig(rigCaps ? rigCaps->modelName : QString());
+    // Notify connected clients that rig capabilities changed
+    if (rigCaps) {
+        QJsonObject obj;
+        obj["type"] = "rigConnected";
+        obj["model"] = rigCaps->modelName;
+        obj["manufacturer"] = manufacturerName(rigCaps->manufacturer);
+        obj["hasTransmit"] = rigCaps->hasTransmit;
+        obj["hasSpectrum"] = rigCaps->hasSpectrum;
+        obj["spectLenMax"] = rigCaps->spectLenMax;
+        obj["spectAmpMax"] = rigCaps->spectAmpMax;
+        obj["hasMainSub"] = rigCaps->hasCommand29;
+        // Antenna tuner: only rigs whose .rig declares the ATU command have
+        // something to tune, so the TUNE tile and the FUNC TUNER button
+        // follow that capability instead of appearing on every rig.
+        obj["hasTuner"] = rigCaps->commands.contains(funcTunerStatus);
+        // CW break-in (OFF / SEMI / FULL): the BK-IN button in the CW bar.
+        obj["hasBreakIn"] = rigCaps->commands.contains(funcBreakIn);
+        // Speech compressor: the FUNC COMP tile and the GAIN COMP level row.
+        obj["hasCompressor"] = rigCaps->commands.contains(funcCompressor);
+        obj["hasCompLevel"] = rigCaps->commands.contains(funcCompressorLevel);
+        obj["hasPowerControl"] = rigCaps->commands.contains(funcPowerControl);
+        obj["powerOnNeedsRemoteJack"] = powerOnNeedsRemoteJack(rigCaps);
+        addToneCaps(obj);
+        addBandCaps(obj);
+        addTxMeterCaps(obj);
+        // A new rig may not have the meter the previous selection named.
+        if (txMeterFunc != funcNone && !rigCaps->commands.contains(txMeterFunc))
+            txMeterFunc = funcNone;
+        applyTxMeterPoll();
+
+        QJsonArray modes;
+        for (const modeInfo &mi : rigCaps->modes) {
+            modes.append(mi.name);
+        }
+        obj["modes"] = modes;
+        obj["audioAvailable"] = audioConfigured;
+        if (audioConfigured) {
+            obj["audioSampleRate"] = (int)rigSampleRate;
+        }
+        obj["txAudioAvailable"] = txAudioConfigured;
+        obj["rigAudioInputName"] = rigCaptureDeviceName;
+        QJsonArray fdvModes;
+        fdvModes.append("RADE");
+        fdvModes.append("700D");
+        fdvModes.append("700E");
+        fdvModes.append("1600");
+        obj["freedvModes"] = fdvModes;
+        if (!rigCaps->scopeCenterSpans.empty()) {
+            QJsonArray spans;
+            for (const centerSpanData &s : rigCaps->scopeCenterSpans) {
+                QJsonObject span;
+                span["reg"] = s.reg;
+                span["name"] = s.name;
+                span["freq"] = (int)s.freq;
+                spans.append(span);
+            }
+            obj["spans"] = spans;
+        }
+        if (!rigCaps->scopeModes.empty()) {
+            // The rig's scope modes (Center / Fixed / Scroll-C / Scroll-F) as the
+            // rig file lists them; the browser picks which keys to show.
+            QJsonArray scopeModes;
+            for (const genericType &m : rigCaps->scopeModes) {
+                if (m.num > 3) continue;
+                QJsonObject sm;
+                sm["num"] = (int)m.num;
+                sm["name"] = m.name;
+                scopeModes.append(sm);
+            }
+            obj["scopeModes"] = scopeModes;
+        }
+        // The browser may set the Fixed-mode window (setScopeEdges) only when the
+        // rig file carries the 0x27 0x1E range table and both edge commands.
+        obj["scopeFixedEdges"] = !rigCaps->scopeEdgeRanges.empty() &&
+            rigCaps->commands.contains(funcScopeFixedEdgeFreq) && rigCaps->commands.contains(funcScopeEdge);
+        if (!rigCaps->preamps.empty()) {
+            QJsonArray preamps;
+            for (const genericType &p : rigCaps->preamps) {
+                QJsonObject po;
+                po["num"] = p.num;
+                po["name"] = p.name;
+                // Band-limited entries (IC-705: PREAMP 2 is HF/50 MHz only).
+                // Absent = valid across the rig's whole coverage.
+                if (p.minFreq) po["minFreq"] = double(p.minFreq);
+                if (p.maxFreq) po["maxFreq"] = double(p.maxFreq);
+                preamps.append(po);
+            }
+            obj["preamps"] = preamps;
+        }
+        if (!rigCaps->attenuators.empty()) {
+            QJsonArray attenuators;
+            for (const genericType &a : rigCaps->attenuators) {
+                QJsonObject ao;
+                ao["num"] = a.num;
+                ao["name"] = a.name;
+                // Band-limited entries (IC-705: the attenuator is HF/50 MHz only).
+                // Absent = valid across the rig's whole coverage.
+                if (a.minFreq) ao["minFreq"] = double(a.minFreq);
+                if (a.maxFreq) ao["maxFreq"] = double(a.maxFreq);
+                attenuators.append(ao);
+            }
+            obj["attenuators"] = attenuators;
+        }
+        if (!rigCaps->antennas.empty()) {
+            QJsonArray antennas;
+            for (const genericType &a : rigCaps->antennas) {
+                QJsonObject ao;
+                ao["num"] = a.num;
+                ao["name"] = a.name;
+                antennas.append(ao);
+            }
+            obj["antennas"] = antennas;
+            obj["hasRxAnt"] = rigCaps->commands.contains(funcRXAntenna);
+        }
+        if (!rigCaps->filters.empty()) {
+            QJsonArray filters;
+            for (const filterType &f : rigCaps->filters) {
+                QJsonObject fo;
+                fo["num"] = f.num;
+                fo["name"] = f.name;
+                filters.append(fo);
+            }
+            obj["filters"] = filters;
+        }
+        // Memory-group capabilities. memGroups is the highest group number
+        // (IC-9700: 3, one per band); memStart is the lowest (1 on the 9700,
+        // 0 on rigs whose groups are zero-based). Rigs with no groups report
+        // memGroups < memStart and the browser keeps group 0.
+        obj["memGroups"] = rigCaps->memGroups;
+        obj["memStart"] = rigCaps->memStart;
+        // Rig has a memory-mode toggle (V/M): the browser offers MEM in the
+        // VFO cycle only when the rig can actually enter/leave memory mode.
+        obj["hasMemoryMode"] = rigCaps->commands.contains(funcMemoryMode)
+                            && memoryContentsSupported();
+        // These channels are wfweb's, not the radio's (issue #114). The panel
+        // says so, and hides anything that would act on the rig's own list.
+        obj["memoriesLocal"] = !memoryContentsSupported();
+        sendJsonToAll(obj);
+
+        // Issue #76: rigs with an antenna selector but no periodic Antenna
+        // poll (IC-746/9100/756-family, Kenwood) need one initial read so the
+        // FUNC page shows the real selection. Harmless elsewhere: periodic-poll
+        // rigs (IC-7610/785x) refresh it anyway and set-only rigs drop the get.
+        if (!rigCaps->antennas.empty() && rigCaps->commands.contains(funcAntenna)) {
+            queue->add(priorityImmediate, funcAntenna, false, 0);
+        }
+
+        // Issue #31: poll both VFOs on initial connect so the Sub VFO display
+        // is populated without requiring user interaction. requestVfoUpdate()
+        // schedules a 200ms-delayed read of freq/mode for VFO A and (on cmd29
+        // rigs) VFO B; on non-cmd29 rigs the periodic status poll backfills
+        // the inactive VFO once selected/unselected freqs are cached.
+        requestVfoUpdate();
+    }
+}
+
+// --- HTTP Static File Serving ---
+
+void webServer::onHttpConnection()
+{
+    QTcpServer *srv = qobject_cast<QTcpServer *>(sender());
+    if (!srv) return;
+    QTcpSocket *socket = srv->nextPendingConnection();
+    // Tag connections arriving on the plain-HTTP REST port so onHttpReadyRead
+    // can serve them the signpost page instead of the SPA (#69).
+    if (srv == restServer)
+        socket->setProperty("isRestPort", true);
+    connect(socket, &QTcpSocket::readyRead, this, &webServer::onHttpReadyRead);
+    connect(socket, &QTcpSocket::disconnected, this, &webServer::onHttpDisconnected);
+}
+
+void webServer::onHttpReadyRead()
+{
+    QTcpSocket *socket = qobject_cast<QTcpSocket *>(sender());
+    if (!socket) return;
+
+    // WebSocket upgrade applies to SSL sockets or connections through the TLS proxy
+    bool isSslConnection = qobject_cast<QSslSocket *>(socket);
+#ifdef Q_OS_MACOS
+    if (!isSslConnection && useOpenSslProxy)
+        isSslConnection = (socket->localPort() == internalHttpPort);
+#endif
+    if (isSslConnection) {
+        QByteArray peek = socket->peek(4096);
+        if (peek.contains("Upgrade: websocket") || peek.contains("Upgrade: WebSocket")) {
+            disconnect(socket, &QTcpSocket::readyRead, this, &webServer::onHttpReadyRead);
+            disconnect(socket, &QTcpSocket::disconnected, this, &webServer::onHttpDisconnected);
+            wsServer->handleConnection(socket);
+            return;
+        }
+    }
+
+    // Accumulate — body may arrive in a later TCP segment than the headers
+    socketBuffers[socket] += socket->readAll();
+    const QByteArray &request = socketBuffers[socket];
+
+    // Wait until we have the complete headers
+    int sepIdx = request.indexOf("\r\n\r\n");
+    if (sepIdx < 0) return;
+
+    qDebug() << "REST headers:" << request.left(sepIdx);
+
+    QByteArray headerSection = request.left(sepIdx);
+    QByteArray lowerHeaders = headerSection.toLower();
+
+    // If there's a Content-Length, wait until the full body has arrived
+    int clIdx = lowerHeaders.indexOf("content-length:");
+    if (clIdx >= 0) {
+        int clEnd = lowerHeaders.indexOf("\r\n", clIdx);
+        int contentLength = headerSection.mid(clIdx + 15, clEnd - clIdx - 15).trimmed().toInt();
+        if (contentLength > 0 && request.length() < sepIdx + 4 + contentLength)
+            return; // body not yet complete — wait for next readyRead
+    }
+
+    // Full request received — extract body then release the buffer
+    QByteArray body;
+    if (clIdx >= 0) {
+        int clEnd = lowerHeaders.indexOf("\r\n", clIdx);
+        int contentLength = headerSection.mid(clIdx + 15, clEnd - clIdx - 15).trimmed().toInt();
+        if (contentLength > 0)
+            body = request.mid(sepIdx + 4, contentLength);
+    }
+    socketBuffers.remove(socket);
+
+    // Parse first line: METHOD /path HTTP/1.1
+    int firstLineEnd = headerSection.indexOf("\r\n");
+    QByteArray firstLine = (firstLineEnd >= 0) ? headerSection.left(firstLineEnd) : headerSection;
+    QList<QByteArray> parts = firstLine.split(' ');
+    if (parts.size() < 2) return;
+
+    QString method = QString::fromUtf8(parts[0]);
+    QString path = QString::fromUtf8(parts[1]);
+
+    // Split off the query string; the logbook list endpoint takes parameters
+    QUrlQuery query;
+    int qIdx = path.indexOf('?');
+    if (qIdx >= 0) {
+        query.setQuery(path.mid(qIdx + 1));
+        path = path.left(qIdx);
+    }
+
+    // OPTIONS preflight for CORS
+    if (method == "OPTIONS") {
+        sendRestResponse(socket, 200, QJsonObject());
+        return;
+    }
+
+    // REST API routing
+    if (path.startsWith("/api/v1/")) {
+        handleRestRequest(socket, method, path, query, body);
+        return;
+    }
+
+    if (method != "GET") {
+        sendHttpResponse(socket, 405, "Method Not Allowed", "text/plain", "Method Not Allowed");
+        return;
+    }
+
+    // On the plain-HTTP REST port, a non-API GET is almost always a browser
+    // that reached for the wrong port: serving the SPA here leaves it stuck
+    // retrying a WebSocket that only lives on the HTTPS port.  Hand back a
+    // signpost to the real web UI instead (#69).
+    if (socket->property("isRestPort").toBool()) {
+        serveRestInfoPage(socket, headerSection);
+        return;
+    }
+
+    // Default to index.html
+    if (path == "/") {
+        path = "/index.html";
+    }
+
+    serveStaticFile(socket, path, headerSection);
+}
+
+void webServer::onHttpDisconnected()
+{
+    QTcpSocket *socket = qobject_cast<QTcpSocket *>(sender());
+    if (socket) {
+        socketBuffers.remove(socket);
+        socket->deleteLater();
+    }
+}
+
+void webServer::serveStaticFile(QTcpSocket *socket, const QString &path, const QByteArray &headerSection)
+{
+    // Serve from Qt resource system
+    QString resourcePath = ":/web" + path;
+    QFile file(resourcePath);
+
+    if (!file.exists() || !file.open(QIODevice::ReadOnly)) {
+        sendHttpResponse(socket, 404, "Not Found", "text/plain", "Not Found");
+        return;
+    }
+
+    // The CW decoder's model and ONNX runtime (~27 MB together) only change
+    // with a release, and the decoder fetches them on every page that opens
+    // in CW.  Every other resource goes out no-store (see sendHttpResponse);
+    // these two directories get a version+size ETag and "no-cache", which
+    // lets the browser keep the bytes and revalidate with one small round
+    // trip, answered 304 here.
+    const bool revalidable = path.startsWith("/models/") || path.startsWith("/ort/");
+    QByteArray extraHeaders;
+    if (revalidable) {
+        const QByteArray etag = "\"" WFWEB_VERSION "-" + QByteArray::number(file.size()) + "\"";
+        extraHeaders = "ETag: " + etag + "\r\nCache-Control: no-cache\r\n";
+        const QByteArray lower = headerSection.toLower();
+        const int inm = lower.indexOf("if-none-match:");
+        if (inm >= 0) {
+            const int end = lower.indexOf("\r\n", inm);
+            const QByteArray given = headerSection.mid(inm + 14, (end >= 0 ? end : headerSection.size()) - inm - 14).trimmed();
+            if (given == etag || given == "*") {
+                file.close();
+                sendHttpResponse(socket, 304, "Not Modified", "application/octet-stream", QByteArray(), extraHeaders);
+                return;
+            }
+        }
+    }
+
+    QByteArray body = file.readAll();
+    file.close();
+
+    // Determine content type
+    QByteArray contentType = "application/octet-stream";
+    if (path.endsWith(".html")) contentType = "text/html; charset=utf-8";
+    else if (path.endsWith(".js")) contentType = "application/javascript; charset=utf-8";
+    else if (path.endsWith(".mjs")) contentType = "application/javascript; charset=utf-8";
+    else if (path.endsWith(".map")) contentType = "application/json; charset=utf-8";
+    else if (path.endsWith(".css")) contentType = "text/css; charset=utf-8";
+    else if (path.endsWith(".png")) contentType = "image/png";
+    else if (path.endsWith(".svg")) contentType = "image/svg+xml";
+    else if (path.endsWith(".ico")) contentType = "image/x-icon";
+    else if (path.endsWith(".wasm")) contentType = "application/wasm"; // required for WebAssembly streaming compile
+    else if (path.endsWith(".onnx")) contentType = "application/octet-stream";
+    else if (path.endsWith("LICENSE")) contentType = "text/plain; charset=utf-8";
+
+    sendHttpResponse(socket, 200, "OK", contentType, body, extraHeaders);
+}
+
+void webServer::serveRestInfoPage(QTcpSocket *socket, const QByteArray &headerSection)
+{
+    // Pull the hostname out of the Host: header so we can offer a best-effort
+    // link to the web UI on the HTTPS port.  Strip any port the client sent
+    // (this is the REST port) and handle bracketed IPv6 literals.
+    QString host;
+    const QList<QByteArray> lines = headerSection.split('\n');
+    for (const QByteArray &line : lines) {
+        if (line.toLower().startsWith("host:")) {
+            host = QString::fromUtf8(line.mid(5)).trimmed();
+            break;
+        }
+    }
+    if (host.startsWith('[')) {
+        // IPv6 literal: keep "[...]" intact, drop a trailing :port
+        int close = host.indexOf(']');
+        if (close >= 0) host = host.left(close + 1);
+    } else {
+        int colon = host.indexOf(':');
+        if (colon >= 0) host = host.left(colon);
+    }
+    if (host.isEmpty()) host = "<host>";
+
+    QString hostEsc = host.toHtmlEscaped();
+    QString webUrl = QString("https://%1:%2/").arg(hostEsc).arg(webHttpsPort);
+
+    QString html = QStringLiteral(
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>wfweb REST API</title>\n"
+        "<style>\n"
+        "  body { font-family: system-ui, sans-serif; max-width: 40em; margin: 3em auto;\n"
+        "         padding: 0 1em; line-height: 1.5; color: #222; background: #fafafa; }\n"
+        "  h1 { font-size: 1.4em; } code { background: #eee; padding: 0 .3em; border-radius: 3px; }\n"
+        "  a.btn { display: inline-block; margin: 1em 0; padding: .6em 1.1em; background: #2563eb;\n"
+        "          color: #fff; text-decoration: none; border-radius: 5px; }\n"
+        "  .note { color: #555; font-size: .9em; }\n"
+        "</style></head><body>\n"
+        "<h1>This is the wfweb REST API endpoint</h1>\n"
+        "<p>You've reached the plain-HTTP REST/API port. The web user interface is served over\n"
+        "HTTPS on a different port.</p>\n"
+        "<p><a class=\"btn\" href=\"%1\">Open the web UI &rarr;</a></p>\n"
+        "<p class=\"note\">If that link doesn't work, the inferred port may be wrong &mdash; for\n"
+        "example if you remapped ports with Docker. The web UI is the HTTPS port you mapped to the\n"
+        "container's web port (default <code>8080</code>), not this REST port.</p>\n"
+        "<p class=\"note\">Programmatic clients should call <code>/api/v1/&hellip;</code> on this port.\n"
+        "See <a href=\"https://github.com/adecarolis/wfweb/blob/master/REST_API.md\">REST_API.md</a>\n"
+        "for the full API.</p>\n"
+        "</body></html>\n").arg(webUrl);
+
+    sendHttpResponse(socket, 200, "OK", "text/html; charset=utf-8", html.toUtf8());
+}
+
+void webServer::sendHttpResponse(QTcpSocket *socket, int statusCode, const QString &statusText,
+                                  const QByteArray &contentType, const QByteArray &body,
+                                  const QByteArray &extraHeaders)
+{
+    QByteArray response;
+    response.append(QString("HTTP/1.1 %1 %2\r\n").arg(statusCode).arg(statusText).toUtf8());
+    response.append("Content-Type: " + contentType + "\r\n");
+    if (contentType.startsWith("application/x-adif"))
+        response.append("Content-Disposition: attachment; filename=logbook.adi\r\n");
+    response.append(QString("Content-Length: %1\r\n").arg(body.size()).toUtf8());
+    response.append("Connection: close\r\n");
+    response.append("Access-Control-Allow-Origin: *\r\n");
+    // The resources are embedded in the binary and change every build;
+    // there's no CDN in front.  Tell browsers not to cache so a wfweb
+    // rebuild never serves stale JS/CSS to a reloaded page.  A caller that
+    // supplies its own Cache-Control (serveStaticFile, for the CW model and
+    // runtime) replaces this block.
+    if (!extraHeaders.contains("Cache-Control:")) {
+        response.append("Cache-Control: no-store, no-cache, must-revalidate\r\n");
+        response.append("Pragma: no-cache\r\n");
+    }
+    response.append(extraHeaders);
+    response.append("\r\n");
+    response.append(body);
+
+    socket->write(response);
+    socket->flush();
+    socket->disconnectFromHost();
+}
+
+void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json)
+{
+    QByteArray body;
+    if (!json.isEmpty())
+        body = QJsonDocument(json).toJson(QJsonDocument::Compact);
+
+    QString statusText;
+    switch (statusCode) {
+    case 200: statusText = "OK"; break;
+    case 202: statusText = "Accepted"; break;
+    case 400: statusText = "Bad Request"; break;
+    case 404: statusText = "Not Found"; break;
+    case 405: statusText = "Method Not Allowed"; break;
+    case 503: statusText = "Service Unavailable"; break;
+    default:  statusText = "OK"; break;
+    }
+
+    QByteArray response;
+    response.append(QString("HTTP/1.1 %1 %2\r\n").arg(statusCode).arg(statusText).toUtf8());
+    response.append("Content-Type: application/json\r\n");
+    response.append(QString("Content-Length: %1\r\n").arg(body.size()).toUtf8());
+    response.append("Connection: close\r\n");
+    response.append("Access-Control-Allow-Origin: *\r\n");
+    response.append("Access-Control-Allow-Methods: GET, PUT, POST, DELETE, OPTIONS\r\n");
+    response.append("Access-Control-Allow-Headers: Content-Type\r\n");
+    response.append("\r\n");
+    response.append(body);
+
+    socket->write(response);
+    socket->flush();
+    socket->disconnectFromHost();
+}
+
+void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
+                                   const QString &path, const QUrlQuery &query,
+                                   const QByteArray &body)
+{
+    // Normalize path: strip trailing slash
+    QString p = path;
+    if (p.length() > 1 && p.endsWith('/')) p.chop(1);
+
+    // Helper: parse JSON body; returns empty object on empty/invalid input
+    auto parseBody = [&]() -> QJsonObject {
+        if (body.isEmpty()) return QJsonObject();
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(body, &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject()) return QJsonObject();
+        return doc.object();
+    };
+
+    // --- Station identity: one callsign + grid for the whole server ---
+    if (p == "/api/v1/station") {
+        if (method == "GET") {
+            sendRestResponse(socket, 200, QJsonObject{{"callsign", reporterCallsign}, {"grid", reporterGrid}});
+        } else if (method == "PUT" || method == "POST") {
+            const QJsonObject in = parseBody();
+            applyStationCallsign(in.value("callsign").toString(), in.value("grid").toString(), true);
+            sendRestResponse(socket, 200, QJsonObject{{"callsign", reporterCallsign}, {"grid", reporterGrid}});
+        } else {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        }
+        return;
+    }
+
+    // --- CW keyer macros: one set for every browser ---
+    if (p == "/api/v1/cw/macros") {
+        if (method == "GET") {
+            sendRestResponse(socket, 200, QJsonObject{{"macros", cwMacrosJson()}});
+        } else if (method == "PUT" || method == "POST") {
+            const QJsonObject in = parseBody();
+            applyCwMacros(in.contains("macros") ? in.value("macros").toObject() : in, "REST");
+            sendRestResponse(socket, 200, QJsonObject{{"macros", cwMacrosJson()}});
+        } else {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        }
+        return;
+    }
+
+    // --- Station logbook (see logbook.h) ---
+    // The log is never returned whole: GET pages newest-first with a cursor
+    // so a lifetime log stays cheap for the browser and the Pi alike.
+    if (p == "/api/v1/logbook/adif") {
+        if (method == "GET") {
+            // ?new=1: only records without an export stamp, as plain ADIF
+            // without wfweb's own fields (a file for other services).  A
+            // client that wants to confirm the export uses /export instead,
+            // which also returns the ids.
+            if (query.queryItemValue("new") == "1") {
+                sendHttpResponse(socket, 200, "OK", "application/x-adif; charset=utf-8", logbook_.toAdif(true, false));
+                return;
+            }
+            QFile file(logbook_.path());
+            if (!file.open(QIODevice::ReadOnly)) {
+                sendHttpResponse(socket, 500, "Internal Server Error", "text/plain",
+                                 file.errorString().toUtf8());
+                return;
+            }
+            sendHttpResponse(socket, 200, "OK", "application/x-adif; charset=utf-8", file.readAll());
+        } else if (method == "POST") {
+            // Import: merge every record of the posted ADIF document.  An
+            // imported file normally comes from a log that already handled
+            // its own uploads, so its records count as exported unless the
+            // caller says ?new=1.
+            QList<QsoRecord> incoming = Logbook::parseAdif(body);
+            if (query.queryItemValue("new") != "1") {
+                const QString stamp = Logbook::exportStamp();
+                for (QsoRecord &r : incoming)
+                    if (r.exported.isEmpty()) r.exported = stamp;
+            }
+            const int added = logbook_.merge(incoming);
+            qInfo() << "Logbook: imported" << added << "of" << incoming.size() << "QSOs over REST";
+            if (added) logbookReset();
+            sendRestResponse(socket, 202, QJsonObject{{"added", added}, {"skipped", incoming.size() - added},
+                                                     {"total", logbook_.count()}, {"unexported", logbook_.unexportedCount()}});
+        } else {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        }
+        return;
+    }
+    if (p == "/api/v1/logbook/worked") {
+        if (method != "GET") { sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}}); return; }
+        sendRestResponse(socket, 200, QJsonObject{{"calls", logbook_.workedCalls()}, {"total", logbook_.count()}});
+        return;
+    }
+    if (p == "/api/v1/logbook/export") {
+        // The "download new QSOs" document plus the ids it contains, taken
+        // together so the client can confirm exactly what it saved.
+        if (method != "GET") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        const QStringList ids = logbook_.unexportedIds();
+        sendRestResponse(socket, 200, QJsonObject{{"count", ids.size()},
+                                                 {"ids", QJsonArray::fromStringList(ids)},
+                                                 {"adif", QString::fromUtf8(logbook_.toAdif(true, false))}});
+        return;
+    }
+    if (p == "/api/v1/logbook/exported") {
+        // The client that saved a "new" download reports the ids it got.
+        if (method != "POST") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        QStringList ids;
+        const QJsonArray arr = parseBody().value("ids").toArray();
+        for (const QJsonValue &v : arr) ids.append(v.toString());
+        const int marked = logbook_.markExported(ids);
+        if (marked) {
+            qInfo() << "Logbook:" << marked << "QSOs marked as exported";
+            logbookReset();
+        }
+        sendRestResponse(socket, 200, QJsonObject{{"marked", marked}, {"unexported", logbook_.unexportedCount()}});
+        return;
+    }
+    if (p == "/api/v1/logbook") {
+        if (method == "GET") {
+            const Logbook::Page pg = logbook_.page(query.queryItemValue("limit").toInt(),
+                                                   query.queryItemValue("before"),
+                                                   query.queryItemValue("call"));
+            QJsonArray entries;
+            for (const QsoRecord &r : pg.entries) entries.append(r.toJson());
+            QJsonObject out{{"entries", entries}, {"total", logbook_.count()},
+                            {"unexported", logbook_.unexportedCount()}};
+            if (!pg.next.isEmpty()) out["next"] = pg.next;
+            sendRestResponse(socket, 200, out);
+        } else if (method == "POST") {
+            QsoRecord r = QsoRecord::fromJson(parseBody());
+            if (!r.isValid()) {
+                sendRestResponse(socket, 400, QJsonObject{{"error", "A valid call is required"}});
+            } else if (!logbookAdd(r)) {
+                sendRestResponse(socket, 500, QJsonObject{{"error", "Logbook is not writable"}});
+            } else {
+                sendRestResponse(socket, 202, r.toJson());
+            }
+        } else if (method == "DELETE") {
+            if (logbookClear("REST")) sendRestResponse(socket, 202, QJsonObject{{"status", "cleared"}});
+            else sendRestResponse(socket, 500, QJsonObject{{"error", "Logbook is not writable"}});
+        } else {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        }
+        return;
+    }
+    if (p.startsWith("/api/v1/logbook/")) {
+        const QString id = p.mid(QStringLiteral("/api/v1/logbook/").size());
+        if (!logbook_.find(id)) {
+            sendRestResponse(socket, 404, QJsonObject{{"error", "QSO not found"}});
+        } else if (method == "PUT") {
+            const QsoRecord r = QsoRecord::fromJson(parseBody(), id);
+            if (!r.isValid()) {
+                sendRestResponse(socket, 400, QJsonObject{{"error", "A valid call is required"}});
+            } else if (!logbookUpdate(id, r)) {
+                sendRestResponse(socket, 500, QJsonObject{{"error", "Logbook is not writable"}});
+            } else {
+                sendRestResponse(socket, 200, logbook_.find(id)->toJson());
+            }
+        } else if (method == "DELETE") {
+            logbookRemove(id);
+            sendRestResponse(socket, 202, QJsonObject{{"status", "deleted"}});
+        } else {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        }
+        return;
+    }
+
+    // --- GET /api/v1/radio ---
+    if (p == "/api/v1/radio") {
+        if (method != "GET") {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e); return;
+        }
+        QJsonObject resp;
+        resp["info"] = buildInfoJson();
+        if (queue && rigCaps) {
+            QJsonObject status = buildStatusJson();
+            status.remove("type");
+            resp["status"] = status;
+        }
+        sendRestResponse(socket, 200, resp);
+        return;
+    }
+
+    // --- GET /api/v1/radio/info ---
+    if (p == "/api/v1/radio/info") {
+        if (method != "GET") {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e); return;
+        }
+        sendRestResponse(socket, 200, buildInfoJson());
+        return;
+    }
+
+    // --- GET /api/v1/radio/status ---
+    if (p == "/api/v1/radio/status") {
+        if (method != "GET") {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e); return;
+        }
+        if (!queue || !rigCaps) {
+            QJsonObject e; e["error"] = "Rig not connected";
+            sendRestResponse(socket, 503, e); return;
+        }
+        QJsonObject status = buildStatusJson();
+        status.remove("type");
+        sendRestResponse(socket, 200, status);
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/frequency ---
+    if (p == "/api/v1/radio/frequency") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, false);
+            cacheItem freqCache = queue->getCache(t.freqFunc, t.receiver);
+            QJsonObject resp;
+            resp["hz"] = QJsonValue(QJsonValue::Null);
+            resp["mhz"] = QJsonValue(QJsonValue::Null);
+            if (freqCache.value.isValid()) {
+                freqt f = freqCache.value.value<freqt>();
+                if (f.Hz) {
+                    resp["hz"] = (qint64)f.Hz;
+                    resp["mhz"] = f.MHzDouble;
+                }
+            }
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (!obj.contains("hz")) {
+                QJsonObject e; e["error"] = "Missing field: hz";
+                sendRestResponse(socket, 400, e); return;
+            }
+            quint64 hz = obj["hz"].toVariant().toULongLong();
+            if (hz == 0) {
+                QJsonObject e; e["error"] = "Invalid frequency";
+                sendRestResponse(socket, 400, e); return;
+            }
+            freqt f;
+            f.Hz = hz;
+            f.MHzDouble = hz / 1.0E6;
+            f.VFO = activeVFO;
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            queue->addUnique(priorityImmediate, queueItem(t.freqFunc, QVariant::fromValue<freqt>(f), false, t.receiver));
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/mode ---
+    if (p == "/api/v1/radio/mode") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, false);
+            cacheItem modeCache = operatingModeCache(t);
+            QJsonObject resp;
+            resp["mode"] = QJsonValue(QJsonValue::Null);
+            resp["filter"] = QJsonValue(QJsonValue::Null);
+            if (modeCache.value.isValid()) {
+                modeInfo m = modeCache.value.value<modeInfo>();
+                resp["mode"] = modeJson(m);
+                resp["filter"] = filterJson(m);
+            }
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (!obj.contains("mode")) {
+                QJsonObject e; e["error"] = "Missing field: mode";
+                sendRestResponse(socket, 400, e); return;
+            }
+            modeInfo m = stringToMode(obj["mode"].toString());
+            if (m.mk == modeUnknown) {
+                QJsonObject e; e["error"] = "Unknown mode";
+                sendRestResponse(socket, 400, e); return;
+            }
+            if (obj.contains("filter")) {
+                int filt = obj["filter"].toInt();
+                if (filt >= 1 && filt <= 3) m.filter = filt;
+            }
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            queue->addUnique(priorityImmediate, queueItem(t.modeFunc, QVariant::fromValue<modeInfo>(m), false, t.receiver));
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/vfo ---
+    if (p == "/api/v1/radio/vfo") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject resp;
+            vfoCommandType tA = queue->getVfoCommand(vfoA, 0, false);
+            cacheItem freqA = queue->getCache(tA.freqFunc, 0);
+            if (freqA.value.isValid()) resp["vfoA"] = freqJson(freqA.value.value<freqt>());
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            vfoCommandType tB = queue->getVfoCommand(vfoB, cmd29 ? 1 : 0, false);
+            cacheItem freqB = queue->getCache(tB.freqFunc, cmd29 ? 1 : 0);
+            if (freqB.value.isValid()) resp["vfoB"] = freqJson(freqB.value.value<freqt>());
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (obj.contains("action")) {
+                QString action = obj["action"].toString();
+                if (action == "swap") {
+                    funcs swapFunc = funcNone;
+                    if (rigCaps) {
+                        if (rigCaps->commands.contains(funcVFOSwapAB))
+                            swapFunc = funcVFOSwapAB;
+                        else if (rigCaps->commands.contains(funcVFOSwapMS))
+                            swapFunc = funcVFOSwapMS;
+                    }
+                    if (swapFunc != funcNone)
+                        queue->add(priorityImmediate, swapFunc, false, 0);
+                    requestVfoUpdate();
+                    QJsonObject resp; resp["status"] = "accepted";
+                    sendRestResponse(socket, 202, resp);
+                } else if (action == "equalize") {
+                    funcs eqFunc = funcNone;
+                    if (rigCaps) {
+                        if (rigCaps->commands.contains(funcVFOEqualAB))
+                            eqFunc = funcVFOEqualAB;
+                        else if (rigCaps->commands.contains(funcVFOEqualMS))
+                            eqFunc = funcVFOEqualMS;
+                    }
+                    if (eqFunc != funcNone)
+                        queue->add(priorityImmediate, eqFunc, false, 0);
+                    requestVfoUpdate();
+                    QJsonObject resp; resp["status"] = "accepted";
+                    sendRestResponse(socket, 202, resp);
+                } else {
+                    QJsonObject e; e["error"] = "Unknown action (use swap or equalize)";
+                    sendRestResponse(socket, 400, e);
+                }
+            } else if (obj.contains("active")) {
+                QString vfoName = obj["active"].toString();
+                bool wantB = (vfoName == "B");
+                vfo_t v;
+                if (rigCaps && rigCaps->hasCommand29)
+                    v = wantB ? vfoSub : vfoMain;
+                else
+                    v = wantB ? vfoB : vfoA;
+                activeVfoLocal = v;
+                activeReceiver = wantB ? 1 : 0;
+                queue->addUnique(priorityImmediate, queueItem(funcSelectVFO, QVariant::fromValue<vfo_t>(v), false));
+                requestVfoUpdate();
+                QJsonObject resp; resp["status"] = "accepted";
+                sendRestResponse(socket, 202, resp);
+            } else {
+                QJsonObject e; e["error"] = "Missing field: active or action";
+                sendRestResponse(socket, 400, e);
+            }
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/ptt ---
+    if (p == "/api/v1/radio/ptt") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            cacheItem txStatus = queue->getCache(funcTransceiverStatus, 0);
+            QJsonObject resp;
+            if (txStatus.value.isValid()) resp["transmitting"] = txStatus.value.toBool();
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (!obj.contains("transmitting")) {
+                QJsonObject e; e["error"] = "Missing field: transmitting";
+                sendRestResponse(socket, 400, e); return;
+            }
+            bool on = obj["transmitting"].toBool();
+            queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(on), false, uchar(0)));
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET /api/v1/radio/meters ---
+    if (p == "/api/v1/radio/meters") {
+        if (method != "GET") {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e); return;
+        }
+        if (!queue || !rigCaps) {
+            QJsonObject e; e["error"] = "Rig not connected";
+            sendRestResponse(socket, 503, e); return;
+        }
+        QJsonObject resp;
+        cacheItem smeter = queue->getCache(funcSMeter, 0);
+        if (smeter.value.isValid()) resp["sMeter"] = smeter.value.toDouble();
+        cacheItem power = queue->getCache(funcPowerMeter, 0);
+        if (power.value.isValid()) resp["powerMeter"] = power.value.toDouble();
+        cacheItem swr = queue->getCache(funcSWRMeter, 0);
+        if (swr.value.isValid()) resp["swrMeter"] = swr.value.toDouble();
+        cacheItem alc = queue->getCache(funcALCMeter, 0);
+        if (alc.value.isValid()) resp["alcMeter"] = alc.value.toDouble();
+        addTxMeterReadings(resp);
+        sendRestResponse(socket, 200, resp);
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/gains ---
+    if (p == "/api/v1/radio/gains") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject resp;
+            cacheItem afGain = queue->getCache(funcAfGain, 0);
+            if (afGain.value.isValid()) resp["afGain"] = afGain.value.toInt();
+            cacheItem rfGain = queue->getCache(funcRfGain, 0);
+            if (rfGain.value.isValid()) resp["rfGain"] = rfGain.value.toInt();
+            cacheItem rfPower = queue->getCache(funcRFPower, 0);
+            if (rfPower.value.isValid()) resp["rfPower"] = rfPower.value.toInt();
+            cacheItem squelch = queue->getCache(funcSquelch, 0);
+            if (squelch.value.isValid()) resp["squelch"] = squelch.value.toInt();
+            cacheItem micGain = queue->getCache(funcUSBModLevel, 0);
+            if (micGain.value.isValid()) resp["micGain"] = micGain.value.toInt();
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (obj.isEmpty()) {
+                QJsonObject e; e["error"] = "Empty or invalid JSON body";
+                sendRestResponse(socket, 400, e); return;
+            }
+            if (obj.contains("afGain")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["afGain"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcAfGain, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            if (obj.contains("rfGain")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["rfGain"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcRfGain, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            if (obj.contains("rfPower")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["rfPower"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcRFPower, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            if (obj.contains("squelch")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["squelch"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcSquelch, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            if (obj.contains("micGain")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["micGain"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcUSBModLevel, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/rx ---
+    if (p == "/api/v1/radio/rx") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject resp;
+            cacheItem preamp = queue->getCache(funcPreamp, 0);
+            if (preamp.value.isValid()) resp["preamp"] = preamp.value.toInt();
+            cacheItem att = queue->getCache(funcAttenuator, 0);
+            if (att.value.isValid()) resp["attenuator"] = att.value.toInt();
+            cacheItem nb = queue->getCache(funcNoiseBlanker, 0);
+            if (nb.value.isValid()) resp["nb"] = nb.value.toBool();
+            cacheItem nr = queue->getCache(funcNoiseReduction, 0);
+            if (nr.value.isValid()) resp["nr"] = nr.value.toBool();
+            cacheItem agc = queue->getCache(funcAGC, 0);
+            if (agc.value.isValid()) resp["agc"] = agc.value.toInt();
+            cacheItem anf = queue->getCache(funcAutoNotch, 0);
+            if (anf.value.isValid()) resp["autoNotch"] = anf.value.toBool();
+            cacheItem fw = queue->getCache(funcFilterWidth, 0);
+            if (fw.value.isValid()) resp["filterWidth"] = fw.value.toInt();
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (obj.isEmpty()) {
+                QJsonObject e; e["error"] = "Empty or invalid JSON body";
+                sendRestResponse(socket, 400, e); return;
+            }
+            if (obj.contains("preamp")) {
+                uchar val = static_cast<uchar>(qBound(0, obj["preamp"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcPreamp, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("attenuator")) {
+                uchar val = static_cast<uchar>(qBound(0, obj["attenuator"].toInt(), 255));
+                queue->addUnique(priorityImmediate, queueItem(funcAttenuator, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("nb")) {
+                uchar val = obj["nb"].toBool() ? 1 : 0;
+                queue->addUnique(priorityImmediate, queueItem(funcNoiseBlanker, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("nr")) {
+                uchar val = obj["nr"].toBool() ? 1 : 0;
+                queue->addUnique(priorityImmediate, queueItem(funcNoiseReduction, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("agc")) {
+                uchar val = static_cast<uchar>(qBound(0, obj["agc"].toInt(), 255));
+                queue->add(priorityImmediate, queueItem(funcAGC, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("autoNotch")) {
+                uchar val = obj["autoNotch"].toBool() ? 1 : 0;
+                queue->addUnique(priorityImmediate, queueItem(funcAutoNotch, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("filterWidth")) {
+                ushort val = static_cast<ushort>(qBound(0, obj["filterWidth"].toInt(), 10000));
+                queue->addUnique(priorityImmediate, queueItem(funcFilterWidth, QVariant::fromValue<ushort>(val), false, 0));
+            }
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET/PUT /api/v1/radio/tx ---
+    if (p == "/api/v1/radio/tx") {
+        if (method == "GET") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject resp;
+            cacheItem split = queue->getCache(funcSplitStatus, 0);
+            if (split.value.isValid()) resp["split"] = split.value.toBool();
+            cacheItem tuner = queue->getCache(funcTunerStatus, 0);
+            if (tuner.value.isValid()) resp["tuner"] = tuner.value.toInt();
+            cacheItem comp = queue->getCache(funcCompressor, 0);
+            if (comp.value.isValid()) resp["compressor"] = comp.value.toBool();
+            cacheItem mon = queue->getCache(funcMonitor, 0);
+            if (mon.value.isValid()) resp["monitor"] = mon.value.toBool();
+            cacheItem duplex = queue->getCache(funcDuplexMode, 0);
+            if (duplex.value.isValid())
+                resp["duplex"] = duplexModeName(duplex.value.value<duplexMode_t>());
+            if (rigCaps->commands.contains(funcReadFreqOffset)) {
+                cacheItem dupOffset = queue->getCache(funcReadFreqOffset, 0);
+                if (dupOffset.value.isValid())
+                    resp["duplexOffset"] = (double)dupOffset.value.value<freqt>().Hz;
+            }
+            addToneStatus(resp);
+            sendRestResponse(socket, 200, resp);
+        } else if (method == "PUT") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (obj.isEmpty()) {
+                QJsonObject e; e["error"] = "Empty or invalid JSON body";
+                sendRestResponse(socket, 400, e); return;
+            }
+            if (obj.contains("split")) {
+                uchar val = obj["split"].toBool() ? 1 : 0;
+                queue->addUnique(priorityImmediate, queueItem(funcSplitStatus, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("tuner")) {
+                uchar val = static_cast<uchar>(qBound(0, obj["tuner"].toInt(), 2));
+                queue->addUnique(priorityImmediate, queueItem(funcTunerStatus, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("compressor")) {
+                uchar val = obj["compressor"].toBool() ? 1 : 0;
+                queue->add(priorityImmediate, queueItem(funcCompressor, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            if (obj.contains("duplex")) {
+                duplexMode_t dm = duplexModeFromName(obj["duplex"].toString());
+                queue->addUnique(priorityImmediate, queueItem(funcSplitStatus, QVariant::fromValue<duplexMode_t>(dm), false, 0));
+                queue->receiveValue(funcDuplexMode, QVariant::fromValue<duplexMode_t>(dm), 0);
+            }
+            if (obj.contains("duplexOffset")) {
+                freqt off;
+                off.Hz = static_cast<quint64>(qBound(0.0, obj["duplexOffset"].toDouble(), 99999900.0)) / 100 * 100;
+                off.MHzDouble = off.Hz / 1000000.0;
+                queue->addUnique(priorityImmediate, queueItem(funcSendFreqOffset, QVariant::fromValue<freqt>(off), false, 0));
+                queue->receiveValue(funcReadFreqOffset, QVariant::fromValue<freqt>(off), 0);
+            }
+            if (obj.contains("toneMode") && toneCommandsAvailable()) {
+                applyToneMode(toneModeFromName(obj["toneMode"].toString()));
+            }
+            for (const auto &pair : { std::make_pair(QStringLiteral("toneFreq"), funcToneFreq),
+                                      std::make_pair(QStringLiteral("tsqlFreq"), funcTSQLFreq) }) {
+                if (!obj.contains(pair.first) || !rigCaps->commands.contains(pair.second)) continue;
+                toneInfo t;
+                if (!findToneByReg(rigCaps->ctcss, static_cast<ushort>(obj[pair.first].toInt()), &t)) continue;
+                queue->addUnique(priorityImmediate, queueItem(pair.second, QVariant::fromValue<toneInfo>(t), false, 0));
+                queue->receiveValue(pair.second, QVariant::fromValue<toneInfo>(t), 0);
+            }
+            if (obj.contains("dtcsCode") && rigCaps->commands.contains(funcDTCSCode)) {
+                toneInfo t;
+                if (findToneByReg(rigCaps->dtcs, static_cast<ushort>(obj["dtcsCode"].toInt()), &t)) {
+                    int pol = obj["dtcsPolarity"].toInt();
+                    t.tinv = (pol & 2) != 0;
+                    t.rinv = (pol & 1) != 0;
+                    queue->addUnique(priorityImmediate, queueItem(funcDTCSCode, QVariant::fromValue<toneInfo>(t), false, 0));
+                    queue->receiveValue(funcDTCSCode, QVariant::fromValue<toneInfo>(t), 0);
+                }
+            }
+            if (obj.contains("monitor")) {
+                uchar val = obj["monitor"].toBool() ? 1 : 0;
+                queue->add(priorityImmediate, queueItem(funcMonitor, QVariant::fromValue<uchar>(val), false, 0));
+            }
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- POST/DELETE /api/v1/radio/cw ---
+    if (p == "/api/v1/radio/cw") {
+        if (method == "POST") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            QJsonObject obj = parseBody();
+            if (!obj.contains("text")) {
+                QJsonObject e; e["error"] = "Missing field: text";
+                sendRestResponse(socket, 400, e); return;
+            }
+            QString text = obj["text"].toString();
+            if (text.isEmpty()) {
+                QJsonObject e; e["error"] = "Empty CW text";
+                sendRestResponse(socket, 400, e); return;
+            }
+            if (obj.contains("wpm")) {
+                ushort wpm = static_cast<ushort>(qBound(6, obj["wpm"].toInt(), 48));
+                queue->add(priorityImmediate, queueItem(funcKeySpeed, QVariant::fromValue<ushort>(wpm), false, 0));
+            }
+            queue->add(priorityImmediate, queueItem(funcSendCW, QVariant::fromValue<QString>(text)));
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else if (method == "DELETE") {
+            if (!queue || !rigCaps) {
+                QJsonObject e; e["error"] = "Rig not connected";
+                sendRestResponse(socket, 503, e); return;
+            }
+            queue->add(priorityImmediate, queueItem(funcSendCW, QVariant::fromValue<QString>(QString())));
+            QJsonObject resp; resp["status"] = "accepted";
+            sendRestResponse(socket, 202, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- GET /api/v1/radio/memories ---
+    if (p == "/api/v1/radio/memories") {
+        if (method == "GET") {
+            QJsonArray arr;
+            if (!memoryContentsSupported()) {
+                // wfweb's own channels (issue #114) — no rig scan behind this
+                // one, so it answers straight away and is always complete.
+                for (const localMemory &m : memStore.all()) arr.append(localMemoryToJson(m));
+            } else {
+                for (auto it = memories.constBegin(); it != memories.constEnd(); ++it) {
+                    if (!it.value().del) {
+                        arr.append(memoryToJson(it.value()));
+                    }
+                }
+            }
+            QJsonObject resp;
+            resp["memories"] = arr;
+            resp["count"] = arr.size();
+            resp["local"] = !memoryContentsSupported();
+            sendRestResponse(socket, 200, resp);
+        } else {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e);
+        }
+        return;
+    }
+
+    // --- POST /api/v1/radio/memories/{channel}/recall ---
+    if (p.startsWith("/api/v1/radio/memories/") && p.endsWith("/recall")) {
+        if (method != "POST") {
+            QJsonObject e; e["error"] = "Method not allowed";
+            sendRestResponse(socket, 405, e); return;
+        }
+        if (!queue || !rigCaps) {
+            QJsonObject e; e["error"] = "Rig not connected";
+            sendRestResponse(socket, 503, e); return;
+        }
+        // Extract channel number from path; optional group in the JSON body.
+        // Pre-existing off-by-one: "/api/v1/radio/memories/" is 23 characters,
+        // so mid(22) kept the separator and every channel parsed as 0.
+        QString mid = p.mid(23); // after "/api/v1/radio/memories/"
+        mid.chop(7); // remove "/recall"
+        int ch = mid.toInt();
+        if (ch <= 0) {
+            QJsonObject e; e["error"] = "Invalid channel number";
+            sendRestResponse(socket, 400, e); return;
+        }
+        int group = parseBody().value("group").toInt(0);
+        QString err;
+        if (!memoryContentsSupported()) {
+            if (!recallLocalMemory(ch, &err)) {
+                QJsonObject e; e["error"] = err;
+                sendRestResponse(socket, 400, e); return;
+            }
+            QJsonObject ok; ok["channel"] = ch; ok["local"] = true;
+            sendRestResponse(socket, 200, ok); return;
+        }
+        if (!recallMemoryOnRig(ch, group, &err)) {
+            QJsonObject e; e["error"] = err;
+            sendRestResponse(socket, 400, e); return;
+        }
+        QJsonObject resp; resp["status"] = "accepted";
+        sendRestResponse(socket, 202, resp);
+        return;
+    }
+
+    // 404 for unknown paths
+    QJsonObject e; e["error"] = "Unknown API endpoint";
+    sendRestResponse(socket, 404, e);
+}
+
+// --- WebSocket ---
+
+void webServer::onWsNewConnection()
+{
+    QWebSocket *pSocket = wsServer->nextPendingConnection();
+
+    connect(pSocket, &QWebSocket::textMessageReceived, this, &webServer::onWsTextMessage);
+    connect(pSocket, &QWebSocket::binaryMessageReceived, this, &webServer::onWsBinaryMessage);
+    connect(pSocket, &QWebSocket::disconnected, this, &webServer::onWsDisconnected);
+
+    wsClients.append(pSocket);
+    browserCount_ = wsClients.size();
+    qInfo() << "Web client connected:" << pSocket->peerAddress().toString();
+
+    // Send current state to new client
+    sendCurrentState(pSocket);
+}
+
+void webServer::onWsTextMessage(QString message)
+{
+    QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
+    if (!pClient) return;
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError) {
+        qWarning() << "Web: Invalid JSON from client:" << parseError.errorString();
+        return;
+    }
+
+    QJsonObject cmd = doc.object();
+    handleCommand(pClient, cmd);
+}
+
+void webServer::onWsDisconnected()
+{
+    QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
+    if (pClient) {
+        qInfo() << "Web client disconnected:" << pClient->peerAddress().toString();
+        // A browser that keyed the rig and vanished (phone lost the network,
+        // tab killed) must not leave it transmitting until the rig's own
+        // time-out timer, if any, fires.
+        if (pClient == pttClient) {
+            pttClient = nullptr;
+            if (queue) {
+                queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(false), false, uchar(0)));
+                queue->del(funcALCMeter, 0);
+                releaseCompressorHold();
+            }
+            qInfo() << "Web: PTT released (keying client disconnected)";
+        }
+        if (pClient == micActiveClient) {
+            micStatsLog("client disconnected");
+            micDeviceLabel.clear();
+            usbTxReset();
+        }
+        // Restore DATA MOD OFF if this client had mic active
+        if (pClient == micActiveClient && dataOffModSaved && queue) {
+            queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(savedDataOffMod), false, 0));
+            dataOffModSaved = false;
+            micActiveClient = nullptr;
+            qInfo() << "Web: Restored DATA MOD OFF setting (client disconnected)";
+        }
+        // Stop FreeDV/RADE TX drain to prevent ALSA underruns
+        if (freedvTxActive) {
+            freedvTxBuffer.clear();
+            freedvTxActive = false;
+            if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
+            txAudioActive = false;
+            if (usbAudioOutput) {
+                usbAudioOutput->stop();
+                usbAudioOutputDevice = nullptr;
+            }
+        }
+        // Cancel any pending PKT idle-driven unkey.  Clear the flag
+        // before any forced ALSA stop so a stray IdleState transition
+        // can't re-enter onUsbAudioOutputStateChanged.
+        packetTxAwaitingIdle = false;
+        if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
+        if (packetUsbTxDrainTimer) packetUsbTxDrainTimer->stop();
+        packetUsbTxBuffer.clear();
+        packetUsbTxActive = false;
+        audioClients.remove(pClient);
+        wsClients.removeAll(pClient);
+        browserCount_ = wsClients.size();
+        pClient->deleteLater();
+    }
+}
+
+void webServer::onWsBinaryMessage(QByteArray message)
+{
+    if (message.size() < 6) return;
+
+    quint8 msgType = static_cast<quint8>(message[0]);
+
+    if (msgType != 0x03) return; // Only handle TX audio (0x03)
+
+    if (!txAudioConfigured) return;
+
+    // Extract PCM data after 6-byte header: [0x03][0x00][seq_u16LE][reserved_u16LE][PCM...]
+    QByteArray pcmData = message.mid(6);
+    if (pcmData.isEmpty()) return;
+
+    // A packet burst owns the TX audio path (ALSA on USB, the TX converter
+    // on LAN).  The browser keeps streaming mic frames regardless — mic
+    // stays enabled across PTT cycles — and writing them here would
+    // interleave mic samples with the modem audio in the same sink and
+    // garble the packet on the air.  Drop mic audio until the burst
+    // completes; the unkey path re-arms the mic pre-buffer.
+    if (packetTxBusy || packetUsbTxActive) return;
+
+    // Single-writer rule for browser TX audio: modem-generated frames
+    // (FT8/JS8 pacers, TUNE) tag header byte 1 with 0x01; mic/voice frames
+    // are untagged.  While a tagged stream is flowing, drop untagged frames
+    // — this stops a mic left streaming (in this client or another tab or
+    // device) from interleaving with the modem audio and garbling the
+    // transmission.  300 ms covers pacer jitter without noticeably delaying
+    // mic resumption after the modem stream ends.
+    const bool modemTagged = (static_cast<quint8>(message[1]) & 0x01) != 0;
+    if (!modemTagged) micStatsAccumulate(pcmData);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (modemTagged)
+        lastModemAudioMs = nowMs;
+    else if (nowMs - lastModemAudioMs < 300)
+        return;
+
+    // Modem audio must never enter the FreeDV/RADE voice codec — if the
+    // FreeDV mode was left enabled (it survives mode changes between voice
+    // modes), route tagged frames straight to the rig like normal digi TX.
+    if (freedvEnabled && !modemTagged) {
+        audioPacket pkt;
+        pkt.data = pcmData;
+        pkt.time = QTime::currentTime();
+        pkt.sent = 0;
+        pkt.volume = 1.0;
+        if (freedvModeName == "RADE")
+            emit sendToRadeTx(pkt);
+        else
+            emit sendToFreeDVTx(pkt);
+        return;
+    }
+
+    if (usbAudioOutput && txAudioConfigured) {
+        // USB path.  preTxBuffer holds raw mono until the device starts;
+        // from then on frames queue in usbTxPending and usbTxPump writes
+        // them a period at a time.  Expansion to stereo (if needed)
+        // happens inside txWritePcmFrame so the same writer serves the
+        // mic, FT8 and PKT paths.
+        if (preTxBuffering) {
+            // Accumulate chunks until the buffer reaches the device's full capacity,
+            // then start ALSA and dump them all at once.  This ensures ALSA begins
+            // with a full buffer rather than an empty one, providing a real jitter
+            // absorber instead of racing the drain rate from the first byte.
+            preTxBuffer.append(pcmData);
+            const int bufSize = 9600; // ~100ms at 48kHz mono 16-bit
+            if (preTxBuffer.size() >= bufSize) {
+                preTxBuffering = false;
+                usbAudioOutputDevice = usbAudioOutput->start();
+                if (usbAudioOutputDevice) {
+                    txAudioActive = true;
+                    usbTxPending = preTxBuffer;
+                    usbTxLastFrameMs = QDateTime::currentMSecsSinceEpoch();
+                    if (!usbTxPumpTimer) {
+                        usbTxPumpTimer = new QTimer(this);
+                        usbTxPumpTimer->setTimerType(Qt::PreciseTimer);
+                        connect(usbTxPumpTimer, &QTimer::timeout, this, &webServer::usbTxPump);
+                    }
+                    usbTxPumpTimer->start(10);
+                    qInfo() << "Web: TX audio device started, period=" << usbTxPeriodBytes()
+                            << "bytes mono, bufSize=" << usbAudioOutput->bufferSize();
+                    usbTxPump();
+                } else {
+                    qWarning() << "Web: TX audio ALSA start() failed after pre-buffer";
+                }
+                preTxBuffer.clear();
+            }
+        } else {
+            usbTxPending.append(pcmData);
+            usbTxLastFrameMs = QDateTime::currentMSecsSinceEpoch();
+            usbTxPump();
+        }
+    } else if (txConverter) {
+        // LAN path. The rig's UDP audio jitter buffer expects audio in ~20 ms
+        // chunks at wall-clock cadence — exactly what wfview's mic and our own
+        // packet modem deliver. The browser hands us tiny 128-sample (256-byte,
+        // 2.67 ms) frames; forwarding each one immediately floods the rig with
+        // ~378 packets/s and, on some rigs (IC-7610), keys the radio but
+        // produces no modulation. Coalesce into 20 ms slices first. The browser
+        // is a real-time source, so re-chunking preserves the cadence without a
+        // separate pacer. (issue #72)
+        if (micLanTxChunkBytes <= 0) {
+            quint32 rate = rigSampleRate ? rigSampleRate : 48000;
+            micLanTxChunkBytes = (int)(rate / 50) * (int)sizeof(qint16); // 20 ms mono
+        }
+        // One-shot confirmation that the LAN mic path engaged and browser
+        // frames are being coalesced into 20 ms slices. (issue #72)
+        if (!micLanTxLogged) {
+            qInfo() << "Web: LAN mic TX - first PCM frame from browser," << pcmData.size() << "bytes, coalescing to" << micLanTxChunkBytes;
+            micLanTxLogged = true;
+        }
+        micLanTxBuffer.append(pcmData);
+        while (micLanTxBuffer.size() >= micLanTxChunkBytes) {
+            audioPacket pkt;
+            pkt.data = micLanTxBuffer.left(micLanTxChunkBytes);
+            pkt.time = QTime::currentTime();
+            pkt.sent = 0;
+            pkt.volume = 1.0;
+            micLanTxBuffer.remove(0, micLanTxChunkBytes);
+            emit sendToTxConverter(pkt);
+        }
+    }
+}
+
+void webServer::onTxConverted(audioPacket audio)
+{
+    if (audio.data.isEmpty()) return;
+    emit haveTxAudioData(audio);
+}
+
+void webServer::requestVfoUpdate()
+{
+    // After a VFO change, request fresh freq/mode from the radio.
+    // Use a short delay to let the queue process the VFO command first,
+    // then the normal receiveCache flow pushes the update to web clients.
+    QTimer::singleShot(200, this, [this]() {
+        if (!queue) return;
+        bool cmd29 = rigCaps && rigCaps->hasCommand29;
+        vfoCommandType tA = queue->getVfoCommand(vfoA, 0, false);
+        if (tA.freqFunc != funcNone)
+            queue->add(priorityImmediate, tA.freqFunc, false, 0);
+        if (tA.modeFunc != funcNone)
+            queue->add(priorityImmediate, tA.modeFunc, false, 0);
+        // On cmd29 rigs also refresh the sub receiver (VFO B).
+        if (cmd29) {
+            vfoCommandType tB = queue->getVfoCommand(vfoB, 1, false);
+            if (tB.freqFunc != funcNone)
+                queue->add(priorityImmediate, tB.freqFunc, false, 1);
+            if (tB.modeFunc != funcNone)
+                queue->add(priorityImmediate, tB.modeFunc, false, 1);
+        }
+    });
+}
+
+bool webServer::isFreeDVCompatibleMode(rigMode_t mk) const
+{
+    // FreeDV/RADE modulates audio that the rig transmits as SSB/AM/FM.
+    // Modes that carry their own digital signalling (CW, RTTY, PSK, FT8-in-data)
+    // are mutually exclusive with FreeDV.
+    switch (mk) {
+    case modeLSB:
+    case modeUSB:
+    case modeAM:
+    case modeFM:
+    case modeLSB_D:
+    case modeUSB_D:
+    case modeAMN:
+    case modeWFM:
+    case modeDATAFM:
+    case modeDATAFMN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void webServer::disableFreeDV()
+{
+    if (!freedvEnabled) return;
+    freedvEnabled = false;
+    freedvSync = false;
+    freedvSNR = 0.0f;
+    freedvTxBuffer.clear();
+    freedvTxActive = false;
+    if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
+    if (freedvProcessor)
+        QMetaObject::invokeMethod(freedvProcessor, "cleanup", Qt::QueuedConnection);
+    freedvFreqOffset = 0.0f;
+    radeRxCallsign.clear();
+    if (radeProcessor) {
+        radeProcessor->stopRequested.store(true);  // immediate cross-thread halt
+        QMetaObject::invokeMethod(radeProcessor, "cleanup", Qt::QueuedConnection);
+    }
+    if (freedvReporter && reporterEnabled) {
+        freedvReporter->disconnectFromService();
+        qInfo() << "Web: Reporter disconnected (FreeDV disabled)";
+    }
+    // Reporter checkbox may still be on — flip the displayed state from
+    // "connected" to "waiting" so the UI stops looking active.
+    notifyFreedvReporterStatus();
+    qInfo() << "Web: FreeDV disabled";
+}
+
+// Is the browser's mic label the rig's own capture device?  Same name on
+// Windows (both come from the endpoint's friendly name; Chromium appends
+// the USB id).  On Linux and macOS Qt's ALSA/pulse names and the browser's
+// labels differ, but the Icom codec calls itself "USB Audio CODEC" in both.
+static bool labelIsRigCapture(const QString &label, const QString &rigName)
+{
+    if (label.isEmpty() || rigName.isEmpty()) return false;
+    if (label.contains(rigName, Qt::CaseInsensitive)) return true;
+    static const QString codec = QStringLiteral("USB Audio CODEC");
+    return label.contains(codec, Qt::CaseInsensitive) && rigName.contains(codec, Qt::CaseInsensitive);
+}
+
+void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
+{
+    QString type = cmd["cmd"].toString();
+
+    if (type == "qsoLogged") {
+        QsoRecord r = QsoRecord::fromJson(cmd["qso"].toObject());
+        if (!logbookAdd(r))
+            qWarning() << "Web: qsoLogged ignored (invalid record or logbook not writable)";
+    }
+    else if (type == "updateQso") {
+        const QString id = cmd["id"].toString();
+        logbookUpdate(id, QsoRecord::fromJson(cmd["qso"].toObject(), id));
+    }
+    else if (type == "deleteQso") {
+        logbookRemove(cmd["id"].toString());
+    }
+    else if (type == "mergeLogbook") {
+        // Migration of a browser-local (localStorage) log.  The browser drops
+        // its copy only when this reply says the merge is on persistent
+        // storage; otherwise it keeps it and re-sends on every connect.
+        QList<QsoRecord> incoming;
+        const QJsonArray entries = cmd["entries"].toArray();
+        for (const QJsonValue &v : entries) {
+            QsoRecord r = QsoRecord::fromJson(v.toObject());
+            if (r.stationCall.isEmpty()) r.stationCall = reporterCallsign;   // logged at this station
+            incoming.append(r);
+        }
+        const int added = logbook_.merge(incoming);
+        if (added) {
+            qInfo() << "Logbook: merged" << added << "of" << incoming.size() << "browser-local QSOs";
+            logbookReset();
+        }
+        sendJsonTo(client, QJsonObject{{"type", "logbookMerged"}, {"added", added},
+                                       {"total", logbook_.count()}, {"persistent", logbookPersistent_},
+                                       {"unexported", logbook_.unexportedCount()}});
+    }
+    else if (type == "setFrequency") {
+        quint64 hz = cmd["value"].toVariant().toULongLong();
+        if (hz > 0) {
+            freqt f;
+            f.Hz = hz;
+            f.MHzDouble = hz / 1.0E6;
+            f.VFO = activeVFO;
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            queue->addUnique(priorityImmediate, queueItem(t.freqFunc, QVariant::fromValue<freqt>(f), false, t.receiver));
+        }
+    }
+    else if (type == "setBand") {
+        // BAND key: recall the rig's band stacking register (CI-V 1A 01).
+        // `bsr` is the rig file's Bands\N\BSR code the page got in
+        // rigInfo.bands[].bsr, `reg` 1..3 the slot (1 = most recent). The
+        // reply lands in receiveCache() -> applyMemoryToVfo(). Rigs without
+        // the command advertise bsr 0 and the page sends setFrequency instead.
+        const int bsr = cmd["bsr"].toInt();
+        const int reg = qBound(1, cmd["reg"].toInt(1), 3);
+        bool known = false;
+        if (rigCaps && rigCaps->manufacturer == manufIcom
+                && rigCaps->commands.contains(funcBandStackReg) && bsr > 0) {
+            for (const bandType &b : rigCaps->bands) {
+                if (b.bsr == bsr) { known = true; break; }
+            }
+        }
+        if (!known) {
+            qCWarning(logWebServer) << "setBand: no band stacking register" << bsr << "on this rig";
+            return;
+        }
+        // The rig only stores the VFO into a register from its own BAND key
+        // (bench IC-7300: CI-V tuning never touches the stack), so do what
+        // the key does first: store the current VFO in the register of the
+        // band being left (`save`: its bsr + the slot last recalled there).
+        // Read-modify-write — the reply handler below swaps in freq / mode /
+        // filter and writes the record back with its tone bytes intact.
+        pendingBsrSave = {};
+        const QJsonObject save = cmd["save"].toObject();
+        const int saveBsr = save["bsr"].toInt();
+        const int saveReg = qBound(1, save["reg"].toInt(1), 3);
+        if (saveBsr > 0 && !(saveBsr == bsr && saveReg == reg)) {
+            bool cmd29 = rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            const cacheItem fc = queue->getCache(t.freqFunc, t.receiver);
+            const cacheItem mc = queue->getCache(t.modeFunc, t.receiver);
+            if (fc.value.isValid() && mc.value.isValid()) {
+                const freqt f = fc.value.value<freqt>();
+                const modeInfo m = mc.value.value<modeInfo>();
+                if (f.Hz > 0 && m.reg != 0xff) {
+                    pendingBsrSave.bsr = saveBsr;
+                    pendingBsrSave.reg = saveReg;
+                    pendingBsrSave.hz = qint64(f.Hz);
+                    pendingBsrSave.mode = m.reg;
+                    pendingBsrSave.filter = (m.filter > 0 && m.filter != 0xff) ? m.filter : 1;
+                    queue->add(priorityImmediate, queueItem(funcBandStackReg,
+                               QVariant::fromValue<bandStackType>(bandStackType(uchar(saveBsr), uchar(saveReg))), false, 0));
+                }
+            }
+        }
+        // add(), not addUnique(): a bandStackType with freq 0 is the read
+        // request; icomcommander skips the post-set read-back for this func.
+        queue->add(priorityImmediate, queueItem(funcBandStackReg,
+                   QVariant::fromValue<bandStackType>(bandStackType(uchar(bsr), uchar(reg))), false, 0));
+    }
+    else if (type == "setMode") {
+        QString modeName = cmd["value"].toString();
+        modeInfo m = stringToMode(modeName);
+        if (m.mk != modeUnknown) {
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            // Preserve the current filter from cache instead of resetting to FIL1
+            cacheItem modeCache = operatingModeCache(t);
+            if (modeCache.value.isValid()) {
+                modeInfo cached = modeCache.value.value<modeInfo>();
+                m.filter = cached.filter;
+            }
+            // An explicit filter rides in the same command: the panel-close
+            // restore needs mode + filter as one set, a trailing setFilter
+            // would rebuild from the cache before the mode reply lands.
+            const int wantFilter = cmd["filter"].toInt(0);
+            if (wantFilter >= 1 && wantFilter <= 3) m.filter = wantFilter;
+            qCDebug(logWebServer) << "setMode:" << modeName << "mk=" << m.mk << "reg=" << m.reg
+                                  << "name=" << m.name << "filter=" << m.filter << "func=" << t.modeFunc;
+            queue->addUnique(priorityImmediate, queueItem(t.modeFunc, QVariant::fromValue<modeInfo>(m), false, t.receiver));
+        } else {
+            qCWarning(logWebServer) << "setMode: unknown mode name:" << modeName;
+        }
+    }
+    else if (type == "selectVFO") {
+        QString vfoName = cmd["value"].toString();
+        // On cmd29 rigs (IC-7610/785x/9700/905) selecting a VFO means Main/Sub,
+        // not A/B. funcSelectVFO in icomcommander maps vfo_t to the right command.
+        if (vfoName == "MEM") {
+            // Memory mode — the front-panel V/M (bare CI-V 08 / FR2). Leave
+            // activeVfoLocal alone so a later switch back to VFO returns here.
+            if (rigCaps && rigCaps->commands.contains(funcMemoryMode)) {
+                memModeLocal = true;
+                queue->addUnique(priorityImmediate, queueItem(funcSelectVFO, QVariant::fromValue<vfo_t>(vfoMem), false));
+                requestVfoUpdate();
+            }
+            return;
+        }
+        bool wantB = (vfoName == "B");
+        vfo_t v;
+        if (rigCaps && rigCaps->hasCommand29)
+            v = wantB ? vfoSub : vfoMain;
+        else
+            v = wantB ? vfoB : vfoA;
+        // Leaving memory mode on a cmd29 rig needs a real VFO-mode select
+        // (bare CI-V 07): Main/Sub select alone does not exit memory mode.
+        // On A/B rigs the VFO A/B select (07 00/01) exits it by itself.
+        if (rigCaps && rigCaps->hasCommand29
+                && (queue->getState().vfoMode == vfoModeMem || queue->getState().vfo == vfoMem)
+                && rigCaps->commands.contains(funcVFOModeSelect)) {
+            queue->add(priorityImmediate, funcVFOModeSelect, false, 0);
+        }
+        activeVfoLocal = v;
+        activeReceiver = wantB ? 1 : 0;
+        memModeLocal = false;
+        queue->addUnique(priorityImmediate, queueItem(funcSelectVFO, QVariant::fromValue<vfo_t>(v), false));
+        requestVfoUpdate();
+    }
+    else if (type == "swapVFO") {
+        // IC-7300/7100/705/etc use VFO Swap A/B; IC-7610/785x/9700/905 use Swap M/S.
+        funcs swapFunc = funcNone;
+        if (rigCaps) {
+            if (rigCaps->commands.contains(funcVFOSwapAB))
+                swapFunc = funcVFOSwapAB;
+            else if (rigCaps->commands.contains(funcVFOSwapMS))
+                swapFunc = funcVFOSwapMS;
+        }
+        if (swapFunc != funcNone)
+            queue->add(priorityImmediate, swapFunc, false, 0);
+        requestVfoUpdate();
+    }
+    else if (type == "equalizeVFO") {
+        funcs eqFunc = funcNone;
+        if (rigCaps) {
+            if (rigCaps->commands.contains(funcVFOEqualAB))
+                eqFunc = funcVFOEqualAB;
+            else if (rigCaps->commands.contains(funcVFOEqualMS))
+                eqFunc = funcVFOEqualMS;
+        }
+        if (eqFunc != funcNone)
+            queue->add(priorityImmediate, eqFunc, false, 0);
+        requestVfoUpdate();
+    }
+    else if (type == "setPTT") {
+        bool on = cmd["value"].toBool();
+        // What wfweb modulates itself is a digital signal: the page flags
+        // FT8/FT4, JS8 and TUNE, and FreeDV / RADE voice is a modem too.
+        // The compressor goes out before the key, in queue order.
+        if (on && (cmd["digital"].toBool() || freedvEnabled))
+            holdCompressorForDigitalTx(freedvEnabled ? "FreeDV/RADE" : "digital");
+        // On PTT-off with RADE: synthesise an EOO frame carrying the callsign
+        // and delay the radio unkey so the OFDM frame plays out before the
+        // radio stops transmitting. RadeProcessor::sendEoo() emits txReady;
+        // onRadeTxReady routes it through the same USB-or-LAN path as voice
+        // frames, so this works for both USB-attached and LAN-attached rigs.
+        bool radeUnkey = !on && freedvEnabled && freedvModeName == "RADE" && radeProcessor;
+        bool hasTxOut  = (usbAudioOutput && txAudioConfigured) || txConverter;
+        if (radeUnkey && hasTxOut) {
+            QMetaObject::invokeMethod(radeProcessor, "sendEoo", Qt::BlockingQueuedConnection);
+            qInfo() << "Web: queued RADE EOO frame, delaying unkey 300ms";
+            QTimer::singleShot(300, this, [this]() {
+                queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(false), false, uchar(0)));
+                queue->del(funcALCMeter, 0);
+                releaseCompressorHold();
+                qInfo() << "Web: RADE delayed unkey sent";
+            });
+            return;
+        }
+        queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(on), false, uchar(0)));
+        if (!on) releaseCompressorHold();
+        // Remember who keyed the rig so onWsDisconnected can unkey it if that
+        // browser drops mid-over (a latched touch PTT can hold an over for
+        // minutes, #144). nullptr for rigctld, which has its own lifetime.
+        pttClient = on ? client : nullptr;
+        // Start/stop ALC meter polling for web clients
+        if (on) {
+            queue->addUnique(priorityHighest, queueItem(funcALCMeter, true, 0));
+        } else {
+            queue->del(funcALCMeter, 0);
+        }
+    }
+    else if (type == "setAfGain") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcAfGain, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setRfGain") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcRfGain, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setRfPower") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcRFPower, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setSquelch") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcSquelch, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setMicGain") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcUSBModLevel, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setAttenuator") {
+        uchar val = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcAttenuator, QVariant::fromValue<uchar>(val), false, 0));
+    }
+    else if (type == "setPreamp") {
+        uchar val = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcPreamp, QVariant::fromValue<uchar>(val), false, 0));
+    }
+    else if (type == "setAntenna") {
+        // Issue #76: one command carries both the antenna selector and the
+        // RX-antenna flag — they travel in a single CI-V 0x12 frame.
+        antennaInfo ant;
+        ant.antenna = static_cast<quint8>(qBound(0, cmd["antenna"].toInt(), 7));
+        ant.rx = cmd["rx"].toBool();
+        queue->addUnique(priorityImmediate, queueItem(funcAntenna, QVariant::fromValue<antennaInfo>(ant), false, 0));
+    }
+    else if (type == "setNoiseBlanker") {
+        bool on = cmd["value"].toBool();
+        queue->addUnique(priorityImmediate, queueItem(funcNoiseBlanker, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+        QTimer::singleShot(200, this, [this]() {
+            if (queue) queue->add(priorityImmediate, funcNoiseBlanker, false, 0);
+        });
+    }
+    else if (type == "setBreakIn") {
+        // 0 = OFF, 1 = SEMI, 2 = FULL break-in; read back so the CW bar's
+        // BK-IN button shows what the rig took.
+        uchar val = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 2));
+        queue->addUnique(priorityImmediate, queueItem(funcBreakIn, QVariant::fromValue<uchar>(val), false, 0));
+        QTimer::singleShot(200, this, [this]() {
+            if (queue) queue->add(priorityImmediate, funcBreakIn, false, 0);
+        });
+    }
+    else if (type == "setNoiseReduction") {
+        bool on = cmd["value"].toBool();
+        queue->addUnique(priorityImmediate, queueItem(funcNoiseReduction, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+        QTimer::singleShot(200, this, [this]() {
+            if (queue) queue->add(priorityImmediate, funcNoiseReduction, false, 0);
+        });
+    }
+    else if (type == "setAGC") {
+        uchar val = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 255));
+        queue->add(priorityImmediate, queueItem(funcAGC, QVariant::fromValue<uchar>(val), false, 0));
+    }
+    else if (type == "setCompressor") {
+        bool on = cmd["value"].toBool();
+        // The operator's word wins over a digital-TX hold: the end of the
+        // over must not put the old state back on top of it.
+        if (compHeld) compRestoreOn = false;
+        queue->add(priorityImmediate, queueItem(funcCompressor, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+    }
+    else if (type == "setCompLevel") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcCompressorLevel, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setMonitor") {
+        bool on = cmd["value"].toBool();
+        queue->add(priorityImmediate, queueItem(funcMonitor, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+    }
+    else if (type == "setMonitorGain") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcMonitorGain, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setTuner") {
+        // value: 0=off, 1=on, 2=start tuning
+        uchar val = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 2));
+        queue->addUnique(priorityImmediate, queueItem(funcTunerStatus, QVariant::fromValue<uchar>(val), false, 0));
+        // Query status to trigger cache update
+        QTimer::singleShot(200, this, [this]() {
+            if (queue) queue->add(priorityImmediate, funcTunerStatus, false, 0);
+        });
+    }
+    else if (type == "setTxMeter") {
+        // Which reading the browser's second TX bar is showing. Only Comp/Vd/Id
+        // need a poll of their own — SWR and ALC are already polled.
+        QString kind = cmd["value"].toString();
+        funcs f = (kind == "comp") ? funcCompMeter
+                : (kind == "vd")   ? funcVdMeter
+                : (kind == "id")   ? funcIdMeter : funcNone;
+        if (f != txMeterFunc) {
+            txMeterFunc = f;
+            applyTxMeterPoll();
+        }
+    }
+    else if (type == "setAutoNotch") {
+        bool on = cmd["value"].toBool();
+        queue->addUnique(priorityImmediate, queueItem(funcAutoNotch, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+        QTimer::singleShot(200, this, [this]() {
+            if (queue) queue->add(priorityImmediate, funcAutoNotch, false, 0);
+        });
+    }
+    else if (type == "setFilterWidth") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 10000));
+        queue->addUnique(priorityImmediate, queueItem(funcFilterWidth, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setPBTInner") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcPBTInner, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setPBTOuter") {
+        ushort val = static_cast<ushort>(qBound(0, cmd["value"].toInt(), 255));
+        queue->addUnique(priorityImmediate, queueItem(funcPBTOuter, QVariant::fromValue<ushort>(val), false, 0));
+    }
+    else if (type == "setFilterShape") {
+        int shape = qBound(0, cmd["value"].toInt(), 1);  // 0=sharp, 1=soft
+        // Get current filter from mode cache
+        int filter = 1;
+        vfoCommandType t = queue->getVfoCommand(vfoA, 0, false);
+        cacheItem modeCache = operatingModeCache(t);
+        if (modeCache.value.isValid()) {
+            modeInfo m = modeCache.value.value<modeInfo>();
+            filter = qBound(1, (int)m.filter, 3);
+        }
+        uchar val = uchar(shape + (filter * 10));
+        queue->addUnique(priorityImmediate, queueItem(funcFilterShape, QVariant::fromValue<uchar>(val), false, 0));
+    }
+    else if (type == "setFilter") {
+        int filterNum = cmd["value"].toInt();
+        if (filterNum >= 1 && filterNum <= 3) {
+            // Same targeting as setMode: the filter rides in the mode command,
+            // which is the Selected one in VFO mode and the plain 06 in memory
+            // mode (the per-VFO caches say nothing there, see operatingModeCache).
+            bool cmd29 = rigCaps && rigCaps->hasCommand29;
+            uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+            vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+            cacheItem modeCache = operatingModeCache(t);
+            if (modeCache.value.isValid()) {
+                modeInfo m = modeCache.value.value<modeInfo>();
+                m.filter = filterNum;
+                queue->addUnique(priorityImmediate, queueItem(t.modeFunc, QVariant::fromValue<modeInfo>(m), false, t.receiver));
+                // Width and shape are stored per filter; re-read both so the
+                // FILTER window shows the new filter's values.
+                bool hasShape = rigCaps && rigCaps->commands.contains(funcFilterShape);
+                QTimer::singleShot(200, this, [this, hasShape]() {
+                    if (!queue) return;
+                    queue->add(priorityImmediate, funcFilterWidth, false, 0);
+                    if (hasShape) queue->add(priorityImmediate, funcFilterShape, false, 0);
+                });
+            }
+        }
+    }
+    else if (type == "setSplit") {
+        bool on = cmd["value"].toBool();
+        bool supported = rigCaps && rigCaps->commands.contains(funcSplitStatus);
+        qCInfo(logWebServer) << "setSplit:" << on << "supported=" << supported
+                             << "hasCmd29=" << (rigCaps && rigCaps->hasCommand29);
+        if (supported) {
+            queue->addUnique(priorityImmediate, queueItem(funcSplitStatus, QVariant::fromValue<uchar>(on ? 1 : 0), false, 0));
+        }
+    }
+    else if (type == "setDuplex") {
+        // Repeater shift direction. Shares CI-V 0x0F with split, so it is sent
+        // as a duplexMode_t (the encoder appends the raw sub-command byte)
+        // rather than the uchar setSplit uses.
+        duplexMode_t dm = duplexModeFromName(cmd["value"].toString());
+        bool supported = rigCaps && rigCaps->commands.contains(funcSendFreqOffset);
+        qCInfo(logWebServer) << "setDuplex:" << cmd["value"].toString() << "supported=" << supported;
+        if (supported) {
+            queue->addUnique(priorityImmediate, queueItem(funcSplitStatus, QVariant::fromValue<duplexMode_t>(dm), false, 0));
+            // The rig echoes 0x0F back through the periodic poll, but push the
+            // new direction now so the tile doesn't lag a poll interval.
+            queue->receiveValue(funcDuplexMode, QVariant::fromValue<duplexMode_t>(dm), 0);
+        }
+    }
+    else if (type == "setToneMode") {
+        if (!queue || !rigCaps || !toneCommandsAvailable()) return;
+        applyToneMode(toneModeFromName(cmd["value"].toString()));
+    }
+    else if (type == "setToneFreq" || type == "setTsqlFreq") {
+        if (!queue || !rigCaps) return;
+        funcs f = (type == "setToneFreq") ? funcToneFreq : funcTSQLFreq;
+        if (!rigCaps->commands.contains(f)) return;
+        toneInfo t;
+        if (!findToneByReg(rigCaps->ctcss, static_cast<ushort>(cmd["value"].toInt()), &t)) {
+            qCWarning(logWebServer) << type << "unknown tone" << cmd["value"].toInt();
+            return;
+        }
+        queue->addUnique(priorityImmediate, queueItem(f, QVariant::fromValue<toneInfo>(t), false, 0));
+        queue->receiveValue(f, QVariant::fromValue<toneInfo>(t), 0);
+    }
+    else if (type == "setDtcsCode") {
+        if (!queue || !rigCaps || !rigCaps->commands.contains(funcDTCSCode)) return;
+        toneInfo t;
+        if (!findToneByReg(rigCaps->dtcs, static_cast<ushort>(cmd["value"].toInt()), &t)) {
+            qCWarning(logWebServer) << "setDtcsCode: unknown code" << cmd["value"].toInt();
+            return;
+        }
+        // Polarity is one field on the wire: bit 1 inverts TX, bit 0 inverts RX.
+        int pol = cmd["polarity"].toInt();
+        t.tinv = (pol & 2) != 0;
+        t.rinv = (pol & 1) != 0;
+        queue->addUnique(priorityImmediate, queueItem(funcDTCSCode, QVariant::fromValue<toneInfo>(t), false, 0));
+        queue->receiveValue(funcDTCSCode, QVariant::fromValue<toneInfo>(t), 0);
+    }
+    else if (type == "setDuplexOffset") {
+        // Offset in Hz. The rig takes 3 BCD bytes from the 100 Hz digit up,
+        // so anything finer than 100 Hz cannot be represented.
+        freqt off;
+        off.Hz = static_cast<quint64>(qBound(0.0, cmd["value"].toDouble(), 99999900.0)) / 100 * 100;
+        off.MHzDouble = off.Hz / 1000000.0;
+        if (rigCaps && rigCaps->commands.contains(funcSendFreqOffset)) {
+            queue->addUnique(priorityImmediate, queueItem(funcSendFreqOffset, QVariant::fromValue<freqt>(off), false, 0));
+            queue->receiveValue(funcReadFreqOffset, QVariant::fromValue<freqt>(off), 0);
+        }
+    }
+    else if (type == "setSpan") {
+        int idx = cmd["value"].toInt();
+        if (rigCaps && idx >= 0 && idx < (int)rigCaps->scopeCenterSpans.size()) {
+            centerSpanData span = rigCaps->scopeCenterSpans.at(idx);
+            queue->addUnique(priorityImmediate, queueItem(funcScopeSpan, QVariant::fromValue<centerSpanData>(span), false, 0));
+        }
+    }
+    else if (type == "setScopeRef") {
+        // Scope reference level in tenths of a dB (-200..+200). The browser
+        // renders the REF shift itself (the streamed wave data doesn't move
+        // with it); this mirrors the value to the rig so its screen matches.
+        // The Icom encoder takes an int in tenths: 25 -> BCD 02 50 -> +2.5 dB.
+        int tenths = qBound(-200, cmd["value"].toInt(), 200);
+        if (rigCaps && rigCaps->commands.contains(funcScopeRef))
+            queue->addUnique(priorityImmediate, queueItem(funcScopeRef, QVariant::fromValue<int>(tenths), false, 0));
+    }
+    else if (type == "setScopeSpeed") {
+        // Scope sweep speed (0x27 0x1A): 0 = FAST, 1 = MID, 2 = SLOW. The
+        // browser scrolls its own waterfall at the matching rows-per-sweep.
+        uchar speed = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 2));
+        if (rigCaps && rigCaps->commands.contains(funcScopeSpeed))
+            queue->addUnique(priorityImmediate, queueItem(funcScopeSpeed, QVariant::fromValue<uchar>(speed), false, 0));
+    }
+    else if (type == "setScopeMode") {
+        // Scope mode (0x27 0x14): 0 = Center, 1 = Fixed, 2 = Scroll-C,
+        // 3 = Scroll-F. The browser draws whichever the rig reports (the mode
+        // rides in every spectrum frame) and re-commands its last pick on
+        // connect, so nothing forces Center any more (issue #113).
+        uchar mode = static_cast<uchar>(qBound(0, cmd["value"].toInt(), 3));
+        if (rigCaps && rigCaps->commands.contains(funcScopeMode))
+            queue->addUnique(priorityImmediate, queueItem(funcScopeMode, QVariant::fromValue<uchar>(mode), false, 0));
+    }
+    else if (type == "setScopeEdges") {
+        // Fixed-mode window, lower/upper in Hz (issue #113). Written into edge
+        // set 3 of the frequency range that holds it (0x27 0x1E), leaving sets
+        // 1 and 2 as the operator set them on the rig, then that set is
+        // selected (0x27 0x16). Rigs without a range table in their rig file
+        // don't get here: rigInfo reports scopeFixedEdges=false.
+        quint64 lower = static_cast<quint64>(cmd["lower"].toDouble());
+        quint64 upper = static_cast<quint64>(cmd["upper"].toDouble());
+        if (rigCaps && upper > lower && rigCaps->commands.contains(funcScopeFixedEdgeFreq) && rigCaps->commands.contains(funcScopeEdge)) {
+            scopeEdgeSetting e;
+            for (const genericType &r : rigCaps->scopeEdgeRanges) {
+                if (lower >= r.minFreq && upper <= r.maxFreq) { e.range = r.num; break; }
+            }
+            if (e.range) {
+                e.edge = 3;
+                e.lower = lower;
+                e.upper = upper;
+                queue->addUnique(priorityImmediate, queueItem(funcScopeFixedEdgeFreq, QVariant::fromValue<scopeEdgeSetting>(e), false, 0));
+                queue->addUnique(priorityImmediate, queueItem(funcScopeEdge, QVariant::fromValue<uchar>(e.edge), false, 0));
+            } else {
+                qCInfo(logWebServer) << "setScopeEdges: no fixed-edge range holds" << lower << "-" << upper << "Hz";
+            }
+        }
+    }
+    else if (type == "enableAudio") {
+        bool enable = cmd["value"].toBool();
+        if (enable) {
+            if (audioConfigured) {
+                audioClients.insert(client);
+                qInfo() << "Web: Audio enabled for client" << client->peerAddress().toString();
+                QJsonObject resp;
+                resp["type"] = "audioStatus";
+                resp["enabled"] = true;
+                resp["sampleRate"] = (int)rigSampleRate;
+                sendJsonTo(client, resp);
+            } else {
+                QJsonObject resp;
+                resp["type"] = "audioStatus";
+                resp["enabled"] = false;
+                resp["reason"] = "Audio not available (USB rig or not configured)";
+                sendJsonTo(client, resp);
+            }
+        } else {
+            audioClients.remove(client);
+            qInfo() << "Web: Audio disabled for client" << client->peerAddress().toString();
+            QJsonObject resp;
+            resp["type"] = "audioStatus";
+            resp["enabled"] = false;
+            sendJsonTo(client, resp);
+        }
+    }
+    else if (type == "enableMic") {
+        bool enable = cmd["value"].toBool();
+        if (enable) {
+            // Save current DATA MOD OFF setting and switch it to the input that
+            // matches our audio transport. LAN-attached rigs carry mic audio over
+            // the Icom UDP audio stream, so their DATA MOD OFF must be "LAN";
+            // USB-attached rigs use "USB". Forcing USB on a LAN rig (e.g. IC-7610,
+            // IC-7300 MK2, IC-9700) keys the radio with no modulation. (issue #72)
+            // Save the baseline once per mic session.  TUNE and the FT8/JS8
+            // TX path send enableMic unconditionally, so a second enable can
+            // arrive while the mic is already on; by then the periodic poll
+            // has refreshed the cache to the input we switched to, and saving
+            // that would make the later restore leave the rig on USB/LAN (#95).
+            if (!dataOffModSaved) {
+                cacheItem cache = queue->getCache(funcDATAOffMod, 0);
+                if (cache.value.isValid()) {
+                    savedDataOffMod = cache.value.value<rigInput>();
+                    dataOffModSaved = true;
+                }
+            }
+            // Reset the LAN mic-session state so each session coalesces and
+            // logs afresh.
+            micLanTxLogged = false;
+            micLanTxBuffer.clear();
+            // Pick the mod input from rig capabilities: LAN when LAN-connected,
+            // otherwise USB (shared with the packet TX path).
+            rigInput modInput;
+            if (pickDataModInput(modInput)) {
+                queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(modInput), false, 0));
+                qInfo() << "Web: Set DATA MOD OFF to" << modInput.name << "for web mic";
+            } else {
+                qInfo() << "Web: No suitable mod input found in rig capabilities";
+            }
+            micActiveClient = client;
+            // TUNE and the FT8/JS8 TX path repeat enableMic without a
+            // device while the mic is already on; only a real mic start
+            // names one, and only that resets the session diagnostics.
+            if (cmd.contains("device")) {
+                micDeviceLabel = cmd["device"].toString();
+                micStatBytes = 0;
+                micStatPeak = 0;
+                micStatLastLogMs = QDateTime::currentMSecsSinceEpoch();
+                const QString from = cmd["autoSwitchedFrom"].toString();
+                qInfo().noquote() << "Web: browser mic device:" << micDeviceLabel
+                        << (from.isEmpty() ? QString()
+                                           : QStringLiteral("(browser default was the rig codec %1, switched automatically)").arg(from))
+                        << "(rig capture device:" << rigCaptureDeviceName << ")";
+                if (labelIsRigCapture(micDeviceLabel, rigCaptureDeviceName)) {
+                    const QString why = QStringLiteral("The browser is capturing the radio's own USB audio codec (")
+                            + micDeviceLabel
+                            + QStringLiteral("): that is the receiver audio, not a microphone, so the transmission "
+                                             "will be silent. Choose another input device in the browser's "
+                                             "microphone settings.");
+                    qWarning().noquote() << "Web:" << why;
+                    QJsonObject warn;
+                    warn["type"] = "micWarning";
+                    warn["message"] = why;
+                    sendJsonTo(client, warn);
+                }
+            }
+            if (usbAudioOutput) {
+                // Stop any previous session cleanly, then arm the pre-buffer.
+                // ALSA will be started only once the pre-buffer is full, so it
+                // never begins with an empty buffer and races the drain rate.
+                if (usbAudioOutput->state() != QAudio::StoppedState)
+                    usbAudioOutput->stop();
+                usbAudioOutputDevice = nullptr;
+                usbTxReset();
+                preTxBuffer.clear();
+                preTxBuffering = true;
+                // Reset FreeDV TX state so onFreeDVTxReady() will restart ALSA
+                freedvTxBuffer.clear();
+                freedvTxActive = false;
+                if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
+            }
+        } else {
+            // Restore previous DATA MOD OFF setting
+            if (dataOffModSaved && queue) {
+                queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(savedDataOffMod), false, 0));
+                qInfo() << "Web: Restored DATA MOD OFF setting";
+            }
+            dataOffModSaved = false;
+            micStatsLog("session end");
+            micDeviceLabel.clear();
+            micActiveClient = nullptr;
+            preTxBuffering = false;
+            preTxBuffer.clear();
+            freedvTxBuffer.clear();
+            freedvTxActive = false;
+            if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
+            txAudioActive = false;
+            micLanTxBuffer.clear();
+            usbTxReset();
+            if (usbAudioOutput) {
+                usbAudioOutput->stop();
+                usbAudioOutputDevice = nullptr;
+            }
+        }
+    }
+    else if (type == "getStatus") {
+        sendCurrentState(client);
+    }
+    else if (type == "sendCW") {
+        QString text = cmd["text"].toString();
+        if (!text.isEmpty()) {
+            queue->add(priorityImmediate, queueItem(funcSendCW, QVariant::fromValue<QString>(text)));
+            qCDebug(logWebServer) << "sendCW:" << text;
+        }
+    }
+    else if (type == "setCWSpeed") {
+        ushort wpm = static_cast<ushort>(qBound(6, cmd["wpm"].toInt(), 48));
+        queue->add(priorityImmediate, queueItem(funcKeySpeed, QVariant::fromValue<ushort>(wpm), false, 0));
+        qCDebug(logWebServer) << "setCWSpeed:" << wpm << "WPM";
+    }
+    else if (type == "stopCW") {
+        // Send empty string to stop CW transmission
+        queue->add(priorityImmediate, queueItem(funcSendCW, QVariant::fromValue<QString>(QString())));
+        qCDebug(logWebServer) << "stopCW";
+    }
+    else if (type == "setPower") {
+        bool on = cmd["value"].toBool();
+        if (on) {
+            emit requestPowerOn();
+        } else {
+            emit requestPowerOff();
+        }
+    }
+    else if (type == "disconnectLan") {
+        emit requestLanDisconnect();
+    }
+    else if (type == "reconnectLan") {
+        emit requestLanReconnect();
+    }
+    else if (type == "getMemories") {
+        if (!queue || !rigCaps) {
+            QJsonObject err;
+            err["type"] = "memoryScanComplete";
+            err["count"] = 0;
+            err["error"] = "Rig not connected";
+            sendJsonTo(client, err);
+            return;
+        }
+        // Radios that can't report a channel's contents get wfweb's own list
+        // instead of an error (issue #114).
+        if (!memoryContentsSupported()) {
+            sendLocalMemories(client);
+            return;
+        }
+        int start = cmd.contains("start") ? cmd["start"].toInt() : 1;
+        int end = cmd.contains("end") ? cmd["end"].toInt() : 99;
+        int group = cmd.contains("group") ? cmd["group"].toInt() : 0;
+        // The cached channels stay put while the rig is re-read: a rename
+        // during the scan still finds its source and a client that connects
+        // mid-scan gets the previous picture. Whatever the scan does not
+        // report again is dropped when it completes (scanNextMemory) (#108).
+        memoryScanSeen.clear();
+        memoryScanActive = true;
+        memoryScanCurrent = start;
+        memoryScanEnd = end;
+        memoryScanGroup = group;
+        // Initialize scan timer on first use
+        if (!memoryScanTimer) {
+            memoryScanTimer = new QTimer(this);
+            memoryScanTimer->setSingleShot(true);
+            memoryScanTimer->setInterval(500);
+            connect(memoryScanTimer, &QTimer::timeout, this, &webServer::scanNextMemory);
+        }
+        // Request first channel. Memory reads and writes are addressed by
+        // channel, so two of them are never duplicates of each other: plain
+        // add(), not addUnique(), which compares command and receiver only
+        // and would evict a queued request for a *different* channel (#108).
+        uint val = (uint(group) << 16) | uint(start);
+        queue->add(priorityImmediate, queueItem(funcMemoryContents, QVariant::fromValue<uint>(val), false, 0));
+        memoryScanTimer->start();
+    }
+    else if (type == "recallMemory") {
+        // Recall the channel on the radio itself so tone / tone squelch /
+        // duplex offset apply. Wire protocol is {channel, group} only — the
+        // rig's stored contents are authoritative, never client-supplied.
+        if (!queue || !rigCaps) return;
+        if (!cmd.contains("channel")) return;
+        int ch = cmd["channel"].toInt(-1);
+        int group = cmd.contains("group") ? cmd["group"].toInt() : 0;
+        QString err;
+        if (!memoryContentsSupported()) {
+            if (!recallLocalMemory(ch, &err))
+                sendMemoryError(client, err);
+            else
+                qCInfo(logWebServer) << "recallMemory (local): channel=" << ch;
+            return;
+        }
+        if (!recallMemoryOnRig(ch, group, &err)) {
+            qCWarning(logWebServer) << "recallMemory: channel=" << ch << "group=" << group << ":" << err;
+        } else {
+            qCInfo(logWebServer) << "recallMemory: channel=" << ch << "group=" << group;
+        }
+    }
+    else if (type == "writeMemory") {
+        if (!queue || !rigCaps) return;
+        int ch = cmd["channel"].toInt();
+        int group = cmd.contains("group") ? cmd["group"].toInt() : 0;
+        // Channel 0 is real on zero-based rigs (IC-705/905)
+        if (ch < 0 || (ch == 0 && rigCaps->memStart != 0)) return;
+        // Radios that cannot store a channel themselves keep wfweb's own list
+        // (issue #114). Checked before the Main/Sub cache plumbing below,
+        // which only matters on the rig path.
+        if (!memoryContentsSupported()) {
+            QString err;
+            if (!writeLocalMemory(ch, cmd["name"].toString(), &err))
+                sendMemoryError(client, err);
+            else
+                qCInfo(logWebServer) << "writeMemory (local): channel=" << ch;
+            return;
+        }
+        // Everything below is captured from the band the operator is actually
+        // on. On a Main/Sub rig (IC-7600/7610/785x/7760) the two bands have
+        // their own caches, indexed by receiver, so a write from SUB that
+        // reads receiver 0 stores MAIN's frequency and mode instead (#108).
+        // A/B rigs have one receiver and reach the selected VFO through
+        // funcSelectedFreq/Mode, so rx stays 0 and nothing changes for them.
+        bool memCmd29 = rigCaps->hasCommand29;
+        uchar memRx = memCmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+        // A cache is only keyed by receiver when the rig scopes that command
+        // with the 0x29 prefix. Commands it does not scope — every command on
+        // the IC-7600, which has no 0x29 at all — always answer under
+        // receiver 0, so asking for receiver 1 would miss them entirely.
+        auto memCacheRx = [&](funcs f) -> uchar {
+            if (!memCmd29 || memRx == 0) return 0;
+            auto it = rigCaps->commands.find(f);
+            return (it != rigCaps->commands.end() && it.value().cmd29) ? memRx : 0;
+        };
+        // Build memoryType from current VFO state
+        memoryType mem;
+        mem.channel = ch;
+        mem.group = group;
+        mem.del = false;
+        mem.skip = 0;
+        mem.scan = 0;
+        memset(mem.name, ' ', sizeof(mem.name) - 1);
+        mem.name[sizeof(mem.name) - 1] = '\0';
+        if (cmd.contains("name")) {
+            QByteArray nb = cmd["name"].toString().toLatin1().left(int(sizeof(mem.name)) - 1);
+            memcpy(mem.name, nb.constData(), size_t(nb.size()));
+        }
+        // The DV callsign buffers and duplex offsets have no default
+        // initializers. Rigs whose MemFormat includes them (IC-705 t/u/v
+        // fields) serialize whatever is in there — uninitialized garbage gets
+        // the whole write rejected (FA). The IC-7300 never showed this only
+        // because its format has no DV fields.
+        memset(mem.UR, 0, sizeof(mem.UR));
+        memset(mem.URB, 0, sizeof(mem.URB));
+        memset(mem.R1, 0, sizeof(mem.R1));
+        memset(mem.R1B, 0, sizeof(mem.R1B));
+        memset(mem.R2, 0, sizeof(mem.R2));
+        memset(mem.R2B, 0, sizeof(mem.R2B));
+        mem.duplexOffset.Hz = 0;
+        mem.duplexOffset.MHzDouble = 0.0;
+        mem.split = 0;
+        // Repeater tone and shift, captured from the live caches so the
+        // channel stores what you are actually hearing. These are not
+        // optional extras: the 'j'/'J' MemFormat specs pack the duplex
+        // direction and the tone mode into a single byte, so writing one
+        // without the other silently clears the repeater shift.
+        mem.tonemode = static_cast<quint8>(currentToneMode());
+        cacheItem toneCache = queue->getCache(funcToneFreq, memCacheRx(funcToneFreq));
+        if (toneCache.value.isValid()) mem.tone = toneCache.value.value<toneInfo>().name;
+        cacheItem tsqlCache = queue->getCache(funcTSQLFreq, memCacheRx(funcTSQLFreq));
+        if (tsqlCache.value.isValid()) mem.tsql = tsqlCache.value.value<toneInfo>().name;
+        cacheItem dtcsCache = queue->getCache(funcDTCSCode, memCacheRx(funcDTCSCode));
+        if (dtcsCache.value.isValid()) {
+            // Only a code the rig actually lists: the struct's own default is a
+            // CTCSS value, and a memory carrying it is rejected outright.
+            toneInfo dt = dtcsCache.value.value<toneInfo>();
+            toneInfo known;
+            if (findToneByReg(rigCaps->dtcs, dt.tone, &known)) {
+                mem.dtcs = dt.tone;
+                mem.dtcsp = (dt.tinv ? 2 : 0) | (dt.rinv ? 1 : 0);
+            } else {
+                qCWarning(logWebServer) << "writeMemory: ignoring unknown DTCS code" << dt.tone;
+            }
+        }
+        // The stored duplex is the low nibble of duplexMode_t (0 simplex,
+        // 1 DUP-, 2 DUP+), not the 0x1x register value.
+        cacheItem dupCache = queue->getCache(funcDuplexMode, memCacheRx(funcDuplexMode));
+        if (dupCache.value.isValid())
+            mem.duplex = static_cast<quint8>(dupCache.value.value<duplexMode_t>()) & 0x0f;
+        if (rigCaps->commands.contains(funcReadFreqOffset)) {
+            cacheItem offCache = queue->getCache(funcReadFreqOffset, memCacheRx(funcReadFreqOffset));
+            if (offCache.value.isValid()) mem.duplexOffset = offCache.value.value<freqt>();
+        }
+        // A channel that says "shift down" with no shift transmits on its own
+        // receive frequency. Refuse rather than store that.
+        if (mem.duplex != 0 && mem.duplexOffset.Hz == 0) {
+            qCWarning(logWebServer) << "writeMemory: refusing channel" << ch
+                                    << "- duplex set with no offset";
+            if (client) {
+                QJsonObject err;
+                err["type"] = "error";
+                err["message"] = "Memory not saved: repeater shift is set but the offset is unknown";
+                sendJsonTo(client, err);
+            }
+            return;
+        }
+        mem.duplexOffsetB = mem.duplexOffset;
+        // Get the current operating frequency and mode. getVfoCommand only
+        // routes to funcSelectedFreq/Mode while the rig is in VFO mode, and
+        // rigs differ in which cache the periodic poll fills — so fall back
+        // through the same sources buildStatusJson uses. In memory mode the
+        // selected-freq cache carries the recalled channel's frequency, so a
+        // write from MEM captures what you're actually listening to.
+        vfoCommandType tA = queue->getVfoCommand(vfoA, memRx, false);
+        cacheItem freqCache = queue->getCache(tA.freqFunc, tA.receiver);
+        if (!freqCache.value.isValid()) freqCache = queue->getCache(funcSelectedFreq, 0);
+        if (!freqCache.value.isValid()) freqCache = queue->getCache(funcFreq, memCacheRx(funcFreq));
+        if (freqCache.value.isValid()) {
+            mem.frequency = freqCache.value.value<freqt>();
+        }
+        if (mem.frequency.Hz == 0) {
+            // Never send the rig a 0 Hz channel — it NGs the write (FA).
+            qCWarning(logWebServer) << "writeMemory: no cached frequency, refusing to write channel" << ch;
+            if (client) {
+                QJsonObject err;
+                err["type"] = "error";
+                err["message"] = "Memory write failed: no known frequency";
+                sendJsonTo(client, err);
+            }
+            return;
+        }
+        cacheItem modeCache = queue->getCache(tA.modeFunc, tA.receiver);
+        if (!modeCache.value.isValid()) modeCache = queue->getCache(funcSelectedMode, 0);
+        if (!modeCache.value.isValid()) modeCache = queue->getCache(funcMode, memCacheRx(funcMode));
+        if (modeCache.value.isValid()) {
+            modeInfo m = modeCache.value.value<modeInfo>();
+            mem.mode = m.reg;
+            mem.filter = m.filter > 0 ? m.filter : 1;
+            mem.datamode = m.data == 0xff ? 0 : m.data;
+        } else {
+            mem.mode = 1; // USB
+            mem.filter = 1;
+            mem.datamode = 0;
+        }
+        // Copy VFO A to B fields (no split support)
+        mem.frequencyB = mem.frequency;
+        mem.modeB = mem.mode;
+        mem.filterB = mem.filter;
+        mem.datamodeB = mem.datamode;
+        mem.tonemodeB = mem.tonemode;
+        mem.toneB = mem.tone;
+        mem.tsqlB = mem.tsql;
+        mem.dtcsB = mem.dtcs;
+        mem.dtcspB = mem.dtcsp;
+        mem.duplexB = mem.duplex;
+        queue->add(priorityImmediate, queueItem(funcMemoryContents, QVariant::fromValue<memoryType>(mem), false, 0));
+    }
+    else if (type == "renameMemory") {
+        // Rewrite an existing channel with a new name. The rest of the
+        // contents come from the server's cached copy of the channel, so
+        // tone / duplex / split written from the rig's front panel survive.
+        if (!queue || !rigCaps) return;
+        int ch = cmd["channel"].toInt();
+        int group = cmd.contains("group") ? cmd["group"].toInt() : 0;
+        if (ch <= 0 && !(ch == 0 && rigCaps->memStart == 0)) return;
+        if (!memoryContentsSupported()) {
+            if (!memStore.rename(ch, cmd["name"].toString())) {
+                sendMemoryError(client, "Could not rename that memory");
+                return;
+            }
+            QJsonObject msg;
+            msg["type"] = "memoryChannel";
+            msg["memory"] = localMemoryToJson(memStore.get(ch));
+            sendJsonToAll(msg);
+            return;
+        }
+        quint32 key = (quint32(group) << 16) | quint32(ch);
+        auto it = memories.find(key);
+        if (it == memories.end()) {
+            qCWarning(logWebServer) << "renameMemory: channel" << ch << "group" << group << "not cached";
+            return;
+        }
+        memoryType mem = it.value();
+        memset(mem.name, ' ', sizeof(mem.name) - 1);
+        mem.name[sizeof(mem.name) - 1] = '\0';
+        QByteArray nb = cmd["name"].toString().toLatin1().left(int(sizeof(mem.name)) - 1);
+        memcpy(mem.name, nb.constData(), size_t(nb.size()));
+        mem.del = false;
+        memories[key] = mem;
+        queue->add(priorityImmediate, queueItem(funcMemoryContents, QVariant::fromValue<memoryType>(mem), false, 0));
+        // Let every client refresh the row without a rescan
+        QJsonObject memUpdate;
+        memUpdate["type"] = "memoryChannel";
+        memUpdate["memory"] = memoryToJson(mem);
+        sendJsonToAll(memUpdate);
+    }
+    else if (type == "clearMemory") {
+        if (!queue || !rigCaps) return;
+        int ch = cmd["channel"].toInt();
+        int group = cmd.contains("group") ? cmd["group"].toInt() : 0;
+        if (ch <= 0) return;
+        if (!memoryContentsSupported()) {
+            memStore.remove(ch);
+            QJsonObject msg;
+            msg["type"] = "memoryChannel";
+            QJsonObject m;
+            m["channel"] = ch;
+            m["group"] = 0;
+            m["del"] = true;
+            m["local"] = true;
+            msg["memory"] = m;
+            sendJsonToAll(msg);
+            qCInfo(logWebServer) << "clearMemory (local): channel=" << ch;
+            return;
+        }
+        // Write a deleted/empty memory via funcMemoryContents (same path as writeMemory)
+        memoryType mem;
+        mem.channel = ch;
+        mem.group = group;
+        mem.del = true;
+        mem.split = 0;
+        mem.skip = 0;
+        mem.scan = 0;
+        memset(mem.name, 0, sizeof(mem.name));
+        memset(mem.UR, 0, sizeof(mem.UR));
+        memset(mem.URB, 0, sizeof(mem.URB));
+        memset(mem.R1, 0, sizeof(mem.R1));
+        memset(mem.R2, 0, sizeof(mem.R2));
+        memset(mem.R1B, 0, sizeof(mem.R1B));
+        memset(mem.R2B, 0, sizeof(mem.R2B));
+        qCInfo(logWebServer) << "clearMemory: channel=" << ch << "group=" << group;
+        queue->add(priorityImmediate, queueItem(funcMemoryContents, QVariant::fromValue<memoryType>(mem), false, 0));
+        quint32 key = (quint32(group) << 16) | ch;
+        memories.remove(key);
+    }
+    else if (type == "setFreeDV") {
+        bool enable = cmd["enabled"].toBool();
+        QString modeName = cmd["mode"].toString();
+        if (enable && audioConfigured) {
+            // FreeDV/RADE rides on SSB. If the user is parked on a mode that
+            // isn't USB/LSB (e.g. CW/RTTY/FM left over from a previous session),
+            // force to the right sideband for the current frequency — USB on
+            // bands >= 10 MHz, LSB below. This matches HF ham convention.
+            if (queue) {
+                vfoCommandType t = queue->getVfoCommand(vfoA, 0, true);
+                cacheItem modeCache = operatingModeCache(t);
+                cacheItem freqCache = operatingFreqCache(t);
+                if (modeCache.value.isValid()) {
+                    modeInfo cur = modeCache.value.value<modeInfo>();
+                    if (cur.mk != modeUSB && cur.mk != modeLSB) {
+                        quint64 hz = 0;
+                        if (freqCache.value.isValid())
+                            hz = freqCache.value.value<freqt>().Hz;
+                        QString forced = (hz >= 10000000ULL) ? QStringLiteral("USB")
+                                                             : QStringLiteral("LSB");
+                        modeInfo m = stringToMode(forced);
+                        m.filter = cur.filter;
+                        qCInfo(logWebServer) << "FreeDV enable: forcing mode from"
+                                             << modeToString(cur) << "to" << forced
+                                             << "at" << (double)hz/1e6 << "MHz";
+                        queue->addUnique(priorityImmediate,
+                                         queueItem(t.modeFunc,
+                                                   QVariant::fromValue<modeInfo>(m),
+                                                   false, 0));
+                    }
+                }
+            }
+            if (modeName == "RADE" && radeProcessor) {
+                freedvModeName = modeName;
+                freedvEnabled = true;
+                if (freedvProcessor)
+                    QMetaObject::invokeMethod(freedvProcessor, "cleanup", Qt::QueuedConnection);
+                emit setupRade(rigSampleRate);
+                // Send cached callsign to RADE processor for EOO encoding
+                if (!reporterCallsign.isEmpty()) {
+                    QMetaObject::invokeMethod(radeProcessor, "setTxCallsign",
+                                              Qt::QueuedConnection,
+                                              Q_ARG(QString, reporterCallsign));
+                }
+                qInfo() << "Web: RADE enabled";
+            } else if (freedvProcessor) {
+                int mode = -1;
+                if (modeName == "700D") mode = FREEDV_MODE_700D;
+                else if (modeName == "700E") mode = FREEDV_MODE_700E;
+                else if (modeName == "1600") mode = FREEDV_MODE_1600;
+                if (mode >= 0) {
+                    freedvModeName = modeName;
+                    freedvEnabled = true;
+                    if (radeProcessor) {
+                        radeProcessor->stopRequested.store(true);
+                        QMetaObject::invokeMethod(radeProcessor, "cleanup", Qt::QueuedConnection);
+                    }
+                    emit setupFreeDV(mode, rigSampleRate);
+                    qInfo() << "Web: FreeDV enabled, mode=" << modeName;
+                }
+            }
+            // Reconnect reporter when entering FreeDV/RADE mode
+            if (freedvEnabled && freedvReporter && reporterEnabled)
+                freedvReporter->connectToService();
+            // Even without a connect, flip "waiting" → "connecting" / "connected"
+            // (or back the other way for disable) for the UI right away.
+            notifyFreedvReporterStatus();
+        } else {
+            disableFreeDV();
+        }
+        QJsonObject notify;
+        notify["type"] = "freedvStatus";
+        notify["enabled"] = freedvEnabled;
+        notify["freedvMode"] = freedvModeName;
+        notify["freedvSync"] = freedvSync;
+        notify["freedvSNR"] = (double)freedvSNR;
+        if (freedvModeName == "RADE")
+            notify["freedvFreqOffset"] = (double)freedvFreqOffset;
+        sendJsonToAll(notify);
+    }
+    else if (type == "setFreeDVTxGain") {
+        float gain = (float)cmd["value"].toDouble();
+        freedvTxGain = qBound(0.01f, gain, 1.0f);
+    }
+    else if (type == "setFreeDVMonitor") {
+        freedvMonitor = cmd["value"].toBool();
+    }
+    else if (type == "packetEnable") {
+        packetEnabled = cmd["value"].toBool();
+        if (dwProc) {
+            QMetaObject::invokeMethod(dwProc, "setEnabled", Qt::QueuedConnection,
+                                      Q_ARG(bool, packetEnabled));
+        }
+        packetSaveSettings();
+        QJsonObject notify;
+        notify["type"] = "packetStatus";
+        notify["enabled"] = packetEnabled;
+        notify["mode"] = packetMode;
+        sendJsonToAll(notify);
+    }
+    else if (type == "packetSetMode") {
+        int baud = cmd["value"].toInt(-1);
+        if (baud == 300 || baud == 1200 || baud == 9600) {
+            // Changing the baud rate invalidates the physical-layer timing
+            // any live AX.25 session is calibrated for.  t1v evolves from
+            // the observed srt once a session is open; switching 1200→300
+            // leaves T1 far too short, so the sender retries long before
+            // the peer can even finish TXing an ACK at the new speed.
+            // Tear down active sessions so a fresh Connect picks up the
+            // new frack/retry values cleanly.
+            if (axProc) {
+                for (TerminalSession *s : termSessions) {
+                    if (s->state == TerminalSession::Connected
+                        || s->state == TerminalSession::Connecting) {
+                        QByteArray info = QStringLiteral("*** Mode change — link closed").toUtf8();
+                        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+                        termAppendScrollback(s, e);
+                        termBroadcastData(s->sid, e);
+                        s->state = TerminalSession::Disconnecting;
+                        termBroadcastSession(s);
+                        QMetaObject::invokeMethod(axProc, "disconnectRequest", Qt::QueuedConnection,
+                                                  Q_ARG(int, TERM_FIXED_CLIENT),
+                                                  Q_ARG(int, s->chan),
+                                                  Q_ARG(QString, s->ownCall),
+                                                  Q_ARG(QString, s->peerCall),
+                                                  Q_ARG(QStringList, s->digis));
+                    }
+                }
+            }
+
+            packetMode = baud;
+            if (dwProc) {
+                QMetaObject::invokeMethod(dwProc, "setMode", Qt::QueuedConnection,
+                                          Q_ARG(int, baud));
+            }
+            if (axProc) {
+                QMetaObject::invokeMethod(axProc, "setLinkParamsForBaud", Qt::QueuedConnection,
+                                          Q_ARG(int, baud));
+            }
+            packetSaveSettings();
+            QJsonObject notify;
+            notify["type"] = "packetStatus";
+            notify["enabled"] = packetEnabled;
+            notify["mode"] = packetMode;
+            sendJsonToAll(notify);
+        }
+    }
+    else if (type == "packetTx") {
+        // {src, dst, info}  required;  path: [ "WIDE1-1", ... ]  optional
+        QString src  = cmd["src"].toString().trimmed().toUpper();
+        QString dst  = cmd["dst"].toString().trimmed().toUpper();
+        QString info = cmd["info"].toString();
+        QStringList pathList;
+        if (cmd.value("path").isArray()) {
+            QJsonArray arr = cmd["path"].toArray();
+            for (int i = 0; i < arr.size(); i++) {
+                QString p = arr[i].toString().trimmed().toUpper();
+                if (!p.isEmpty()) pathList.append(p);
+            }
+        }
+
+        QString failReason;
+        if (!packetEnabled || !dwProc) {
+            failReason = "packet modem not enabled";
+        } else if (src.isEmpty() || dst.isEmpty() || info.isEmpty()) {
+            failReason = "src, dst, and info are required";
+        } else if (!(txAudioConfigured && usbAudioOutput) && !txConverter) {
+            // Either USB mode (usbAudioOutput + txAudioConfigured both set
+            // by setupUsbAudio) or LAN mode (txConverter set by setupAudio).
+            failReason = "TX audio not configured";
+        } else if (packetTxBusy || freedvTxActive) {
+            failReason = "TX already in progress";
+        }
+
+        if (!failReason.isEmpty()) {
+            QJsonObject notify;
+            notify["type"] = "packetTxFailed";
+            notify["reason"] = failReason;
+            sendJsonToAll(notify);
+        } else {
+            QString monitor = src + ">" + dst;
+            if (!pathList.isEmpty()) monitor += "," + pathList.join(",");
+            monitor += ":" + info;
+
+            // Claim the TX slot now — without this flag, a second packetTx
+            // that arrives before the queued encode completes would slip
+            // past the "already in progress" guard.  Cleared by the drain
+            // timer on completion, or by onPacketTxFailed on error.
+            packetTxBusy = true;
+
+            // Key the radio immediately so it's settled by the time the
+            // encoded burst arrives via onPacketTxReady.
+            queuePacketModInput();
+            queue->add(priorityImmediate,
+                       queueItem(funcTransceiverStatus,
+                                 QVariant::fromValue<bool>(true), false, uchar(0)));
+            queue->addUnique(priorityHighest,
+                             queueItem(funcALCMeter, true, 0));
+
+            QMetaObject::invokeMethod(dwProc, "transmitFrame", Qt::QueuedConnection,
+                                      Q_ARG(QString, monitor));
+
+            QJsonObject notify;
+            notify["type"] = "packetTxStarted";
+            notify["monitor"] = monitor;
+            sendJsonToAll(notify);
+            qInfo().noquote() << "Web: Packet TX queued:" << monitor;
+        }
+    }
+    // ---- APRS ----
+    else if (type == "aprsRequestSnapshot") {
+        if (aprsProc) {
+            QJsonObject snap = aprsProc->snapshot();
+            sendJsonTo(client, snap);
+        }
+    }
+    else if (type == "aprsClearStations") {
+        if (aprsProc) {
+            QMetaObject::invokeMethod(aprsProc, "clearStations", Qt::QueuedConnection);
+        }
+    }
+    else if (type == "aprsTxBeacon") {
+        // {src, lat, lon, symTable, symCode, comment, path?: ["WIDE1-1",...]}
+        if (!aprsProc) return;
+        QString src      = cmd["src"].toString().trimmed().toUpper();
+        double  lat      = cmd["lat"].toDouble();
+        double  lon      = cmd["lon"].toDouble();
+        QString symTable = cmd.value("symTable").toString();
+        QString symCode  = cmd.value("symCode").toString();
+        QString comment  = cmd.value("comment").toString();
+        QStringList path;
+        if (cmd.value("path").isArray()) {
+            QJsonArray arr = cmd["path"].toArray();
+            for (int i = 0; i < arr.size(); i++) {
+                QString p = arr[i].toString().trimmed().toUpper();
+                if (!p.isEmpty()) path.append(p);
+            }
+        }
+        if (src.isEmpty()) {
+            QJsonObject notify;
+            notify["type"] = "packetTxFailed";
+            notify["reason"] = "APRS beacon needs source callsign";
+            sendJsonToAll(notify);
+            return;
+        }
+        QChar st = symTable.isEmpty() ? QChar('/') : symTable.at(0);
+        QChar sc = symCode.isEmpty()  ? QChar('.') : symCode.at(0);
+        QMetaObject::invokeMethod(aprsProc, "txBeaconNow", Qt::QueuedConnection,
+                                  Q_ARG(QString, src),
+                                  Q_ARG(double, lat),
+                                  Q_ARG(double, lon),
+                                  Q_ARG(QChar, st),
+                                  Q_ARG(QChar, sc),
+                                  Q_ARG(QString, comment),
+                                  Q_ARG(QStringList, path));
+    }
+    else if (type == "aprsBeaconConfig") {
+        // {enabled, intervalSec, src, lat, lon, symTable, symCode, comment, path}
+        if (!aprsProc) return;
+        bool   enabled  = cmd.value("enabled").toBool();
+        int    interval = cmd.value("intervalSec").toInt(600);
+        QString src     = cmd["src"].toString().trimmed().toUpper();
+        double  lat     = cmd["lat"].toDouble();
+        double  lon     = cmd["lon"].toDouble();
+        QString symTable= cmd.value("symTable").toString();
+        QString symCode = cmd.value("symCode").toString();
+        QString comment = cmd.value("comment").toString();
+        QStringList path;
+        if (cmd.value("path").isArray()) {
+            QJsonArray arr = cmd["path"].toArray();
+            for (int i = 0; i < arr.size(); i++) {
+                QString p = arr[i].toString().trimmed().toUpper();
+                if (!p.isEmpty()) path.append(p);
+            }
+        }
+        QChar st = symTable.isEmpty() ? QChar('/') : symTable.at(0);
+        QChar sc = symCode.isEmpty()  ? QChar('.') : symCode.at(0);
+        QMetaObject::invokeMethod(aprsProc, "setBeaconConfig", Qt::QueuedConnection,
+                                  Q_ARG(bool, enabled),
+                                  Q_ARG(int, interval),
+                                  Q_ARG(QString, src),
+                                  Q_ARG(double, lat),
+                                  Q_ARG(double, lon),
+                                  Q_ARG(QChar, st),
+                                  Q_ARG(QChar, sc),
+                                  Q_ARG(QString, comment),
+                                  Q_ARG(QStringList, path));
+    }
+    // ---- AX.25 connected-mode terminal sessions ----
+    else if (type == "termList") {
+        QJsonArray sessions;
+        for (const TerminalSession *s : termSessions) {
+            sessions.append(termSessionToJson(s));
+        }
+        QJsonObject reply;
+        reply["type"] = "termList";
+        reply["sessions"] = sessions;
+        // termList is per-client; reply only to the requesting socket if we
+        // can identify it.  For now broadcast (cheap, idempotent).
+        sendJsonToAll(reply);
+    }
+    else if (type == "termHistory") {
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        QJsonObject reply;
+        reply["type"] = "termHistory";
+        reply["sid"] = sid;
+        QJsonArray entries;
+        if (s) {
+            for (const QJsonObject &e : s->scrollback) entries.append(e);
+        }
+        reply["entries"] = entries;
+        sendJsonToAll(reply);
+    }
+    else if (type == "termConnect") {
+        QString own  = cmd["ownCall"].toString().trimmed().toUpper();
+        QString peer = cmd["peerCall"].toString().trimmed().toUpper();
+        int chan = cmd.value("chan").toInt(0);
+        QStringList digis;
+        if (cmd.value("digis").isArray()) {
+            QJsonArray arr = cmd["digis"].toArray();
+            for (int i = 0; i < arr.size(); i++) {
+                QString d = arr[i].toString().trimmed().toUpper();
+                if (!d.isEmpty()) digis.append(d);
+            }
+        }
+        QString failReason;
+        TerminalSession *existing = termFindByEndpoints(chan, own, peer);
+        if (!packetEnabled || !dwProc || !axProc) failReason = "packet modem not enabled";
+        else if (own.isEmpty() || peer.isEmpty()) failReason = "ownCall and peerCall are required";
+        else if (existing && existing->state != TerminalSession::Disconnected)
+            failReason = "session already in progress";
+
+        if (!failReason.isEmpty()) {
+            QJsonObject notify;
+            notify["type"] = "termError";
+            notify["reason"] = failReason;
+            sendJsonToAll(notify);
+        } else {
+            TerminalSession *s = existing;
+            if (!s) {
+                s = new TerminalSession();
+                s->sid = termMakeSid();
+                s->chan = chan;
+                s->ownCall = own;
+                s->peerCall = peer;
+                s->createdMs = QDateTime::currentMSecsSinceEpoch();
+                termSessions.insert(s->sid, s);
+            }
+            s->digis = digis;
+            s->state = TerminalSession::Connecting;
+            s->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+            // Make sure we'll accept inbound to this own_call too.
+            termEnsureRegistered(chan, own);
+            {
+                QJsonObject e = termScrollbackEntry(QStringLiteral("info"),
+                    QString("Connecting to %1...").arg(peer).toUtf8());
+                termAppendScrollback(s, e);
+                termBroadcastSession(s);
+                termBroadcastData(s->sid, e);
+            }
+            QMetaObject::invokeMethod(axProc, "connectRequest", Qt::QueuedConnection,
+                                      Q_ARG(int, TERM_FIXED_CLIENT),
+                                      Q_ARG(int, chan),
+                                      Q_ARG(QString, own),
+                                      Q_ARG(QString, peer),
+                                      Q_ARG(QStringList, digis));
+            qInfo().noquote() << "Web: termConnect" << s->sid << own << "->" << peer;
+        }
+    }
+    else if (type == "termDisconnect") {
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && axProc) {
+            bool force = (s->state == TerminalSession::Disconnecting);
+            // ax25_link's state_2_awaiting_release handler (dl_disconnect_request
+            // with S->state == state_2_awaiting_release) treats a second
+            // disconnect as the "impatient application" case: send DM
+            // (expedited), stop T1, go straight to state_0_disconnected, and
+            // fire server_link_terminated.  So re-issuing the same dlq event
+            // here gets us instant tear-down for free.
+            s->state = TerminalSession::Disconnecting;
+            {
+                QJsonObject e = termScrollbackEntry(QStringLiteral("info"),
+                    force ? QStringLiteral("Forcing disconnect...").toUtf8()
+                          : QStringLiteral("Disconnecting...").toUtf8());
+                termAppendScrollback(s, e);
+                termBroadcastSession(s);
+                termBroadcastData(s->sid, e);
+            }
+            QMetaObject::invokeMethod(axProc, "disconnectRequest", Qt::QueuedConnection,
+                                      Q_ARG(int, TERM_FIXED_CLIENT),
+                                      Q_ARG(int, s->chan),
+                                      Q_ARG(QString, s->ownCall),
+                                      Q_ARG(QString, s->peerCall),
+                                      Q_ARG(QStringList, s->digis));
+        }
+    }
+    else if (type == "termSend") {
+        QString sid = cmd["sid"].toString();
+        QString text = cmd["data"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && axProc && s->state == TerminalSession::Connected) {
+            QByteArray data = text.toUtf8();
+            QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                                      Q_ARG(int, TERM_FIXED_CLIENT),
+                                      Q_ARG(int, s->chan),
+                                      Q_ARG(QString, s->ownCall),
+                                      Q_ARG(QString, s->peerCall),
+                                      Q_ARG(QStringList, s->digis),
+                                      Q_ARG(int, 0xF0),
+                                      Q_ARG(QByteArray, data));
+            QJsonObject entry = termScrollbackEntry(QStringLiteral("tx"), data);
+            termAppendScrollback(s, entry);
+            termBroadcastData(s->sid, entry);
+        }
+    }
+    else if (type == "termClose") {
+        // Force-remove a session record from the server.  Sends a disconnect
+        // first if the link is still up; the resulting linkTerminated will
+        // also clean up but this lets a stuck session be wiped immediately.
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.take(sid);
+        if (s) {
+            if (axProc && s->state != TerminalSession::Disconnected) {
+                QMetaObject::invokeMethod(axProc, "disconnectRequest", Qt::QueuedConnection,
+                                          Q_ARG(int, TERM_FIXED_CLIENT),
+                                          Q_ARG(int, s->chan),
+                                          Q_ARG(QString, s->ownCall),
+                                          Q_ARG(QString, s->peerCall),
+                                          Q_ARG(QStringList, s->digis));
+            }
+            QJsonObject notify;
+            notify["type"] = "termClose";
+            notify["sid"] = sid;
+            sendJsonToAll(notify);
+            delete s;
+        }
+    }
+    else if (type == "termRegister") {
+        // Standalone callsign registration so the server accepts inbound
+        // connections without the operator first making an outbound call.
+        QString own = cmd["ownCall"].toString().trimmed().toUpper();
+        int chan = cmd.value("chan").toInt(0);
+        if (!own.isEmpty()) termEnsureRegistered(chan, own);
+    }
+    else if (type == "termUnregister") {
+        QString own = cmd["ownCall"].toString().trimmed().toUpper();
+        int chan = cmd.value("chan").toInt(0);
+        if (!own.isEmpty() && axProc && termRegisteredOwnCalls.remove(own)) {
+            QMetaObject::invokeMethod(axProc, "unregisterCallsign", Qt::QueuedConnection,
+                                      Q_ARG(int, TERM_FIXED_CLIENT),
+                                      Q_ARG(int, chan),
+                                      Q_ARG(QString, own));
+        }
+    }
+    else if (type == "termFileSend") {
+        QString sid  = cmd["sid"].toString();
+        QString name = cmd["name"].toString();
+        QByteArray data = QByteArray::fromBase64(cmd["dataB64"].toString().toLatin1());
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && !name.isEmpty() && !data.isEmpty()
+            && s->state == TerminalSession::Connected
+            && !s->xfer.active) {
+            yappSendFile(s, name, data);
+        } else {
+            QJsonObject notify;
+            notify["type"] = "termError";
+            notify["reason"] = !s ? "unknown session"
+                : (s->xfer.active ? "transfer already in progress"
+                                  : "session not connected");
+            sendJsonToAll(notify);
+        }
+    }
+    else if (type == "termFileAbort") {
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && s->xfer.active) yappAbortSend(s);
+    }
+    else if (type == "termXferAccept") {
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && s->xfer.active && s->xfer.phase == "awaiting_accept") {
+            yappSendRR(s);
+            s->xfer.phase = QStringLiteral("active");
+            qInfo().noquote() << "Web: YAPP accept → RR sent" << s->sid;
+        }
+    }
+    else if (type == "termXferReject") {
+        QString sid = cmd["sid"].toString();
+        TerminalSession *s = termSessions.value(sid, nullptr);
+        if (s && s->xfer.active && s->xfer.phase == "awaiting_accept") {
+            yappSendAB(s);
+            xferBroadcastEnd(s, /*aborted=*/true);
+            QByteArray info = QStringLiteral("*** Rejected").toUtf8();
+            QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+            termAppendScrollback(s, e);
+            termBroadcastData(s->sid, e);
+            s->xfer = XferState{};
+            qInfo().noquote() << "Web: YAPP reject → AB sent" << s->sid;
+        }
+    }
+    else if (type == "setReporter") {
+        // Only the on/off flags: the station callsign and grid are server
+        // state (see applyStationCallsign), not something each browser
+        // re-asserts.
+        // "enabled" is the legacy field (FreeDV reporter); "freedvEnabled"
+        // is the explicit name now that PSK Reporter is also configured here.
+        reporterEnabled = cmd.contains("freedvEnabled")
+                            ? cmd["freedvEnabled"].toBool()
+                            : cmd["enabled"].toBool();
+        bool wantPsk = cmd["pskEnabled"].toBool();
+
+        // ---- FreeDV Reporter ----
+        if (reporterEnabled) {
+            if (!freedvReporter) {
+                freedvReporter = new FreeDVReporter(this);
+                connect(freedvReporter, &FreeDVReporter::stateChanged,
+                        this, &webServer::onReporterStateChanged);
+            }
+            freedvReporter->setStation(reporterCallsign, reporterGrid);
+
+            // Seed reporter with current frequency from cache
+            if (queue) {
+                vfoCommandType t = queue->getVfoCommand(vfoA, 0, false);
+                cacheItem freqCache = queue->getCache(t.freqFunc, 0);
+                if (freqCache.value.isValid()) {
+                    freqt f = freqCache.value.value<freqt>();
+                    if (f.Hz > 0) freedvReporter->updateFrequency(f.Hz);
+                }
+            }
+
+            // Only connect if FreeDV/RADE mode is currently active
+            if (freedvEnabled) {
+                freedvReporter->updateTx(freedvModeName, false);
+                freedvReporter->connectToService();
+            }
+        } else {
+            if (freedvReporter)
+                freedvReporter->disconnectFromService();
+        }
+
+        // ---- PSK Reporter (FT8/FT4) ----
+        pskReporterEnabled = wantPsk;
+        if (pskReporterEnabled) {
+            if (!pskReporter) {
+                pskReporter = new PskReporter(this);
+                connect(pskReporter, &PskReporter::stateChanged,
+                        this, &webServer::onPskReporterStateChanged);
+            }
+            pskReporter->setStation(reporterCallsign, reporterGrid);
+
+            if (queue) {
+                vfoCommandType t = queue->getVfoCommand(vfoA, 0, false);
+                cacheItem freqCache = queue->getCache(t.freqFunc, 0);
+                if (freqCache.value.isValid()) {
+                    freqt f = freqCache.value.value<freqt>();
+                    if (f.Hz > 0) pskReporter->updateFrequency(f.Hz);
+                }
+            }
+
+            // Connect only if a digital mode panel (FT8/FT4) is currently active.
+            if (digiActive) {
+                pskReporter->updateTx(digiMode, false);
+                pskReporter->connectToService();
+            }
+        } else {
+            if (pskReporter)
+                pskReporter->disconnectFromService();
+        }
+
+        // Pass callsign to RADE processor for EOO encoding
+        if (radeProcessor && !reporterCallsign.isEmpty()) {
+            QMetaObject::invokeMethod(radeProcessor, "setTxCallsign",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, reporterCallsign));
+        }
+
+        notifyFreedvReporterStatus();
+        notifyPskReporterStatus();
+    }
+    else if (type == "setStationCallsign") {
+        // A browser changed the station callsign (or grid) in one of its
+        // panels.  Persist it and push it to every other browser; an empty
+        // grid leaves the stored one alone (a panel without the grid input
+        // in view sends none).
+        applyStationCallsign(cmd["callsign"].toString(), cmd["grid"].toString(), true);
+    }
+    else if (type == "setCWMacros") {
+        // A browser edited a CW macro: the whole set comes back and
+        // replaces the server's (persisted, pushed to every browser).
+        applyCwMacros(cmd["macros"].toObject(), "browser");
+    }
+    else if (type == "setDigiActive") {
+        // Browser opens / closes the FT8/FT4 panel.  PSK Reporter only
+        // connects while a digital mode is actually being decoded.
+        digiActive = cmd["active"].toBool();
+        QString m = cmd["mode"].toString().toUpper();
+        if (m == "FT8" || m == "FT4") digiMode = m;
+
+        if (pskReporter && pskReporterEnabled) {
+            if (digiActive) {
+                pskReporter->updateTx(digiMode, false);
+                pskReporter->connectToService();
+            } else {
+                // Flush whatever's queued before going dormant.
+                pskReporter->disconnectFromService();
+            }
+        }
+        // Even if no reporter object exists yet, the displayed state can flip
+        // between "waiting" and "disconnected" based on digiActive — refresh.
+        notifyPskReporterStatus();
+    }
+    else if (type == "reportDigiSpot") {
+        // Browser-side FT8/FT4 decode → forward to PSK Reporter.  The browser
+        // computes the on-air RF frequency (rig dial + audio offset) so the
+        // backend doesn't need to know the rig's USB/LSB sense.
+        if (pskReporter && pskReporterEnabled && digiActive) {
+            QString call = cmd["callsign"].toString().toUpper().trimmed();
+            QString grid = cmd["grid"].toString().toUpper().trimmed();
+            QString mode = cmd["mode"].toString().toUpper().trimmed();
+            if (mode != "FT8" && mode != "FT4") mode = digiMode;
+            int snr = cmd["snr"].toInt();
+            quint64 freqHz = cmd["freq"].toVariant().toULongLong();
+            if (freqHz > 0) pskReporter->updateFrequency(freqHz);
+            pskReporter->updateRxSpotWithGrid(call, grid, mode, snr);
+        }
+        if (wsjtxEnabled_ && wsjtxDecodes_) wsjtxSendDecode(cmd);
+    }
+    else {
+        qWarning() << "Web: Unknown command:" << type;
+        QJsonObject err;
+        err["type"] = "error";
+        err["message"] = QString("Unknown command: %1").arg(type);
+        sendJsonTo(client, err);
+    }
+}
+
+QJsonObject webServer::buildInfoJson() const
+{
+    QJsonObject info;
+    // Where the station log lives, so scripts (and the test suite on any
+    // platform) can find the file without guessing the data directory.
+    info["logbookPath"] = logbook_.path();
+    info["logbookPersistent"] = logbookPersistent_;
+    info["stationCallsign"] = reporterCallsign;
+    info["stationGrid"] = reporterGrid;
+    info["cwMacros"] = cwMacrosJson();
+    info["version"] = QString(WFWEB_VERSION);
+    // Instance tag from --name; empty means "show the rig model".
+    info["name"] = instanceName_;
+
+    // freedvModes depends only on compile-time flags, not on the rig,
+    // so it must be sent regardless of whether rigCaps is populated yet.
+    QJsonArray fdvModes;
+    fdvModes.append("RADE");
+    fdvModes.append("700D");
+    fdvModes.append("700E");
+    fdvModes.append("1600");
+    info["freedvModes"] = fdvModes;
+
+    info["isLan"] = lanMode;
+    info["lanConnected"] = lanConnected;
+
+    if (rigCaps) {
+        info["connected"] = true;
+        info["model"] = rigCaps->modelName;
+        info["manufacturer"] = manufacturerName(rigCaps->manufacturer);
+        info["hasTransmit"] = rigCaps->hasTransmit;
+        info["hasSpectrum"] = rigCaps->hasSpectrum;
+        info["spectLenMax"] = rigCaps->spectLenMax;
+        info["spectAmpMax"] = rigCaps->spectAmpMax;
+
+        QJsonArray modes;
+        for (const modeInfo &mi : rigCaps->modes) {
+            modes.append(mi.name);
+        }
+        info["modes"] = modes;
+        info["audioAvailable"] = audioConfigured;
+        if (audioConfigured) {
+            info["audioSampleRate"] = (int)rigSampleRate;
+        }
+        info["txAudioAvailable"] = txAudioConfigured;
+        info["rigAudioInputName"] = rigCaptureDeviceName;
+        info["hasFilterSettings"] = rigCaps->commands.contains(funcPBTInner);
+        info["hasPowerControl"] = rigCaps->commands.contains(funcPowerControl);
+        info["powerOnNeedsRemoteJack"] = powerOnNeedsRemoteJack(rigCaps);
+        info["hasMainSub"] = rigCaps->hasCommand29;
+        // Repeater duplex: only the rigs whose .rig declares the offset
+        // command (IC-705/9700/905/785x) can shift the TX frequency, so the
+        // DUP tile follows that capability rather than a model list.
+        info["hasDuplex"] = rigCaps->commands.contains(funcSendFreqOffset);
+        // Antenna tuner (see receiveRigCaps): tuner-less rigs (IC-9700/905,
+        // the receivers, the older HF rigs) never declare the ATU command.
+        // The IC-705 declares it for the optional AH-705 and refuses the
+        // status read without one — tunerRejected tracks that.
+        info["hasTuner"] = rigCaps->commands.contains(funcTunerStatus) && !tunerRejected;
+        info["hasBreakIn"] = rigCaps->commands.contains(funcBreakIn);
+        info["hasCompressor"] = rigCaps->commands.contains(funcCompressor);
+        info["hasCompLevel"] = rigCaps->commands.contains(funcCompressorLevel);
+        addToneCaps(info);
+        addBandCaps(info);
+        addTxMeterCaps(info);
+        if (!rigCaps->scopeCenterSpans.empty()) {
+            QJsonArray spans;
+            for (const centerSpanData &s : rigCaps->scopeCenterSpans) {
+                QJsonObject span;
+                span["reg"] = s.reg;
+                span["name"] = s.name;
+                span["freq"] = (int)s.freq;
+                spans.append(span);
+            }
+            info["spans"] = spans;
+        }
+        if (!rigCaps->scopeModes.empty()) {
+            // The rig's scope modes (Center / Fixed / Scroll-C / Scroll-F) as the
+            // rig file lists them; the browser picks which keys to show.
+            QJsonArray scopeModes;
+            for (const genericType &m : rigCaps->scopeModes) {
+                if (m.num > 3) continue;
+                QJsonObject sm;
+                sm["num"] = (int)m.num;
+                sm["name"] = m.name;
+                scopeModes.append(sm);
+            }
+            info["scopeModes"] = scopeModes;
+        }
+        // The browser may set the Fixed-mode window (setScopeEdges) only when the
+        // rig file carries the 0x27 0x1E range table and both edge commands.
+        info["scopeFixedEdges"] = !rigCaps->scopeEdgeRanges.empty() &&
+            rigCaps->commands.contains(funcScopeFixedEdgeFreq) && rigCaps->commands.contains(funcScopeEdge);
+        if (!rigCaps->preamps.empty()) {
+            QJsonArray preamps;
+            for (const genericType &p : rigCaps->preamps) {
+                QJsonObject po;
+                po["num"] = p.num;
+                po["name"] = p.name;
+                // Band-limited entries (IC-705: PREAMP 2 is HF/50 MHz only).
+                // Absent = valid across the rig's whole coverage.
+                if (p.minFreq) po["minFreq"] = double(p.minFreq);
+                if (p.maxFreq) po["maxFreq"] = double(p.maxFreq);
+                preamps.append(po);
+            }
+            info["preamps"] = preamps;
+        }
+        if (!rigCaps->attenuators.empty()) {
+            QJsonArray attenuators;
+            for (const genericType &a : rigCaps->attenuators) {
+                QJsonObject ao;
+                ao["num"] = a.num;
+                ao["name"] = a.name;
+                // Band-limited entries (IC-705: the attenuator is HF/50 MHz only).
+                // Absent = valid across the rig's whole coverage.
+                if (a.minFreq) ao["minFreq"] = double(a.minFreq);
+                if (a.maxFreq) ao["maxFreq"] = double(a.maxFreq);
+                attenuators.append(ao);
+            }
+            info["attenuators"] = attenuators;
+        }
+        if (!rigCaps->antennas.empty()) {
+            QJsonArray antennas;
+            for (const genericType &a : rigCaps->antennas) {
+                QJsonObject ao;
+                ao["num"] = a.num;
+                ao["name"] = a.name;
+                antennas.append(ao);
+            }
+            info["antennas"] = antennas;
+            info["hasRxAnt"] = rigCaps->commands.contains(funcRXAntenna);
+        }
+        if (!rigCaps->filters.empty()) {
+            QJsonArray filters;
+            for (const filterType &f : rigCaps->filters) {
+                QJsonObject fo;
+                fo["num"] = f.num;
+                fo["name"] = f.name;
+                filters.append(fo);
+            }
+            info["filters"] = filters;
+        }
+        info["memGroups"] = rigCaps->memGroups;
+        info["memStart"] = rigCaps->memStart;
+        info["hasMemoryMode"] = rigCaps->commands.contains(funcMemoryMode)
+                             && memoryContentsSupported();
+        info["memoriesLocal"] = !memoryContentsSupported();
+    } else {
+        info["connected"] = false;
+    }
+    return info;
+}
+
+void webServer::onRigCtlPtt(bool on)
+{
+    // Funnel rigctld PTT through the same setPTT branch that WebSocket
+    // clients use. handleCommand() does not dereference the QWebSocket*
+    // for setPTT, so passing nullptr is safe and avoids broadcasting a
+    // synthetic client object.
+    QJsonObject cmd;
+    cmd["cmd"] = "setPTT";
+    cmd["value"] = on;
+    handleCommand(nullptr, cmd);
+}
+
+void webServer::sendCurrentState(QWebSocket *client)
+{
+    QJsonObject info = buildInfoJson();
+    info["type"] = "rigInfo";
+    if (!audioConfigured && !audioErrorReason.isEmpty()) {
+        info["audioError"] = audioErrorReason;
+    }
+    info["remoteLogEnabled"] = wsjtxEnabled_;
+    info["remoteLogTarget"] = wsjtxTarget_;
+    info["remoteLogDecodes"] = wsjtxDecodes_;
+    info["logbookPath"] = logbook_.path();
+    info["logbookCount"] = logbook_.count();
+    info["logbookPersistent"] = logbookPersistent_;
+    // The browser adopts these on connect instead of pushing its own copy.
+    info["stationCallsign"] = reporterCallsign;
+    info["stationGrid"] = reporterGrid;
+    sendJsonTo(client, info);
+    // The log itself is paged over REST; this only tells the browser to fetch page 1.
+    sendJsonTo(client, logbookSummary());
+
+    // Send current status
+    if (rigCaps) {
+        sendJsonTo(client, buildStatusJson());
+    }
+
+    // APRS station database — push the full set so the panel renders
+    // immediately on reload instead of waiting for the next beacon to
+    // arrive over the air.
+    if (aprsProc) {
+        sendJsonTo(client, aprsProc->snapshot());
+    }
+}
+
+// Operating freq / mode with the memory-mode fallbacks (#138); the chain
+// lives in cachingQueue so rigctld reads the same values as the web status.
+cacheItem webServer::operatingFreqCache(const vfoCommandType &t)
+{
+    return queue ? queue->operatingFreqCache(t) : cacheItem();
+}
+
+cacheItem webServer::operatingModeCache(const vfoCommandType &t)
+{
+    return queue ? queue->operatingModeCache(t) : cacheItem();
+}
+
+QJsonObject webServer::buildStatusJson()
+{
+    QJsonObject status;
+    status["type"] = "status";
+    // SPA fingerprint — lets a tab that survived a server upgrade (the
+    // WebSocket auto-reconnects) notice the mismatch and reload itself.
+    if (!spaBuildId.isEmpty())
+        status["buildId"] = spaBuildId;
+
+    vfoCommandType t = queue->getVfoCommand(vfoA, 0, false);
+
+    // Frequency - keep current VFO frequency for backwards compat. The key is
+    // always present: null before the first reply and while the rig has no
+    // frequency to report (blank memory channel), never a bogus number.
+    cacheItem freqCache = operatingFreqCache(t);
+    status["frequency"] = freqCache.value.isValid()
+                        ? freqJson(freqCache.value.value<freqt>())
+                        : QJsonValue(QJsonValue::Null);
+
+    // VFO A and VFO B frequencies (send both).
+    // On cmd29 rigs (IC-7610 etc) the two VFOs are Main (rx=0) and Sub (rx=1),
+    // both accessed via funcFreq with different receiver indices. On A/B rigs
+    // (IC-7300 etc) funcSelectedFreq/funcUnselectedFreq are keyed by which
+    // VFO is currently selected on the radio, NOT by the literal A/B labels —
+    // so we have to consult rigState.vfo to map them back to A/B.
+    // In memory mode those caches hold the recalled channel (both of them on
+    // an IC-7300), so the VFO slots are left alone: the browser keeps the
+    // values from before the recall and shows "frequency" instead (#108).
+    bool cmd29 = rigCaps && rigCaps->hasCommand29;
+    bool inMem = (queue->getState().vfo == vfoMem);
+    if (cmd29) {
+        vfoCommandType tA = queue->getVfoCommand(vfoA, 0, false);
+        cacheItem freqCacheA = queue->getCache(tA.freqFunc, 0);
+        if (freqCacheA.value.isValid() && !inMem) {
+            status["vfoAFrequency"] = freqJson(freqCacheA.value.value<freqt>());
+        }
+        vfoCommandType tB = queue->getVfoCommand(vfoB, 1, false);
+        cacheItem freqCacheB = queue->getCache(tB.freqFunc, 1);
+        if (freqCacheB.value.isValid() && !inMem) {
+            status["vfoBFrequency"] = freqJson(freqCacheB.value.value<freqt>());
+        }
+        status["selectedVfo"] = (queue->getState().vfo == vfoMem) ? "MEM"
+                              : (queue->getState().vfo == vfoSub) ? "B" : "A";
+    } else {
+        bool bSelected = (queue->getState().vfo == vfoB);
+        cacheItem selCache = queue->getCache(funcSelectedFreq, 0);
+        cacheItem unselCache = queue->getCache(funcUnselectedFreq, 0);
+        if (!selCache.value.isValid()) selCache = freqCache; // fall back to plain funcFreq
+        if (selCache.value.isValid() && !inMem) {
+            status[bSelected ? "vfoBFrequency" : "vfoAFrequency"] = freqJson(selCache.value.value<freqt>());
+        }
+        if (unselCache.value.isValid() && !inMem) {
+            status[bSelected ? "vfoAFrequency" : "vfoBFrequency"] = freqJson(unselCache.value.value<freqt>());
+        }
+        status["selectedVfo"] = (queue->getState().vfo == vfoMem) ? "MEM"
+                              : bSelected ? "B" : "A";
+    }
+
+    // Current memory channel number (for the browser's MEM tile) — last
+    // channel select seen, from whichever select command this rig uses.
+    if (queue->getState().vfo == vfoMem) {
+        cacheItem memCh = queue->getCache(funcMemoryMode, 0);
+        if (!memCh.value.isValid()) memCh = queue->getCache(funcMemorySelect, 0);
+        bool ok = false;
+        int ch = memCh.value.toInt(&ok);
+        if (ok) status["memChannel"] = ch;
+    }
+
+    // Mode - same contract as frequency: keys always present, null when unknown.
+    cacheItem modeCache = operatingModeCache(t);
+    if (modeCache.value.isValid()) {
+        modeInfo m = modeCache.value.value<modeInfo>();
+        status["mode"] = modeJson(m);
+        status["filter"] = filterJson(m);
+    } else {
+        status["mode"] = QJsonValue(QJsonValue::Null);
+        status["filter"] = QJsonValue(QJsonValue::Null);
+    }
+
+    // S-Meter
+    cacheItem smeter = queue->getCache(funcSMeter, 0);
+    if (smeter.value.isValid()) {
+        status["sMeter"] = smeter.value.toDouble();
+    }
+
+    // Power meter
+    cacheItem power = queue->getCache(funcPowerMeter, 0);
+    if (power.value.isValid()) {
+        status["powerMeter"] = power.value.toDouble();
+    }
+
+    // SWR
+    cacheItem swr = queue->getCache(funcSWRMeter, 0);
+    if (swr.value.isValid()) {
+        status["swrMeter"] = swr.value.toDouble();
+    }
+
+    // ALC
+    cacheItem alc = queue->getCache(funcALCMeter, 0);
+    if (alc.value.isValid()) {
+        status["alcMeter"] = alc.value.toDouble();
+    }
+
+    // Switchable second TX bar (Comp / Vd / Id) — only one is ever polled.
+    addTxMeterReadings(status);
+
+    // TX status
+    cacheItem txStatus = queue->getCache(funcTransceiverStatus, 0);
+    if (txStatus.value.isValid()) {
+        status["transmitting"] = txStatus.value.toBool();
+    }
+
+    // Power state (on/off)
+    cacheItem powerState = queue->getCache(funcPowerControl, 0);
+    if (powerState.value.isValid()) {
+        rigPoweredOn = powerState.value.toBool();
+    }
+    status["powerState"] = rigPoweredOn;
+
+    status["isLan"] = lanMode;
+    status["lanConnected"] = lanConnected;
+
+    // FreeDV
+    status["freedv"] = freedvEnabled;
+    if (freedvEnabled) {
+        status["freedvMode"] = freedvModeName;
+        status["freedvSync"] = freedvSync;
+        status["freedvSNR"] = (double)freedvSNR;
+        if (freedvModeName == "RADE")
+            status["freedvFreqOffset"] = (double)freedvFreqOffset;
+    }
+
+    // Reporter
+    status["reporterEnabled"] = reporterEnabled;
+    static const char *reporterStateNames[] = {"disconnected", "connecting", "connected", "error"};
+    if (freedvReporter) {
+        int s = static_cast<int>(freedvReporter->state());
+        status["reporterState"] = QString(reporterStateNames[qBound(0, s, 3)]);
+    }
+    status["pskReporterEnabled"] = pskReporterEnabled;
+    if (pskReporter) {
+        int s = static_cast<int>(pskReporter->state());
+        status["pskReporterState"] = QString(reporterStateNames[qBound(0, s, 3)]);
+    }
+
+    // AF Gain
+    cacheItem afGain = queue->getCache(funcAfGain, 0);
+    if (afGain.value.isValid()) {
+        status["afGain"] = afGain.value.toInt();
+    }
+
+    // RF Gain
+    cacheItem rfGain = queue->getCache(funcRfGain, 0);
+    if (rfGain.value.isValid()) {
+        status["rfGain"] = rfGain.value.toInt();
+    }
+
+    // RF Power
+    cacheItem rfPower = queue->getCache(funcRFPower, 0);
+    if (rfPower.value.isValid()) {
+        status["rfPower"] = rfPower.value.toInt();
+    }
+
+    // Squelch
+    cacheItem squelch = queue->getCache(funcSquelch, 0);
+    if (squelch.value.isValid()) {
+        status["squelch"] = squelch.value.toInt();
+    }
+
+    // Mic Gain
+    cacheItem micGain = queue->getCache(funcUSBModLevel, 0);
+    if (micGain.value.isValid()) {
+        status["micGain"] = micGain.value.toInt();
+    }
+
+    // Split
+    cacheItem split = queue->getCache(funcSplitStatus, 0);
+    if (split.value.isValid()) {
+        status["split"] = split.value.toBool();
+    }
+
+    // Repeater duplex direction and offset. getCache() re-requests anything
+    // stale, so only ask on rigs that actually have the command — otherwise
+    // every status tick burns an immediate queue slot the rig will reject.
+    cacheItem duplex = queue->getCache(funcDuplexMode, 0);
+    if (duplex.value.isValid()) {
+        status["duplex"] = duplexModeName(duplex.value.value<duplexMode_t>());
+    }
+    if (rigCaps && rigCaps->commands.contains(funcReadFreqOffset)) {
+        cacheItem dupOffset = queue->getCache(funcReadFreqOffset, 0);
+        if (dupOffset.value.isValid()) {
+            status["duplexOffset"] = (double)dupOffset.value.value<freqt>().Hz;
+        }
+    }
+
+    // Repeater access tone (TONE / TSQL / DTCS)
+    addToneStatus(status);
+
+    // Monitor
+    cacheItem mon = queue->getCache(funcMonitor, 0);
+    if (mon.value.isValid()) status["monitor"] = mon.value.toBool();
+    cacheItem monGain = queue->getCache(funcMonitorGain, 0);
+    if (monGain.value.isValid()) status["monitorGain"] = monGain.value.toInt();
+
+    // Speech compressor (FUNC COMP tile) and its level (GAIN COMP row).
+    // Only asked on rigs that have them: getCache() re-requests a miss.
+    if (rigCaps && rigCaps->commands.contains(funcCompressor)) {
+        cacheItem comp = queue->getCache(funcCompressor, 0);
+        if (comp.value.isValid()) status["compressor"] = comp.value.toBool();
+    }
+    if (rigCaps && rigCaps->commands.contains(funcCompressorLevel)) {
+        cacheItem compLevel = queue->getCache(funcCompressorLevel, 0);
+        if (compLevel.value.isValid()) status["compLevel"] = compLevel.value.toInt();
+    }
+
+    // Tuner (0=off, 1=on, 2=tuning)
+    cacheItem tuner = queue->getCache(funcTunerStatus, 0);
+    if (tuner.value.isValid()) status["tuner"] = tuner.value.toInt();
+
+    // Preamp
+    cacheItem preamp = queue->getCache(funcPreamp, 0);
+    if (preamp.value.isValid()) status["preamp"] = preamp.value.toInt();
+
+    // Antenna selector (+ RX antenna flag) — only cached on rigs that have one
+    cacheItem antCache = queue->getCache(funcAntenna, 0);
+    if (antCache.value.isValid() && !strcmp(antCache.value.typeName(), "antennaInfo")) {
+        antennaInfo ant = antCache.value.value<antennaInfo>();
+        status["antenna"] = ant.antenna;
+        status["rxAntenna"] = ant.rx;
+    }
+
+    // Auto Notch
+    cacheItem anf = queue->getCache(funcAutoNotch, 0);
+    if (anf.value.isValid()) status["autoNotch"] = anf.value.toBool();
+
+    // Noise Blanker
+    cacheItem nb = queue->getCache(funcNoiseBlanker, 0);
+    if (nb.value.isValid()) status["nb"] = nb.value.toBool();
+
+    // CW break-in: 0 = OFF, 1 = SEMI, 2 = FULL. Only asked of rigs that have
+    // it, since getCache() requests a missing value from the rig.
+    if (rigCaps && rigCaps->commands.contains(funcBreakIn)) {
+        cacheItem bk = queue->getCache(funcBreakIn, 0);
+        if (bk.value.isValid()) status["breakIn"] = bk.value.toInt();
+    }
+
+    // Noise Reduction
+    cacheItem nr = queue->getCache(funcNoiseReduction, 0);
+    if (nr.value.isValid()) status["nr"] = nr.value.toBool();
+
+    // IF Filter Width
+    cacheItem fw = queue->getCache(funcFilterWidth, 0);
+    if (fw.value.isValid()) status["filterWidth"] = fw.value.toInt();
+
+    // PBT Inner/Outer
+    cacheItem pbtIn = queue->getCache(funcPBTInner, 0);
+    if (pbtIn.value.isValid()) status["pbtInner"] = pbtIn.value.toInt();
+    cacheItem pbtOut = queue->getCache(funcPBTOuter, 0);
+    if (pbtOut.value.isValid()) status["pbtOuter"] = pbtOut.value.toInt();
+
+    // Filter Shape
+    cacheItem fs = queue->getCache(funcFilterShape, 0);
+    if (fs.value.isValid()) status["filterShape"] = fs.value.toInt();
+
+    // CW pitch (Hz): the browser sidetone follows it
+    if (rigCaps && rigCaps->commands.contains(funcCwPitch)) {
+        cacheItem cp = queue->getCache(funcCwPitch, 0);
+        if (cp.value.isValid()) status["cwPitch"] = cp.value.toInt();
+    }
+
+    // Spectrum span
+    cacheItem spanCache = queue->getCache(funcScopeSpan, 0);
+    if (spanCache.value.isValid() && rigCaps) {
+        centerSpanData span = spanCache.value.value<centerSpanData>();
+        for (int i = 0; i < (int)rigCaps->scopeCenterSpans.size(); i++) {
+            if (rigCaps->scopeCenterSpans.at(i).reg == span.reg) {
+                status["spanIndex"] = i;
+                break;
+            }
+        }
+    }
+    cacheItem scopeModeCache = queue->getCache(funcScopeMode, 0);
+    if (scopeModeCache.value.isValid())
+        status["scopeMode"] = (int)scopeModeCache.value.value<uchar>();
+
+    return status;
+}
+
+void webServer::receiveCache(cacheItem item)
+{
+    // Tone state is mirrored here, ahead of the no-clients shortcut below: the
+    // REST status and a memory write both need it whether or not a browser is
+    // attached. Nothing in this block may call back into the queue — see the
+    // note on these members in webserver.h.
+    switch (item.command) {
+    case funcToneSquelchType:
+        toneModeCache = item.value.value<rptrAccessData>().accessMode;
+        break;
+    case funcRepeaterTone: toneFlagTone = item.value.toBool(); break;
+    case funcRepeaterTSQL: toneFlagTsql = item.value.toBool(); break;
+    case funcRepeaterDTCS: toneFlagDtcs = item.value.toBool(); break;
+    case funcTunerStatus: tunerRejected = false; break;   // the rig answered: it has a tuner
+    // The tone scan reads the squelch, not the browser, so it too is serviced
+    // before that shortcut — otherwise a sweep whose last client walked away
+    // would run to exhaustion without noticing it had found the tone. Only the
+    // rig ever reports this register, so this slot is always reached through a
+    // queued connection here and the queue calls below are safe.
+    default:
+        break;
+    }
+
+    if (wsClients.isEmpty()) return;
+
+    QJsonObject update;
+    update["type"] = "update";
+
+    funcs func = item.command;
+
+    // Map various freq/mode funcs to canonical names
+    if (func == funcFreqTR || func == funcSelectedFreq || func == funcFreq) {
+        func = funcFreq;
+    } else if (func == funcModeTR || func == funcSelectedMode || func == funcMode) {
+        func = funcMode;
+    }
+
+    switch (func) {
+    case funcFreq:
+    case funcFreqGet:
+    case funcFreqSet:
+    {
+        // After canonicalization above, this case also handles funcFreqTR
+        // and funcSelectedFreq. On cmd29 rigs the receiver index in
+        // item.receiver is authoritative (0=Main/A, 1=Sub/B); on non-cmd29
+        // rigs the freq belongs to whichever VFO we currently track as
+        // active. The local mirror (activeVfoLocal/activeReceiver) is
+        // updated by the VFO-selection cases below and from the WebSocket
+        // selectVFO handler — never via queue->getState() from this slot
+        // (would re-enter the queue mutex; see issue #31 / 126f0f0c).
+        freqt f = item.value.value<freqt>();
+        QJsonValue hz = freqJson(f);
+        bool cmd29 = rigCaps && rigCaps->hasCommand29;
+        bool isActive = cmd29 ? (item.receiver == activeReceiver) : true;
+        if (memModeLocal) {
+            // Memory mode: the operating band reports the recalled channel,
+            // which belongs to neither VFO slot, and the other band's read
+            // answers with the channel too (IC-7300, measured) so it says
+            // nothing about that VFO. Only the operating frequency goes out;
+            // the VFO slots keep what they held before the recall (#108).
+            if (!isActive) return;
+        } else if (cmd29) {
+            update[item.receiver == 1 ? "vfoBFrequency" : "vfoAFrequency"] = hz;
+        } else {
+            bool activeIsB = (activeVfoLocal == vfoB);
+            update[activeIsB ? "vfoBFrequency" : "vfoAFrequency"] = hz;
+        }
+        if (isActive) {
+            update["frequency"] = hz;
+            // Reporters keep the last real frequency while the rig has none.
+            if (f.Hz && freedvReporter) freedvReporter->updateFrequency(f.Hz);
+            if (f.Hz && pskReporter) pskReporter->updateFrequency(f.Hz);
+        }
+        break;
+    }
+    case funcUnselectedFreq:
+    {
+        // Non-cmd29 rigs report the inactive VFO's freq via this func.
+        // cmd29 rigs use receiver-indexed funcFreq, handled above.
+        if (rigCaps && rigCaps->hasCommand29) return;
+        if (memModeLocal) return; // echoes the recalled channel, see funcFreq
+        freqt f = item.value.value<freqt>();
+        bool activeIsB = (activeVfoLocal == vfoB);
+        update[activeIsB ? "vfoAFrequency" : "vfoBFrequency"] = freqJson(f);
+        break;
+    }
+    case funcSelectVFO:
+    {
+        vfo_t v = item.value.value<vfo_t>();
+        if (v == vfoUnknown) return;
+        if (v == vfoMem) {
+            // Memory mode: report it, but keep activeVfoLocal pointing at the
+            // last real VFO so command targeting (and a later switch back to
+            // VFO mode) still lands on it.
+            memModeLocal = true;
+            update["selectedVfo"] = "MEM";
+            break;
+        }
+        bool isB = (v == vfoB || v == vfoSub);
+        memModeLocal = false;
+        activeVfoLocal = v;
+        activeReceiver = isB ? 1 : 0;
+        update["selectedVfo"] = isB ? "B" : "A";
+        break;
+    }
+    case funcMemoryMode:
+    case funcMemorySelect:
+    {
+        // Channel-select value (recall, MC reply, CI-V 08 echo) — surface the
+        // current memory channel number for the browser's MEM indicator.
+        bool ok = false;
+        int ch = item.value.toInt(&ok);
+        if (!ok) return;
+        update["memChannel"] = ch;
+        break;
+    }
+    case funcVFOASelect:
+    case funcVFOMainSelect:
+        activeVfoLocal = (rigCaps && rigCaps->hasCommand29) ? vfoMain : vfoA;
+        activeReceiver = 0;
+        memModeLocal = false;
+        update["selectedVfo"] = "A";
+        break;
+    case funcVFOBSelect:
+    case funcVFOSubSelect:
+        activeVfoLocal = (rigCaps && rigCaps->hasCommand29) ? vfoSub : vfoB;
+        activeReceiver = 1;
+        memModeLocal = false;
+        update["selectedVfo"] = "B";
+        break;
+    case funcMode:
+    case funcModeGet:
+    case funcModeSet:
+    {
+        modeInfo m = item.value.value<modeInfo>();
+        update["mode"] = modeJson(m);
+        update["filter"] = filterJson(m);
+        // FreeDV/RADE only makes sense on voice-carrying modes. If the rig
+        // (or the user) switches to CW/RTTY/PSK/etc, tear it down so it
+        // doesn't keep trying to decode/encode through a non-audio modem.
+        if (freedvEnabled && !isFreeDVCompatibleMode(m.mk)) {
+            qCInfo(logWebServer) << "Disabling FreeDV: mode changed to"
+                                 << modeToString(m) << "which is not voice-compatible";
+            disableFreeDV();
+            QJsonObject notify;
+            notify["type"] = "freedvStatus";
+            notify["enabled"] = false;
+            notify["freedvMode"] = freedvModeName;
+            notify["freedvSync"] = false;
+            notify["freedvSNR"] = 0.0;
+            if (freedvModeName == "RADE")
+                notify["freedvFreqOffset"] = 0.0;
+            sendJsonToAll(notify);
+        }
+        break;
+    }
+    case funcSMeter:
+        // A dual-receiver rig reports Main and Sub in turn. The page has one
+        // meter and the periodic "meters" message reads receiver 0, so push
+        // only that one — otherwise the reading flips between the two.
+        if (item.receiver != 0) return;
+        update["sMeter"] = item.value.toDouble();
+        break;
+    case funcPowerMeter:
+        update["powerMeter"] = item.value.toDouble();
+        break;
+    case funcSWRMeter:
+        update["swrMeter"] = item.value.toDouble();
+        break;
+    case funcALCMeter:
+        update["alcMeter"] = item.value.toDouble();
+        break;
+    case funcCompMeter:
+        update["compMeter"] = item.value.toDouble();
+        break;
+    case funcVdMeter:
+        update["vdMeter"] = item.value.toDouble();
+        break;
+    case funcIdMeter:
+        update["idMeter"] = item.value.toDouble();
+        break;
+    case funcTransceiverStatus:
+        update["transmitting"] = item.value.toBool();
+        if (freedvReporter) freedvReporter->updateTx(freedvModeName, item.value.toBool());
+        break;
+    case funcAfGain:
+        update["afGain"] = item.value.toInt();
+        break;
+    case funcRfGain:
+        update["rfGain"] = item.value.toInt();
+        break;
+    case funcRFPower:
+        update["rfPower"] = item.value.toInt();
+        break;
+    case funcSquelch:
+        update["squelch"] = item.value.toInt();
+        break;
+    case funcUSBModLevel:
+        update["micGain"] = item.value.toInt();
+        break;
+    case funcScopeWaveData:
+    {
+        // Send spectrum data as binary message for efficiency
+        scopeData sd = item.value.value<scopeData>();
+        if (!sd.valid || sd.data.isEmpty()) return;
+
+        // Binary format: [msgType(1)] [scopeMode(1)] [outOfRange(1)] [padding(1)] [startFreq float32(4)] [endFreq float32(4)] [data(N)]
+        // scopeMode: 0 Center, 1 Fixed, 2 Scroll-C, 3 Scroll-F (rig 0x27 0x14).
+        // outOfRange: 1 when the VFO is outside a Fixed window; data is then all zero.
+        QByteArray msg;
+        msg.resize(12 + sd.data.size());
+        msg[0] = 0x01;  // msgType: spectrum data
+        msg[1] = static_cast<char>(sd.mode);
+        msg[2] = sd.oor ? 1 : 0;
+        msg[3] = 0;     // padding
+
+        float startF = static_cast<float>(sd.startFreq);
+        float endF = static_cast<float>(sd.endFreq);
+        memcpy(msg.data() + 4, &startF, 4);
+        memcpy(msg.data() + 8, &endF, 4);
+        memcpy(msg.data() + 12, sd.data.constData(), sd.data.size());
+
+        sendBinaryToAll(msg);
+        return; // Don't send as JSON
+    }
+    case funcMonitor:
+        update["monitor"] = item.value.toBool();
+        break;
+    case funcMonitorGain:
+        update["monitorGain"] = item.value.toInt();
+        break;
+    case funcCompressor:
+        update["compressor"] = item.value.toBool();
+        break;
+    case funcCompressorLevel:
+        update["compLevel"] = item.value.toInt();
+        break;
+    case funcSplitStatus:
+        update["split"] = item.value.toBool();
+        break;
+    case funcDuplexMode:
+        update["duplex"] = duplexModeName(item.value.value<duplexMode_t>());
+        break;
+    // Whichever dialect reported, re-derive the one mode the browser knows.
+    case funcToneSquelchType:
+    case funcRepeaterTone:
+    case funcRepeaterTSQL:
+    case funcRepeaterDTCS:
+        scheduleToneModeNotify();
+        return;
+    case funcToneFreq:
+        update["toneFreq"] = item.value.value<toneInfo>().tone;
+        break;
+    case funcTSQLFreq:
+        update["tsqlFreq"] = item.value.value<toneInfo>().tone;
+        break;
+    case funcDTCSCode:
+    {
+        toneInfo t = item.value.value<toneInfo>();
+        update["dtcsCode"] = t.tone;
+        update["dtcsPolarity"] = (t.tinv ? 2 : 0) | (t.rinv ? 1 : 0);
+        break;
+    }
+    case funcReadFreqOffset:
+    case funcSendFreqOffset:
+        update["duplexOffset"] = (double)item.value.value<freqt>().Hz;
+        break;
+    case funcTunerStatus:
+        update["tuner"] = item.value.toInt();  // 0=off, 1=on, 2=tuning
+        update["hasTuner"] = true;             // a value proves the tuner is there
+        break;
+    case funcPreamp:
+        update["preamp"] = item.value.toInt();
+        break;
+    case funcAttenuator:
+        update["attenuator"] = item.value.toInt();
+        break;
+    case funcAntenna:
+    {
+        antennaInfo ant = item.value.value<antennaInfo>();
+        update["antenna"] = ant.antenna;
+        update["rxAntenna"] = ant.rx;
+        break;
+    }
+    case funcAutoNotch:
+        update["autoNotch"] = item.value.toBool();
+        break;
+    case funcNoiseBlanker:
+        update["nb"] = item.value.toBool();
+        break;
+    case funcBreakIn:
+        update["breakIn"] = item.value.toInt();   // 0 = OFF, 1 = SEMI, 2 = FULL
+        break;
+    case funcNoiseReduction:
+        update["nr"] = item.value.toBool();
+        break;
+    case funcFilterWidth:
+        update["filterWidth"] = item.value.toInt();
+        break;
+    case funcPBTInner:
+        update["pbtInner"] = item.value.toInt();
+        break;
+    case funcPBTOuter:
+        update["pbtOuter"] = item.value.toInt();
+        break;
+    case funcCwPitch:
+        update["cwPitch"] = item.value.toInt();
+        break;
+    case funcFilterShape:
+        update["filterShape"] = item.value.toInt();
+        break;
+    case funcScopeSpan:
+    {
+        centerSpanData span = item.value.value<centerSpanData>();
+        if (rigCaps) {
+            for (int i = 0; i < (int)rigCaps->scopeCenterSpans.size(); i++) {
+                if (rigCaps->scopeCenterSpans.at(i).reg == span.reg) {
+                    update["spanIndex"] = i;
+                    update["spanName"] = span.name;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case funcScopeMode:
+        // Polled and read back after every set, so a change made on the rig's
+        // own MENU reaches the browser between spectrum frames.
+        update["scopeMode"] = (int)item.value.value<uchar>();
+        break;
+    case funcPowerControl:
+        rigPoweredOn = item.value.toBool();
+        update["powerState"] = rigPoweredOn;
+        break;
+    case funcBandStackReg:
+    {
+        // Band stacking register reply for a setBand request. Our own
+        // request (freq 0) is echoed back through the cache on this thread
+        // with the queue mutex held, so it must leave without touching the
+        // queue; the real reply comes from the rig thread (queued).
+        if (strcmp(item.value.typeName(), "bandStackType") != 0) return;
+        if (bsrWriteEchoPending) { bsrWriteEchoPending = false; return; }   // our write, echoed
+        const bandStackType bsr = item.value.value<bandStackType>();
+        if (bsr.freq.Hz == 0) return;                                        // our read, echoed
+        if (pendingBsrSave.bsr == bsr.band && pendingBsrSave.reg == bsr.reg) {
+            // The register being left: write it back with the VFO we had.
+            bandStackType w = bsr;
+            w.freq.Hz = pendingBsrSave.hz;
+            w.freq.MHzDouble = pendingBsrSave.hz / 1.0E6;
+            w.mode = pendingBsrSave.mode;
+            w.filter = pendingBsrSave.filter;
+            pendingBsrSave = {};
+            qCInfo(logWebServer) << "setBand: storing" << w.freq.Hz << "Hz mode" << w.mode << "filter" << w.filter
+                                 << "in register" << w.band << "/" << w.reg;
+            bsrWriteEchoPending = true;
+            queue->add(priorityImmediate, queueItem(funcBandStackReg, QVariant::fromValue<bandStackType>(w), false, 0));
+            return;
+        }
+        qCInfo(logWebServer) << "setBand: register" << bsr.band << "/" << bsr.reg
+                             << "->" << bsr.freq.Hz << "Hz mode" << bsr.mode << "filter" << bsr.filter;
+        // Data mode is deliberately not restored: wfweb owns data mode itself.
+        applyMemoryToVfo(qint64(bsr.freq.Hz), bsr.mode, bsr.filter, 0);
+        return;
+    }
+    case funcMemoryContents:
+    {
+        // Only process actual memory data from the radio (memoryType),
+        // not our own queued request values (uint) echoed back via cache.
+        if (strcmp(item.value.typeName(), "memoryType") != 0) {
+            return;
+        }
+        memoryType mem = item.value.value<memoryType>();
+        quint32 key = (quint32(mem.group) << 16) | mem.channel;
+        bool empty = mem.del || (mem.frequency.Hz == 0 && mem.mode == 0);
+        if (empty) {
+            memories.remove(key);
+        } else {
+            memories[key] = mem;
+        }
+        // Anything the running scan hears about its group survives the
+        // reconcile at scan end — including a channel saved or renamed while
+        // the scan was already past it (the write echoes back through the
+        // cache with the contents we sent).
+        if (memoryScanActive && !mem.del && int(mem.group) == memoryScanGroup)
+            memoryScanSeen.insert(key);
+        // A reply belongs to the running scan only if it matches the group and
+        // channel we are waiting on; a late reply from before a scan restart
+        // (e.g. a group switch) must not stop the timer or advance the counter.
+        // Our own clear echoes back as a deleted entry and says nothing about
+        // what the rig holds, so it neither stops the timer nor advances the
+        // scan: the rig's own reply, or the 500 ms timeout, does that.
+        bool scanReply = memoryScanActive && !mem.del
+                && int(mem.group) == memoryScanGroup
+                && int(mem.channel) == memoryScanCurrent;
+        if (scanReply && memoryScanTimer) memoryScanTimer->stop();
+        // Broadcast to clients (only non-empty channels)
+        if (!empty) {
+            QJsonObject memUpdate;
+            memUpdate["type"] = "memoryChannel";
+            memUpdate["memory"] = memoryToJson(mem);
+            sendJsonToAll(memUpdate);
+        }
+        if (scanReply) scanNextMemory();
+        return; // Don't send as generic update
+    }
+    default:
+        return; // Don't send updates for unhandled funcs
+    }
+
+    sendJsonToAll(update);
+}
+
+void webServer::sendPeriodicStatus()
+{
+    if (wsClients.isEmpty() || !rigCaps) return;
+
+    // Reconcile the local active-VFO mirror with the queue's authoritative
+    // rigState. Cheap, off the receiveCache hot path, and recovers any drift
+    // from rig-initiated VFO changes that didn't echo back via transceive.
+    // vfoMem is deliberately not mirrored: activeVfoLocal keeps the last real
+    // VFO for command targeting, while the MEM indicator itself stays fresh
+    // because buildStatusJson() reads rigState.vfo directly on every tick.
+    if (queue) {
+        vfo_t qv = queue->getState().vfo;
+        memModeLocal = (qv == vfoMem);
+        if (qv != vfoUnknown && qv != vfoMem && qv != activeVfoLocal) {
+            activeVfoLocal = qv;
+            activeReceiver = (qv == vfoB || qv == vfoSub) ? 1 : 0;
+        }
+    }
+
+    // The duplex offset is asked for nowhere else: buildStatusJson() runs only
+    // when a browser connects, so the one request it makes lands while the
+    // cache is still cold and nothing ever retries. The rig also keeps a
+    // separate offset per band, so a band change silently replaces it. Poll it
+    // on a slow tick — getCache() re-requests only what has gone stale, and
+    // receiveCache() pushes duplexOffset to clients when it changes.
+    // The tuner status rides the same tick on rigs whose .rig file does not
+    // poll it: a TUNER press on the rig's own panel would otherwise never
+    // reach the browser, and it is the evidence the NAK back-off needs to
+    // hide the tile on an IC-705 with no AH-705 (see tunerRejected).
+    if (queue && rigCaps && ++slowPollTick % 25 == 0) {   // 200 ms tick -> 5 s
+        if (rigCaps->commands.contains(funcReadFreqOffset))
+            queue->getCache(funcReadFreqOffset, 0);
+        if (rigCaps->commands.contains(funcTunerStatus))
+            queue->getCache(funcTunerStatus, 0);
+    }
+
+    // Request meter updates by querying current cache values
+    QJsonObject status;
+    status["type"] = "meters";
+
+    cacheItem smeter = queue->getCache(funcSMeter, 0);
+    if (smeter.value.isValid()) {
+        status["sMeter"] = smeter.value.toDouble();
+    }
+
+    cacheItem power = queue->getCache(funcPowerMeter, 0);
+    if (power.value.isValid()) {
+        status["powerMeter"] = power.value.toDouble();
+    }
+
+    cacheItem swr = queue->getCache(funcSWRMeter, 0);
+    if (swr.value.isValid()) {
+        status["swrMeter"] = swr.value.toDouble();
+    }
+
+    cacheItem alc = queue->getCache(funcALCMeter, 0);
+    if (alc.value.isValid()) {
+        status["alcMeter"] = alc.value.toDouble();
+    }
+
+    addTxMeterReadings(status);
+
+    cacheItem txStatus = queue->getCache(funcTransceiverStatus, 0);
+    if (txStatus.value.isValid()) {
+        status["transmitting"] = txStatus.value.toBool();
+    }
+
+    // Include FreeDV/RADE stats when active (5Hz update rate)
+    if (freedvEnabled) {
+        status["freedvSync"] = freedvSync;
+        status["freedvSNR"] = (double)freedvSNR;
+        if (freedvModeName == "RADE")
+            status["freedvFreqOffset"] = (double)freedvFreqOffset;
+    }
+
+    sendJsonToAll(status);
+}
+
+void webServer::sendJsonToAll(const QJsonObject &obj)
+{
+    QByteArray data = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    for (QWebSocket *client : wsClients) {
+        client->sendTextMessage(QString::fromUtf8(data));
+    }
+}
+
+void webServer::sendJsonTo(QWebSocket *client, const QJsonObject &obj)
+{
+    QByteArray data = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    client->sendTextMessage(QString::fromUtf8(data));
+}
+
+void webServer::sendBinaryToAll(const QByteArray &data)
+{
+    for (QWebSocket *client : wsClients) {
+        client->sendBinaryMessage(data);
+    }
+}
+
+void webServer::sendBinaryToAudioClients(const QByteArray &data)
+{
+    for (QWebSocket *client : audioClients) {
+        client->sendBinaryMessage(data);
+    }
+}
+
+// Common TX-audio writer.  Used by the mic-frame WS handler and by the
+// PKT USB pacer so both TX paths share one piece of plumbing.  Mono in;
+// expanded to stereo here when the device requires it.  ALC-controlled
+// gain is opt-in via applyGain — modem audio (FreeDV/RADE/PKT) needs it
+// or it'll clip the rig's USB input; mic/FT8 paths already deliver
+// post-mixer levels and pass false.
+void webServer::txWritePcmFrame(const QByteArray &pcmMonoLE, bool applyGain)
+{
+    if (!usbAudioOutput || !usbAudioOutputDevice) return;
+    if (pcmMonoLE.isEmpty()) return;
+
+    QByteArray writeData;
+    if (usbOutputChannels == 2) {
+        int numSamples = pcmMonoLE.size() / (int)sizeof(qint16);
+        writeData.resize(numSamples * 4);
+        const qint16 *src = reinterpret_cast<const qint16 *>(pcmMonoLE.constData());
+        qint16 *dst = reinterpret_cast<qint16 *>(writeData.data());
+        for (int i = 0; i < numSamples; i++) {
+            dst[i * 2]     = src[i];
+            dst[i * 2 + 1] = src[i];
+        }
+    } else {
+        writeData = pcmMonoLE;
+    }
+
+    if (applyGain && freedvTxGain < 0.99f) {
+        qint16 *samples = reinterpret_cast<qint16 *>(writeData.data());
+        int count = writeData.size() / (int)sizeof(qint16);
+        for (int i = 0; i < count; i++)
+            samples[i] = qBound((int)-32768, (int)(samples[i] * freedvTxGain), (int)32767);
+    }
+
+    usbAudioOutputDevice->write(writeData);
+}
+
+// Mono bytes per device write.  The device's own period is the unit: on
+// WinMM a write shorter than it still spends a whole wave block, on ALSA
+// and CoreAudio any size lands in the ring buffer.  Clamped so an odd
+// backend value (a huge pulse period, none at all on Qt6) can neither add
+// latency nor starve the pump.
+int webServer::usbTxPeriodBytes() const
+{
+    const int ch = qMax(1, usbOutputChannels);
+    int bytes = 0;
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    if (usbAudioOutput) bytes = usbAudioOutput->periodSize() / ch;
+#endif
+    if (bytes < 960 || bytes > 4800)   // 10..50 ms at 48 kHz
+        bytes = 1920;                  // 20 ms
+    return bytes & ~1;
+}
+
+// Write the pending browser audio one period at a time, as long as the
+// device has room for a whole one.  Runs on every incoming frame and on
+// the pump timer, which keeps draining once the device had been full.
+void webServer::usbTxPump()
+{
+    if (!usbAudioOutput || !usbAudioOutputDevice || usbTxPending.isEmpty()) return;
+    const int ch = qMax(1, usbOutputChannels);
+    const int period = usbTxPeriodBytes();
+
+    // The browser is a real-time source, so this only grows when the
+    // device stops taking data.  Drop the oldest rather than build up
+    // latency.
+    const int cap = 48000;  // 500 ms
+    if (usbTxPending.size() > cap) {
+        if (!usbTxOverflowLogged) {
+            qWarning() << "Web: TX audio device not draining, dropping"
+                       << (usbTxPending.size() - cap) << "bytes";
+            usbTxOverflowLogged = true;
+        }
+        usbTxPending.remove(0, usbTxPending.size() - cap);
+    }
+
+    while (usbTxPending.size() >= period && usbAudioOutput->bytesFree() >= period * ch) {
+        txWritePcmFrame(usbTxPending.left(period), /*applyGain=*/false);
+        usbTxPending.remove(0, period);
+    }
+
+    // A tail shorter than a period goes out once the stream has stopped:
+    // the device reports Idle after it ran dry (WinMM, ALSA), or nothing
+    // has arrived for 100 ms, which never happens inside a live 2.7 ms
+    // frame stream (the pulse backend never reports Idle in push mode).
+    // Either way the device is silent already, so padding costs nothing,
+    // and the end of an FT8 frame is not lost.
+    if (!usbTxPending.isEmpty() && usbTxPending.size() < period
+            && (usbAudioOutput->state() == QAudio::IdleState
+                || QDateTime::currentMSecsSinceEpoch() - usbTxLastFrameMs >= 100)) {
+        usbTxPending.append(QByteArray(period - usbTxPending.size(), 0));
+        txWritePcmFrame(usbTxPending, /*applyGain=*/false);
+        usbTxPending.clear();
+    }
+}
+
+// Drop whatever the browser sent but the device has not taken, and stop
+// the pump.  Called wherever the mic session ends or another TX path
+// (FreeDV, RADE, PKT) takes the device over.
+void webServer::usbTxReset()
+{
+    usbTxPending.clear();
+    usbTxOverflowLogged = false;
+    if (usbTxPumpTimer) usbTxPumpTimer->stop();
+}
+
+// Running peak of the untagged (mic) frames the browser sends, logged every
+// 5 s while they flow and once more when the session ends.  A browser that
+// captures the wrong device, a muted input or a stream that never starts
+// all show up here as a peak near the floor, where before the log only
+// said the mic was enabled.
+void webServer::micStatsAccumulate(const QByteArray &pcm)
+{
+    const qint16 *s = reinterpret_cast<const qint16 *>(pcm.constData());
+    const int n = pcm.size() / (int)sizeof(qint16);
+    for (int i = 0; i < n; i++) {
+        const int a = qAbs((int)s[i]);
+        if (a > micStatPeak) micStatPeak = a;
+    }
+    micStatBytes += pcm.size();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - micStatLastLogMs >= 5000) {
+        micStatsLog("last 5 s");
+        micStatLastLogMs = now;
+        micStatBytes = 0;
+        micStatPeak = 0;
+    }
+}
+
+void webServer::micStatsLog(const char *why)
+{
+    if (micStatBytes <= 0) return;
+    const double seconds = micStatBytes / (48000.0 * sizeof(qint16));
+    const double dbfs = micStatPeak > 0 ? 20.0 * std::log10(micStatPeak / 32768.0) : -120.0;
+    QString line = QStringLiteral("Web: mic audio (%1): %2 s received, peak %3 dBFS")
+            .arg(QString::fromLatin1(why)).arg(seconds, 0, 'f', 1).arg(dbfs, 0, 'f', 1);
+    if (dbfs < -60.0)
+        line += QStringLiteral(" - silence: the browser is sending no signal");
+    qInfo().noquote() << line;
+    micStatBytes = 0;
+    micStatPeak = 0;
+}
+
+// icomCommander caches a frequency the rig could not report as Hz == 0 and a
+// mode it could not report as a default modeInfo (IC-705 on a blank memory
+// channel answers both reads with a lone 0xFF). Emit JSON null for those so
+// the keys stay present and a client can tell "no value" from a number.
+QJsonValue webServer::freqJson(const freqt &f)
+{
+    return f.Hz ? QJsonValue((qint64)f.Hz) : QJsonValue(QJsonValue::Null);
+}
+
+QJsonValue webServer::modeJson(const modeInfo &m)
+{
+    return m.reg == 0xff ? QJsonValue(QJsonValue::Null) : QJsonValue(modeToString(m));
+}
+
+QJsonValue webServer::filterJson(const modeInfo &m)
+{
+    return m.filter == 0xff ? QJsonValue(QJsonValue::Null) : QJsonValue(int(m.filter));
+}
+
+QString webServer::modeToString(modeInfo m)
+{
+    if (m.name.isEmpty()) {
+        // Fallback
+        switch (m.mk) {
+        case modeLSB: return "LSB";
+        case modeUSB: return "USB";
+        case modeAM: return "AM";
+        case modeCW: return "CW";
+        case modeRTTY: return "RTTY";
+        case modeFM: return "FM";
+        case modeCW_R: return "CW-R";
+        case modeRTTY_R: return "RTTY-R";
+        case modeLSB_D: return "LSB-D";
+        case modeUSB_D: return "USB-D";
+        default: return "Unknown";
+        }
+    }
+    return m.name;
+}
+
+modeInfo webServer::stringToMode(const QString &mode)
+{
+    modeInfo m;
+    m.mk = modeUnknown;
+
+    if (!rigCaps) return m;
+
+    for (const modeInfo &mi : rigCaps->modes) {
+        if (mi.name.compare(mode, Qt::CaseInsensitive) == 0) {
+            m = mi;
+            m.filter = 1;
+            m.data = 0;
+            return m;
+        }
+    }
+    return m;
+}
+
+// --- Memory Channels ---
+
+QString webServer::modeRegToString(quint8 reg) const
+{
+    if (rigCaps) {
+        for (const modeInfo &mi : rigCaps->modes) {
+            if (mi.reg == reg) return mi.name;
+        }
+    }
+    return QString("?%1").arg(reg);
+}
+
+QJsonObject webServer::memoryToJson(const memoryType &mem)
+{
+    QJsonObject o;
+    o["group"] = mem.group;
+    o["channel"] = mem.channel;
+    o["frequency"] = (qint64)mem.frequency.Hz;
+    o["mode"] = modeRegToString(mem.mode);
+    o["modeReg"] = mem.mode;
+    o["filter"] = mem.filter;
+    o["name"] = QString::fromLatin1(mem.name).trimmed();
+    o["duplex"] = mem.duplex;
+    o["split"] = (int)mem.split;
+    o["tonemode"] = mem.tonemode;
+    // The stored nibble uses the same encoding as the live tone mode, so the
+    // browser can label a channel without repeating the enum.
+    o["toneModeName"] = toneModeName(static_cast<rptAccessTxRx_t>(mem.tonemode));
+    o["tone"] = mem.tone;
+    o["tsql"] = mem.tsql;
+    o["dtcs"] = mem.dtcs;
+    o["dtcsPolarity"] = mem.dtcsp;
+    o["duplexOffset"] = (qint64)mem.duplexOffset.Hz;
+    o["skip"] = mem.skip;
+    o["del"] = mem.del;
+    if (mem.frequency.Hz == 0 && mem.mode == 0) {
+        o["empty"] = true;
+    }
+    // Include VFO B data if split
+    if (mem.split) {
+        o["frequencyB"] = (qint64)mem.frequencyB.Hz;
+        o["modeB"] = modeRegToString(mem.modeB);
+    }
+    return o;
+}
+
+void webServer::scanNextMemory()
+{
+    memoryScanCurrent++;
+    if (memoryScanCurrent > memoryScanEnd || !queue) {
+        memoryScanActive = false;
+        if (memoryScanTimer) memoryScanTimer->stop();
+        QJsonObject done;
+        done["type"] = "memoryScanComplete";
+        // Channels of this group the scan did not report were cleared on the
+        // radio, or a write never landed: drop them now the picture is complete.
+        for (auto it = memories.begin(); it != memories.end(); ) {
+            if (int(it.key() >> 16) == memoryScanGroup && !memoryScanSeen.contains(it.key()))
+                it = memories.erase(it);
+            else
+                ++it;
+        }
+        // Count only the scanned group — a late reply from a previous scan
+        // may have parked an entry under another group's key.
+        int count = 0;
+        for (auto it = memories.constBegin(); it != memories.constEnd(); ++it) {
+            if (!it.value().del && int(it.key() >> 16) == memoryScanGroup) count++;
+        }
+        done["count"] = count;
+        sendJsonToAll(done);
+        return;
+    }
+    uint val = (uint(memoryScanGroup) << 16) | uint(memoryScanCurrent);
+    // add(), not addUnique(): see the getMemories handler.
+    queue->add(priorityImmediate, queueItem(funcMemoryContents, QVariant::fromValue<uint>(val), false, 0));
+    if (memoryScanTimer) memoryScanTimer->start();
+}
+
+// Can this rig report a memory channel's *contents*? Two halves, and both
+// matter (issue #114):
+//
+//   - funcMemoryContents (CI-V 1A 00 on Icom) is the command that reads a
+//     channel back. The IC-718 and the IC-706 family predate it entirely —
+//     they can select, write and clear a channel, but never say what is in
+//     one, so there is nothing to build a list from.
+//   - memParser is the byte layout that command's payload uses, taken from
+//     the rig file's MemFormat. The IC-746 / IC-756PRO family declare the
+//     command but ship an empty MemFormat, and serializing a memoryType
+//     against an empty parser appends no bytes at all — putting a payload-less
+//     "1A 00" on the wire, which the radio answers with NG.
+//
+// Every entry point that reads or writes channel contents gates on this.
+// Channel *select* (funcMemoryMode / funcMemorySelect) is a separate
+// capability and is checked where it is used, in recallMemoryOnRig().
+bool webServer::memoryContentsSupported() const
+{
+    return rigCaps && rigCaps->commands.contains(funcMemoryContents)
+        && !rigCaps->memParser.isEmpty();
+}
+
+// Report a failed memory action back to the client that asked for it. Before
+// this, the unsupported-rig paths in handleCommand() simply returned, leaving
+// the browser's Save / rename / clear looking like they had worked.
+void webServer::sendMemoryError(QWebSocket *client, const QString &error)
+{
+    QJsonObject obj;
+    obj["type"] = "memoryError";
+    obj["error"] = error;
+    sendJsonTo(client, obj);
+}
+
+// Put a stored frequency + mode onto the VFO. This is all a memory recall can
+// be when the channel's contents live outside the radio (local memories) or
+// when the rig has no channel-select command at all — no tone, no duplex, no
+// split, because neither source carries them.
+void webServer::applyMemoryToVfo(qint64 hz, quint8 modeReg, quint8 filter, quint8 datamode)
+{
+    if (!queue || !rigCaps) return;
+    const uchar rx = rigCaps->hasCommand29
+                   ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+    const vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+    if (hz > 0) {
+        freqt f;
+        f.Hz = hz;
+        f.MHzDouble = hz / 1.0E6;
+        f.VFO = activeVFO;
+        queue->addUnique(priorityImmediate, queueItem(t.freqFunc, QVariant::fromValue<freqt>(f), false, t.receiver));
+    }
+    for (const modeInfo &mi : rigCaps->modes) {
+        if (mi.reg == modeReg) {
+            modeInfo m = mi;
+            m.filter = filter > 0 ? filter : 1;
+            m.data = datamode;
+            queue->addUnique(priorityImmediate, queueItem(t.modeFunc, QVariant::fromValue<modeInfo>(m), false, t.receiver));
+            break;
+        }
+    }
+    requestVfoUpdate();
+}
+
+// Local channels reach the browser as the same "memoryChannel" records the rig
+// path sends, so the panel renders both without knowing which it is looking at.
+// The fields a local channel cannot carry are simply left out.
+QJsonObject webServer::localMemoryToJson(const localMemory &m) const
+{
+    QJsonObject o;
+    o["group"] = 0;
+    o["channel"] = m.channel;
+    o["frequency"] = m.frequency;
+    o["mode"] = modeRegToString(m.modeReg);
+    o["modeReg"] = m.modeReg;
+    o["filter"] = m.filter;
+    o["name"] = m.name;
+    o["local"] = true;
+    o["del"] = false;
+    if (m.frequency == 0) o["empty"] = true;
+    return o;
+}
+
+// The local answer to "getMemories". No scan and no timer — the list is
+// already in memory, so every channel goes out at once.
+void webServer::sendLocalMemories(QWebSocket *client)
+{
+    const QList<localMemory> list = memStore.all();
+    for (const localMemory &m : list) {
+        QJsonObject msg;
+        msg["type"] = "memoryChannel";
+        msg["memory"] = localMemoryToJson(m);
+        sendJsonTo(client, msg);
+    }
+    QJsonObject done;
+    done["type"] = "memoryScanComplete";
+    done["count"] = list.size();
+    done["local"] = true;
+    sendJsonTo(client, done);
+}
+
+// Store what the radio is on right now as local channel `channel`.
+bool webServer::writeLocalMemory(int channel, const QString &name, QString *error)
+{
+    if (!queue) {
+        if (error) *error = "Rig not connected";
+        return false;
+    }
+    localMemory m;
+    m.channel = channel;
+    m.name = name;
+
+    // Same cache fallback chain the rig write path uses: rigs differ in which
+    // cache the periodic poll fills, and the IC-718 class fills only funcFreq.
+    const vfoCommandType tA = queue->getVfoCommand(vfoA, 0, false);
+    cacheItem freqCache = queue->getCache(tA.freqFunc, 0);
+    if (!freqCache.value.isValid()) freqCache = queue->getCache(funcSelectedFreq, 0);
+    if (!freqCache.value.isValid()) freqCache = queue->getCache(funcFreq, 0);
+    if (freqCache.value.isValid()) m.frequency = qint64(freqCache.value.value<freqt>().Hz);
+    // Refuse a channel with no frequency rather than storing a 0 Hz entry the
+    // user would have to notice and delete. Same guard the rig path uses.
+    if (m.frequency <= 0) {
+        if (error) *error = "No frequency to store yet";
+        return false;
+    }
+    cacheItem modeCache = queue->getCache(tA.modeFunc, 0);
+    if (!modeCache.value.isValid()) modeCache = queue->getCache(funcSelectedMode, 0);
+    if (!modeCache.value.isValid()) modeCache = queue->getCache(funcMode, 0);
+    if (modeCache.value.isValid()) {
+        const modeInfo mi = modeCache.value.value<modeInfo>();
+        m.modeReg = quint8(mi.reg);
+        m.filter = quint8(mi.filter > 0 ? mi.filter : 1);
+    }
+    if (!memStore.set(m)) {
+        if (error) *error = "Could not save the memory file";
+        return false;
+    }
+    // Everyone watching gets the new row without a rescan.
+    QJsonObject msg;
+    msg["type"] = "memoryChannel";
+    msg["memory"] = localMemoryToJson(m);
+    sendJsonToAll(msg);
+    return true;
+}
+
+// Recall a local channel: tune the VFO, nothing else. Deliberately does NOT
+// touch the rig's own memory mode — on a radio like the IC-718 the CI-V 08
+// select would jump to *its* channel N, which has nothing to do with the entry
+// wfweb is storing under that number.
+bool webServer::recallLocalMemory(int channel, QString *error)
+{
+    if (!memStore.contains(channel)) {
+        if (error) *error = "No such memory channel";
+        return false;
+    }
+    const localMemory m = memStore.get(channel);
+    applyMemoryToVfo(m.frequency, m.modeReg, m.filter, 0);
+    return true;
+}
+
+// Recall a stored channel *on the radio* (issue #92) so the rig itself
+// restores the channel's full contents — mode, filter, repeater tone / tone
+// squelch, duplex direction and offset — instead of replaying freq + mode
+// from the cache. The wire protocol is {channel, group} only: the rig's own
+// data stays authoritative, clients never supply channel contents.
+bool webServer::recallMemoryOnRig(int channel, int group, QString *error)
+{
+    if (!queue || !rigCaps) {
+        if (error) *error = "Rig not connected";
+        return false;
+    }
+    if (channel < 0 || group < 0) {
+        if (error) *error = "Invalid channel or group";
+        return false;
+    }
+
+    // Per-rig select dialect. Kenwood defines BOTH funcMemoryMode (FR2, a
+    // bare toggle) and funcMemorySelect (MC, takes the channel) — MC must
+    // win or the channel digit gets appended to FR2. Yaesu has only MC.
+    // Icom has only funcMemoryMode (CI-V 08), which takes the channel.
+    funcs selCmd = rigCaps->commands.contains(funcMemorySelect) ? funcMemorySelect
+                 : rigCaps->commands.contains(funcMemoryMode)   ? funcMemoryMode
+                 : funcNone;
+
+    const quint32 key = (quint32(group) << 16) | quint32(channel);
+    bool cmd29 = rigCaps->hasCommand29;
+    uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
+
+    if (selCmd == funcNone) {
+        // No channel-select command at all: fall back to replaying the cached
+        // channel contents onto the VFO. No tone/offset, but better than
+        // nothing. Same freq/mode path as the canonical set handlers; the
+        // filter and datamode come from the channel itself.
+        auto it = memories.find(key);
+        if (it == memories.end()) {
+            if (error) *error = "Rig has no memory recall command and channel is not cached";
+            return false;
+        }
+        const memoryType &mem = it.value();
+        applyMemoryToVfo(qint64(mem.frequency.Hz), mem.mode, mem.filter, mem.datamode);
+        return true;
+    }
+
+    // Does this rig actually store a group in its channels? MemGroups alone
+    // lies on some rigs (IC-7610 declares 1 with no group field) — trust the
+    // memParser's 'a' spec instead.
+    bool hasGroupField = false;
+    for (const memParserFormat &parse : rigCaps->memParser) {
+        if (parse.spec == 'a') { hasGroupField = true; break; }
+    }
+
+    if (hasGroupField) {
+        if (rigCaps->commands.contains(funcMemoryGroup)) {
+            // Direct group select (CI-V 08 A0). The commander encodes the
+            // group to this rig's field width (1 or 2 BCD bytes).
+            queue->addUnique(priorityImmediate, queueItem(funcMemoryGroup, QVariant::fromValue<uint>(uint(group)), false, 0));
+        } else {
+            // IC-9700/IC-9100: groups exist but there is no group-select
+            // command — channel select acts on the bank owned by the current
+            // band. Derive the band from the group (Bands\N\MemoryGroup in
+            // the rig file) and nudge the VFO onto it first. If the rig is
+            // sitting in memory mode, drop back to VFO mode before retuning.
+            if (queue->getState().vfoMode == vfoModeMem || queue->getState().vfo == vfoMem) {
+                if (rigCaps->commands.contains(funcVFOModeSelect)) {
+                    queue->add(priorityImmediate, funcVFOModeSelect, false, 0);
+                }
+            }
+            quint64 bandHz = 0;
+            for (const bandType &b : rigCaps->bands) {
+                if (b.memGroup == group) { bandHz = b.lowFreq; break; }
+            }
+            // Prefer the server-cached channel frequency (it is inside the
+            // right band by definition and avoids an extra band-edge hop).
+            auto it = memories.constFind(key);
+            if (it != memories.constEnd() && it.value().frequency.Hz > 0) {
+                bandHz = it.value().frequency.Hz;
+            }
+            if (bandHz > 0) {
+                freqt f;
+                f.Hz = bandHz;
+                f.MHzDouble = bandHz / 1.0E6;
+                f.VFO = activeVFO;
+                vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
+                queue->addUnique(priorityImmediate, queueItem(t.freqFunc, QVariant::fromValue<freqt>(f), false, t.receiver));
+            } else {
+                qCWarning(logWebServer) << "recallMemory: no band found for memory group" << group
+                                        << "- recalling from the current band's bank";
+            }
+        }
+    }
+
+    // Select the channel — the radio loads mode, filter, tone, tone squelch,
+    // duplex direction and offset from it.
+    queue->addUnique(priorityImmediate, queueItem(selCmd, QVariant::fromValue<uint>(uint(channel)), false, 0));
+
+    // Selecting a channel does not flip the rig into memory mode by itself
+    // (Icom stays on VFO A/B, Kenwood needs FR2). funcSelectVFO(vfoMem) sends
+    // the bare mode select (CI-V 08 / FR2;) and marks the queue's rigState.
+    // Distinct queue command from the channel select above, so addUnique
+    // doesn't dedup it. Yaesu MC already switches to memory operation and
+    // defines no memory-mode toggle, so nothing is queued there.
+    if (rigCaps->commands.contains(funcMemoryMode)) {
+        queue->addUnique(priorityImmediate, queueItem(funcSelectVFO, QVariant::fromValue<vfo_t>(vfoMem), false, 0));
+    }
+
+    // Read freq/mode back so the browser display follows the recalled channel.
+    requestVfoUpdate();
+    // …and the tone the channel just restored, so the TONE tile and indicator
+    // show what the rig is actually doing rather than the previous VFO's tone.
+    for (funcs f : { funcToneSquelchType, funcRepeaterTone, funcRepeaterTSQL,
+                     funcRepeaterDTCS, funcToneFreq, funcTSQLFreq, funcDTCSCode }) {
+        if (rigCaps->commands.contains(f)) queue->addUnique(priorityImmediate, f, false, 0);
+    }
+    return true;
+}
+
+// --- Repeater access tone ---
+
+// The rig's band table, one entry per band, for the browser's BAND picker.
+// A .rig carries a separate row per ITU region wherever the edges differ
+// (40 m is 7.0-7.2 MHz in region 1, 7.0-7.3 in region 2) and nothing here
+// picks a region, so each band is folded to its widest edges: the picker
+// only needs "where does this band start" and "which band is this
+// frequency in". num is the availableBands enum (rigidentities.h), which
+// is what the browser keys its button labels on.
+void webServer::addBandCaps(QJsonObject &o) const
+{
+    if (!rigCaps || rigCaps->bands.empty()) return;
+    struct edges { QString name; quint64 lo; quint64 hi; int bsr; };
+    QMap<int, edges> folded;
+    // bsr: the band's CI-V 1A 01 stacking-register code (0 = none). The
+    // page sends setBand for those bands and setFrequency for the rest.
+    // Icom only: the Kenwood/Yaesu rig files carry band codes under the
+    // same label, but there funcBandStackReg is a native band-select
+    // (BD/BU0/BS) with no readable record, so they keep the plain path.
+    const bool hasBsr = rigCaps->manufacturer == manufIcom
+                     && rigCaps->commands.contains(funcBandStackReg);
+    for (const bandType &b : rigCaps->bands) {
+        if (b.band == bandUnknown || b.highFreq <= b.lowFreq) continue;
+        auto it = folded.find(int(b.band));
+        if (it == folded.end()) {
+            folded.insert(int(b.band), edges{b.name, b.lowFreq, b.highFreq, hasBsr ? int(b.bsr) : 0});
+        } else {
+            it->lo = qMin(it->lo, b.lowFreq);
+            it->hi = qMax(it->hi, b.highFreq);
+        }
+    }
+    QJsonArray bands;
+    for (auto it = folded.constBegin(); it != folded.constEnd(); ++it) {
+        QJsonObject bo;
+        bo["num"] = it.key();
+        bo["name"] = it->name;
+        bo["start"] = double(it->lo);
+        bo["end"] = double(it->hi);
+        bo["bsr"] = it->bsr;
+        bands.append(bo);
+    }
+    o["bands"] = bands;
+}
+
+// The bottom bar of the browser's meter is switchable: SWR (default), ALC,
+// COMP, Vd and Id, the same set the rig's own multi-function meter offers.
+// Send one descriptor per meter the rig can actually drive, so the browser
+// never offers a reading this radio cannot produce.
+//
+// Each descriptor carries the rig's own calibration table ([rigVal, actual]
+// pairs straight out of the .rig file) plus the actual value where the red
+// zone starts. That is exactly what the rig prints on its meter face: the
+// bar is linear in the raw register value, and the table says which reading
+// each printed tick corresponds to. A meter with no table would read out raw
+// 0..255 counts, so it is left out rather than shown lying.
+void webServer::addTxMeterCaps(QJsonObject &o) const
+{
+    if (!rigCaps) return;
+    struct meterDesc { const char *kind; funcs func; meter_t meter; };
+    static const meterDesc meters[] = {
+        { "swr",  funcSWRMeter,  meterSWR     },
+        { "alc",  funcALCMeter,  meterALC     },
+        { "comp", funcCompMeter, meterComp    },
+        { "vd",   funcVdMeter,   meterVoltage },
+        { "id",   funcIdMeter,   meterCurrent },
+    };
+    QJsonArray list;
+    for (const meterDesc &d : meters) {
+        if (!rigCaps->commands.contains(d.func)) continue;
+        const QMap<int, double> &cal = rigCaps->meters[d.meter];
+        if (cal.isEmpty()) continue;
+        QJsonArray points;
+        for (auto it = cal.constBegin(); it != cal.constEnd(); ++it) {
+            QJsonArray pt;
+            pt.append(it.key());
+            pt.append(it.value());
+            points.append(pt);
+        }
+        QJsonObject m;
+        m["kind"] = d.kind;
+        m["cal"] = points;
+        // meterLines[] is only written for a cal point flagged RedLine.
+        if (rigCaps->meterLines[d.meter] != 0.0)
+            m["red"] = rigCaps->meterLines[d.meter];
+        list.append(m);
+    }
+    o["txMeters"] = list;
+
+    // The Power table, so the page can tell this rig's 100 % from watts (the
+    // reading it gets is in watts, and a 10 W rig's full scale is not 100).
+    QJsonArray poCal;
+    const QMap<int, double> &po = rigCaps->meters[meterPower];
+    for (auto it = po.constBegin(); it != po.constEnd(); ++it) {
+        QJsonArray pt;
+        pt.append(it.key());
+        pt.append(it.value());
+        poCal.append(pt);
+    }
+    o["poCal"] = poCal;
+
+    // The keyer speed range from the rig file (Icom 6-48 WPM, Kenwood and
+    // Yaesu up to 60), so the CW bar's speed box clamps to this radio (#141).
+    if (rigCaps->commands.contains(funcKeySpeed)) {
+        const funcType &ks = rigCaps->commands[funcKeySpeed];
+        if (ks.maxVal > ks.minVal) {
+            QJsonObject r;
+            r["min"] = ks.minVal;
+            r["max"] = ks.maxVal;
+            o["cwSpeedRange"] = r;
+        }
+    }
+}
+
+// The cached reading of whichever optional meter is currently polled. Only
+// one of the three is ever in the queue, so at most one key appears.
+void webServer::addTxMeterReadings(QJsonObject &o) const
+{
+    const char *key = (txMeterFunc == funcCompMeter) ? "compMeter"
+                    : (txMeterFunc == funcVdMeter)   ? "vdMeter"
+                    : (txMeterFunc == funcIdMeter)   ? "idMeter" : nullptr;
+    if (!queue || !key) return;
+    cacheItem c = queue->getCache(txMeterFunc, 0);
+    if (c.value.isValid()) o[key] = c.value.toDouble();
+}
+
+// Poll whichever of Comp/Vd/Id the browser's second TX bar is showing, and
+// drop the poll for the other two. SWR/ALC/power are polled unconditionally
+// elsewhere, so selecting them just clears the extra poll.
+void webServer::applyTxMeterPoll()
+{
+    if (!queue || !rigCaps) return;
+    static const funcs optional[] = { funcCompMeter, funcVdMeter, funcIdMeter };
+    for (funcs f : optional) {
+        if (f == txMeterFunc) continue;
+        queue->del(f, 0);
+    }
+    if (txMeterFunc != funcNone && rigCaps->commands.contains(txMeterFunc))
+        queue->addUnique(priorityHighest, queueItem(txMeterFunc, true, 0));
+}
+
+// What the browser needs to draw the TONE panel: which of the three tone kinds
+// this rig can do, whether the tone *frequency* is settable (the IC-905 can
+// engage a tone but has no 0x1B register), and the rig's own tone tables.
+void webServer::addToneCaps(QJsonObject &o) const
+{
+    if (!rigCaps) return;
+    const bool hasTone = toneCommandsAvailable();
+    o["hasCTCSS"] = hasTone && !rigCaps->ctcss.empty();
+    o["hasDTCS"] = hasTone && !rigCaps->dtcs.empty()
+                && rigCaps->commands.contains(funcDTCSCode);
+    o["hasToneSqlType"] = rigCaps->commands.contains(funcToneSquelchType);
+    o["canSetToneFreq"] = rigCaps->commands.contains(funcToneFreq);
+    o["canSetTsqlFreq"] = rigCaps->commands.contains(funcTSQLFreq);
+    if (hasTone && !rigCaps->ctcss.empty()) {
+        QJsonArray tones;
+        for (const toneInfo &t : rigCaps->ctcss) tones.append(t.tone);
+        o["ctcssTones"] = tones;
+    }
+    if (o["hasDTCS"].toBool()) {
+        QJsonArray codes;
+        for (const toneInfo &t : rigCaps->dtcs) codes.append(t.tone);
+        o["dtcsCodes"] = codes;
+    }
+}
+
+// True when the rig can engage a tone at all — either dialect will do.
+bool webServer::toneCommandsAvailable() const
+{
+    if (!rigCaps) return false;
+    return rigCaps->commands.contains(funcToneSquelchType)
+        || rigCaps->commands.contains(funcRepeaterTone)
+        || rigCaps->commands.contains(funcRepeaterTSQL)
+        || rigCaps->commands.contains(funcRepeaterDTCS);
+}
+
+// Collapse whichever dialect the rig speaks into a single rptAccessTxRx_t.
+// Rigs with the "Tone Squelch Type" register report the combined modes
+// directly; the rest are three independent booleans we fold together.
+//
+// Reads only the mirrored members (see the note in webserver.h) so it is safe
+// to call from receiveCache(), which may hold the queue mutex.
+rptAccessTxRx_t webServer::currentToneMode() const
+{
+    if (!rigCaps) return ratrNN;
+    if (rigCaps->commands.contains(funcToneSquelchType)) return toneModeCache;
+    // DTCS wins over the CTCSS pair: a rig in DTCS is not also sending a tone.
+    if (toneFlagDtcs) return ratrDD;
+    if (toneFlagTone && toneFlagTsql) return ratrTT;
+    if (toneFlagTsql) return ratrNT;
+    if (toneFlagTone) return ratrTN;
+    return ratrNN;
+}
+
+// Write the mode back out in whichever dialect the rig speaks. On the boolean
+// rigs every flag is written every time — leaving the previous mode's flag set
+// would silently combine the two.
+void webServer::applyToneMode(rptAccessTxRx_t mode)
+{
+    if (!queue || !rigCaps) return;
+    if (rigCaps->commands.contains(funcToneSquelchType)) {
+        rptrAccessData r;
+        r.accessMode = mode;
+        queue->addUnique(priorityImmediate,
+                         queueItem(funcToneSquelchType, QVariant::fromValue<rptrAccessData>(r), false, 0));
+        queue->receiveValue(funcToneSquelchType, QVariant::fromValue<rptrAccessData>(r), 0);
+        return;
+    }
+    struct { funcs f; bool on; } flags[] = {
+        { funcRepeaterTone, toneModeUsesTone(mode) },
+        { funcRepeaterTSQL, toneModeUsesTsql(mode) },
+        { funcRepeaterDTCS, toneModeUsesDtcs(mode) },
+    };
+    for (const auto &fl : flags) {
+        if (!rigCaps->commands.contains(fl.f)) continue;
+        queue->addUnique(priorityImmediate, queueItem(fl.f, QVariant::fromValue<bool>(fl.on), false, 0));
+        queue->receiveValue(fl.f, QVariant::fromValue<bool>(fl.on), 0);
+    }
+    scheduleToneModeNotify();
+}
+
+// Coalesce the tone-mode notification. Three flags land as three separate
+// cache updates — whether we just wrote them or the rig is answering a poll —
+// and folding after each one would flash a mode nobody selected.
+void webServer::scheduleToneModeNotify()
+{
+    if (!toneModeNotifyTimer) {
+        toneModeNotifyTimer = new QTimer(this);
+        toneModeNotifyTimer->setSingleShot(true);
+        toneModeNotifyTimer->setInterval(60);
+        connect(toneModeNotifyTimer, &QTimer::timeout, this, [this]() {
+            if (wsClients.isEmpty()) return;
+            QJsonObject u;
+            u["type"] = "update";
+            u["toneMode"] = toneModeName(currentToneMode());
+            sendJsonToAll(u);
+        });
+    }
+    toneModeNotifyTimer->start();
+}
+
+// Shared by the periodic status and the REST status document.
+void webServer::addToneStatus(QJsonObject &o)
+{
+    if (!queue || !rigCaps || !toneCommandsAvailable()) return;
+    // currentToneMode() is served from the mirrored members, so ask the queue
+    // for the mode registers here — getCache() re-requests anything stale, and
+    // this runs from the status build, where the queue mutex is free.
+    if (rigCaps->commands.contains(funcToneSquelchType)) {
+        queue->getCache(funcToneSquelchType, 0);
+    } else {
+        for (funcs f : { funcRepeaterTone, funcRepeaterTSQL, funcRepeaterDTCS }) {
+            if (rigCaps->commands.contains(f)) queue->getCache(f, 0);
+        }
+    }
+    o["toneMode"] = toneModeName(currentToneMode());
+    if (rigCaps->commands.contains(funcToneFreq)) {
+        cacheItem c = queue->getCache(funcToneFreq, 0);
+        if (c.value.isValid()) o["toneFreq"] = c.value.value<toneInfo>().tone;
+    }
+    if (rigCaps->commands.contains(funcTSQLFreq)) {
+        cacheItem c = queue->getCache(funcTSQLFreq, 0);
+        if (c.value.isValid()) o["tsqlFreq"] = c.value.value<toneInfo>().tone;
+    }
+    if (rigCaps->commands.contains(funcDTCSCode)) {
+        cacheItem c = queue->getCache(funcDTCSCode, 0);
+        if (c.value.isValid()) {
+            toneInfo t = c.value.value<toneInfo>();
+            o["dtcsCode"] = t.tone;
+            o["dtcsPolarity"] = (t.tinv ? 2 : 0) | (t.rinv ? 1 : 0);
+        }
+    }
+}
+
+
+
+// --- Audio Streaming ---
+
+codecType webServer::codecByteToType(quint8 codec)
+{
+    switch (codec) {
+    case 0x01:
+    case 0x20:
+        return PCMU;
+    case 0x40:
+    case 0x41:
+        return OPUS;
+    case 0x80:
+        return ADPCM;
+    case 0x02:
+    case 0x04:
+    case 0x08:
+    case 0x10:
+    default:
+        return LPCM;
+    }
+}
+
+void webServer::setLanInfo(bool isLan, bool connected)
+{
+    bool changed = (lanMode != isLan) || (lanConnected != connected);
+    bool justConnected = connected && !lanConnected;
+    lanMode = isLan;
+    lanConnected = connected;
+    if (!changed) return;
+    QJsonObject obj;
+    obj["type"] = "lanStatus";
+    obj["isLan"] = lanMode;
+    obj["lanConnected"] = lanConnected;
+    sendJsonToAll(obj);
+
+    // On LAN power-up, the rig caps may already be known (cached from a prior
+    // session) so receiveRigCaps won't fire again. Poll both VFOs here so the
+    // Sub VFO display populates without user interaction (issue #31).
+    if (justConnected && rigCaps) requestVfoUpdate();
+}
+
+void webServer::setupAudio(quint8 codec, quint32 sampleRate)
+{
+    if (audioConfigured) {
+        qInfo() << "Web: Audio already configured, skipping";
+        return;
+    }
+    if (codec == 0 || sampleRate == 0) {
+        qInfo() << "Web: Audio not available (codec=0 or sampleRate=0)";
+        return;
+    }
+
+    rigCodec = codec;
+    rigSampleRate = sampleRate;
+
+    // Create audio converter in its own thread
+    rxConverter = new audioConverter();
+    rxConverterThread = new QThread(this);
+    rxConverterThread->setObjectName("webAudioConv()");
+    rxConverter->moveToThread(rxConverterThread);
+
+    connect(this, &webServer::setupConverter, rxConverter, &audioConverter::init);
+    connect(this, &webServer::sendToConverter, rxConverter, &audioConverter::convert);
+    connect(rxConverter, &audioConverter::converted, this, &webServer::onRxConverted);
+    connect(rxConverterThread, &QThread::finished, rxConverter, &QObject::deleteLater);
+
+    rxConverterThread->start();
+
+    // Input format: what the rig sends
+    QAudioFormat inFormat = toQAudioFormat(codec, sampleRate);
+    codecType inCodec = codecByteToType(codec);
+
+    // Output format: 16-bit signed LE mono at the rig's sample rate
+    // (browser handles any resampling needed)
+    QAudioFormat outFormat;
+    outFormat.setSampleRate(sampleRate);
+    outFormat.setChannelCount(1);
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    outFormat.setSampleSize(16);
+    outFormat.setSampleType(QAudioFormat::SignedInt);
+    outFormat.setByteOrder(QAudioFormat::LittleEndian);
+    outFormat.setCodec("audio/pcm");
+#else
+    outFormat.setSampleFormat(QAudioFormat::Int16);
+#endif
+
+    emit setupConverter(inFormat, inCodec, outFormat, LPCM, 5, 4);
+
+    // TX converter: PCM Int16 (from browser) → rig codec (for transmission)
+    txConverter = new audioConverter();
+    txConverterThread = new QThread(this);
+    txConverterThread->setObjectName("webTxConv()");
+    txConverter->moveToThread(txConverterThread);
+
+    connect(this, &webServer::setupTxConverter, txConverter, &audioConverter::init);
+    connect(this, &webServer::sendToTxConverter, txConverter, &audioConverter::convert);
+    connect(txConverter, &audioConverter::converted, this, &webServer::onTxConverted);
+    connect(txConverterThread, &QThread::finished, txConverter, &QObject::deleteLater);
+
+    txConverterThread->start();
+
+    // TX: input is PCM Int16 mono (from browser), output is rig codec format
+    emit setupTxConverter(outFormat, LPCM, inFormat, inCodec, 5, 4);
+
+    txAudioConfigured = true;
+    audioConfigured = true;
+
+    // FreeDV processor thread (created once, activated on demand)
+    freedvProcessor = new FreeDVProcessor();
+    freedvThread = new QThread(this);
+    freedvThread->setObjectName("webFreeDV()");
+    freedvProcessor->moveToThread(freedvThread);
+
+    connect(this, &webServer::setupFreeDV, freedvProcessor, &FreeDVProcessor::init);
+    connect(this, &webServer::sendToFreeDVRx, freedvProcessor, &FreeDVProcessor::processRx);
+    connect(this, &webServer::sendToFreeDVTx, freedvProcessor, &FreeDVProcessor::processTx);
+    connect(freedvProcessor, &FreeDVProcessor::rxReady, this, &webServer::onFreeDVRxReady);
+    connect(freedvProcessor, &FreeDVProcessor::txReady, this, &webServer::onFreeDVTxReady);
+    connect(freedvProcessor, &FreeDVProcessor::statsUpdate, this, &webServer::onFreeDVStats);
+    connect(freedvProcessor, &FreeDVProcessor::rxCallsign, this, &webServer::onFreeDVRxCallsign);
+    connect(freedvThread, &QThread::finished, freedvProcessor, &QObject::deleteLater);
+
+    freedvThread->start();
+
+    // RADE V1 processor thread (created once, activated on demand)
+    radeProcessor = new RadeProcessor();
+    radeThread = new QThread(this);
+    radeThread->setObjectName("webRADE()");
+    radeProcessor->moveToThread(radeThread);
+
+    connect(this, &webServer::setupRade, radeProcessor, &RadeProcessor::init);
+    connect(this, &webServer::sendToRadeRx, radeProcessor, &RadeProcessor::processRx);
+    connect(this, &webServer::sendToRadeTx, radeProcessor, &RadeProcessor::processTx);
+    connect(radeProcessor, &RadeProcessor::rxReady, this, &webServer::onRadeRxReady);
+    connect(radeProcessor, &RadeProcessor::txReady, this, &webServer::onRadeTxReady);
+    connect(radeProcessor, &RadeProcessor::statsUpdate, this, &webServer::onRadeStats);
+    connect(radeProcessor, &RadeProcessor::rxCallsign, this, &webServer::onRadeRxCallsign);
+    connect(radeThread, &QThread::finished, radeProcessor, &QObject::deleteLater);
+
+    radeThread->start();
+
+    // Dire Wolf packet processor thread (created once, activated on demand)
+    dwProc = new DireWolfProcessor();
+    dwThread = new QThread(this);
+    dwThread->setObjectName("webPacket()");
+    dwProc->moveToThread(dwThread);
+
+    connect(this, &webServer::setupPacket, dwProc, &DireWolfProcessor::init);
+    connect(this, &webServer::sendToPacketRx, dwProc, &DireWolfProcessor::processRx);
+    connect(dwProc, &DireWolfProcessor::rxFrameDecoded, this, &webServer::onPacketRxDecoded);
+    connect(dwProc, &DireWolfProcessor::txFrameDecoded, this, &webServer::onPacketTxDecoded);
+    connect(dwProc, &DireWolfProcessor::txReady, this, &webServer::onPacketTxReady);
+    connect(dwProc, &DireWolfProcessor::txFailed, this, &webServer::onPacketTxFailed);
+    connect(dwThread, &QThread::finished, dwProc, &QObject::deleteLater);
+
+    dwThread->start();
+
+    // Initialize the modem at the current rig sample rate so it's ready when enabled.
+    emit setupPacket(sampleRate);
+
+    // AX.25 connected-mode: spin up the data-link state machine.  Owns
+    // its own dispatcher thread internally; we just connect signals.
+    if (!axProc) {
+        axProc = new AX25LinkProcessor(this);
+        // Connected-mode TX: ax25_link → AX25LinkProcessor → DireWolfProcessor.
+        // QueuedConnection lets the dispatcher thread cross into the dwProc thread.
+        connect(axProc, &AX25LinkProcessor::transmitFrameBytes,
+                dwProc, &DireWolfProcessor::transmitFrameBytes,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::linkEstablished,
+                this,   &webServer::onAxLinkEstablished,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::linkTerminated,
+                this,   &webServer::onAxLinkTerminated,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::rxData,
+                this,   &webServer::onAxRxData,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::dataAcked,
+                this,   &webServer::onAxDataAcked,
+                Qt::QueuedConnection);
+        axProc->start();
+
+        // APRS layer.  Lives in the webserver thread; receives decoded
+        // RX frames via queued connection, broadcasts station deltas to
+        // all WS clients, and asks us to TX beacons through the same
+        // path packetTx uses.
+        aprsProc = new AprsProcessor(this);
+        connect(dwProc, &DireWolfProcessor::rxFrameDecoded,
+                aprsProc, &AprsProcessor::onRxFrame,
+                Qt::QueuedConnection);
+        connect(aprsProc, &AprsProcessor::stationUpdated,
+                this, &webServer::onAprsStationUpdated);
+        connect(aprsProc, &AprsProcessor::stationsCleared,
+                this, &webServer::onAprsStationsCleared);
+        connect(aprsProc, &AprsProcessor::txBeaconRequested,
+                this, &webServer::onAprsBeaconRequested);
+
+        // Mirror the setupUsbAudio() startup block: load persisted
+        // packet enable/mode and apply it to the processors.  Without
+        // this, the LAN path leaves paclen at the static-init default
+        // (128) instead of baud-scaling it via setLinkParamsForBaud.
+        packetLoadSettings();
+        QMetaObject::invokeMethod(axProc, "setLinkParamsForBaud", Qt::QueuedConnection,
+                                  Q_ARG(int, packetMode));
+        QMetaObject::invokeMethod(dwProc, "setMode", Qt::QueuedConnection,
+                                  Q_ARG(int, packetMode));
+        if (packetEnabled) {
+            QMetaObject::invokeMethod(dwProc, "setEnabled", Qt::QueuedConnection,
+                                      Q_ARG(bool, true));
+        }
+    }
+
+    qInfo() << "Web: Audio configured, codec=" << Qt::hex << codec
+            << "sampleRate=" << Qt::dec << sampleRate;
+
+    // Notify already-connected web clients that audio is now available
+    if (!wsClients.isEmpty()) {
+        QJsonObject notify;
+        notify["type"] = "audioAvailable";
+        notify["available"] = true;
+        notify["sampleRate"] = (int)sampleRate;
+        notify["txAudioAvailable"] = true;
+        sendJsonToAll(notify);
+    }
+}
+
+void webServer::receiveRxAudio(audioPacket audio)
+{
+    if (!audioConfigured) return;
+    // Forward audio whenever *any* consumer cares: browser audio clients,
+    // or an active packet modem that needs samples even when no one is
+    // listening to RX audio in the browser.
+    bool haveConsumer = !audioClients.isEmpty();
+    haveConsumer = haveConsumer || packetEnabled;
+    if (!haveConsumer) return;
+    if (freedvEnabled && !freedvMonitor) {
+        if (freedvModeName == "RADE")
+            emit sendToRadeRx(audio);
+        else
+            emit sendToFreeDVRx(audio);
+    } else {
+        emit sendToConverter(audio);
+    }
+}
+
+void webServer::onFreeDVRxReady(audioPacket audio)
+{
+    if (rxConverter) {
+        // LAN path: feed into converter
+        emit sendToConverter(audio);
+    } else {
+        // USB path: send directly to browser clients
+        quint16 rateDiv = static_cast<quint16>(rigSampleRate / 1000);
+        QByteArray msg;
+        int headerSize = 6;
+        msg.resize(headerSize + audio.data.size());
+        msg[0] = 0x02;
+        msg[1] = 0x00;
+        quint16 seq = audioSeq++;
+        memcpy(msg.data() + 2, &seq, 2);
+        memcpy(msg.data() + 4, &rateDiv, 2);
+        memcpy(msg.data() + headerSize, audio.data.constData(), audio.data.size());
+        sendBinaryToAudioClients(msg);
+    }
+}
+
+void webServer::onFreeDVTxReady(audioPacket audio)
+{
+    if (usbAudioOutput && txAudioConfigured) {
+        // Expand mono → stereo if needed
+        QByteArray writeData;
+        if (usbOutputChannels == 2) {
+            int numSamples = audio.data.size() / 2;
+            writeData.resize(numSamples * 4);
+            const qint16 *src = reinterpret_cast<const qint16 *>(audio.data.constData());
+            qint16 *dst = reinterpret_cast<qint16 *>(writeData.data());
+            for (int i = 0; i < numSamples; i++) {
+                dst[i * 2] = src[i];
+                dst[i * 2 + 1] = src[i];
+            }
+        } else {
+            writeData = audio.data;
+        }
+
+        // Apply ALC-controlled gain to modem output
+        if (freedvTxGain < 0.99f) {
+            qint16 *samples = reinterpret_cast<qint16 *>(writeData.data());
+            int count = writeData.size() / (int)sizeof(qint16);
+            for (int i = 0; i < count; i++)
+                samples[i] = qBound((int)-32768, (int)(samples[i] * freedvTxGain), (int)32767);
+        }
+
+        // Accumulate modem output; drain timer feeds ALSA at a steady rate
+        freedvTxBuffer.append(writeData);
+
+        // Start ALSA and drain timer on first data
+        if (!freedvTxActive) {
+            freedvTxActive = true;
+            // Stop any existing ALSA session (started by normal mic path)
+            if (usbAudioOutput->state() != QAudio::StoppedState)
+                usbAudioOutput->stop();
+            usbAudioOutputDevice = nullptr;
+            usbTxReset();
+
+            usbAudioOutputDevice = usbAudioOutput->start();
+            if (usbAudioOutputDevice) {
+                txAudioActive = true;
+                preTxBuffering = false;
+                // Pre-fill ALSA with silence for headroom
+                QByteArray prefill(4800 * usbOutputChannels, 0);  // 50ms
+                usbAudioOutputDevice->write(prefill);
+
+                if (!freedvTxDrainTimer) {
+                    freedvTxDrainTimer = new QTimer(this);
+                    freedvTxDrainTimer->setTimerType(Qt::PreciseTimer);
+                    connect(freedvTxDrainTimer, &QTimer::timeout, this, &webServer::drainFreeDVTxBuffer);
+                }
+                freedvTxDrainTimer->start(10);  // 10ms ticks
+                qInfo() << "Web: FreeDV TX started, ALSA bufSize=" << usbAudioOutput->bufferSize();
+            } else {
+                qWarning() << "Web: FreeDV TX ALSA start() failed";
+                freedvTxActive = false;
+            }
+        }
+    } else if (txConverter) {
+        emit sendToTxConverter(audio);
+    }
+}
+
+void webServer::drainFreeDVTxBuffer()
+{
+    if (!usbAudioOutputDevice) return;
+
+    // Write 10ms per tick (48kHz × 2 bytes × channels × 0.010s)
+    int chunkSize = 960 * usbOutputChannels;  // 960 bytes mono, 1920 stereo
+
+    if (freedvTxBuffer.size() >= chunkSize) {
+        usbAudioOutputDevice->write(freedvTxBuffer.left(chunkSize));
+        freedvTxBuffer.remove(0, chunkSize);
+    } else if (!freedvTxBuffer.isEmpty()) {
+        // Partial data: pad with silence to maintain timing
+        QByteArray chunk = freedvTxBuffer;
+        chunk.append(QByteArray(chunkSize - chunk.size(), 0));
+        usbAudioOutputDevice->write(chunk);
+        freedvTxBuffer.clear();
+    } else if (radeEooDraining) {
+        // One-shot RADE EOO frame fully drained — stop ALSA and clean up.
+        // PKT no longer rides this drain function; it has its own pacer
+        // (drainPacketUsbTxBuffer) and an event-driven unkey via
+        // QAudioOutput::stateChanged → IdleState.
+        radeEooDraining = false;
+        freedvTxActive = false;
+        freedvTxDrainTimer->stop();
+        txAudioActive = false;
+        if (usbAudioOutput) {
+            usbAudioOutput->stop();
+            usbAudioOutputDevice = nullptr;
+        }
+        qInfo() << "Web: RADE EOO drain complete, ALSA stopped";
+        return;
+    } else {
+        // No data: write silence to keep ALSA fed
+        QByteArray silence(chunkSize, 0);
+        usbAudioOutputDevice->write(silence);
+    }
+}
+
+void webServer::onFreeDVStats(float snr, bool sync)
+{
+    freedvSNR = snr;
+    bool wasSync = freedvSync;
+    freedvSync = sync;
+    if (sync != wasSync) {
+        QJsonObject notify;
+        notify["type"] = "freedvStatus";
+        notify["freedvSync"] = sync;
+        notify["freedvSNR"] = (double)snr;
+        sendJsonToAll(notify);
+
+        if (freedvReporter) {
+            if (sync) {
+                // Sync acquired: send immediate report, start periodic updates
+                lastReportedCallsign.clear();
+                freedvReporter->updateRxSpot(QString(), freedvModeName, (int)snr);
+                startReporterSnrTimer();
+            } else {
+                // Sync lost: stop periodic updates
+                stopReporterSnrTimer();
+            }
+        }
+    }
+}
+void webServer::onFreeDVRxCallsign(const QString &callsign)
+{
+    qInfo() << "FreeDV: decoded callsign:" << callsign;
+    lastReportedCallsign = callsign;
+    if (freedvReporter && freedvSync)
+        freedvReporter->updateRxSpot(callsign, freedvModeName, (int)freedvSNR);
+}
+
+// "waiting" replaces "connecting" when a reporter is enabled but the
+// matching mode (FreeDV or FT8/FT4) is not currently active — there is
+// nothing to connect to yet, so saying "connecting" would be misleading.
+static QString reporterDisplayState(SpotReporter::State s, bool enabled, bool modeActive)
+{
+    if (!enabled) return QStringLiteral("disconnected");
+    if (!modeActive) return QStringLiteral("waiting");
+    switch (s) {
+    case SpotReporter::Disconnected: return QStringLiteral("disconnected");
+    case SpotReporter::Connecting:   return QStringLiteral("connecting");
+    case SpotReporter::Connected:    return QStringLiteral("connected");
+    case SpotReporter::Error:        return QStringLiteral("error");
+    }
+    return QStringLiteral("disconnected");
+}
+
+void webServer::notifyFreedvReporterStatus()
+{
+    SpotReporter::State s = freedvReporter ? freedvReporter->state()
+                                           : SpotReporter::Disconnected;
+    QJsonObject notify;
+    notify["type"] = "reporterStatus";
+    notify["enabled"] = reporterEnabled;
+    notify["state"] = reporterDisplayState(s, reporterEnabled, freedvEnabled);
+    sendJsonToAll(notify);
+}
+
+void webServer::notifyPskReporterStatus()
+{
+    SpotReporter::State s = pskReporter ? pskReporter->state()
+                                        : SpotReporter::Disconnected;
+    QJsonObject notify;
+    notify["type"] = "pskReporterStatus";
+    notify["enabled"] = pskReporterEnabled;
+    notify["state"] = reporterDisplayState(s, pskReporterEnabled, digiActive);
+    sendJsonToAll(notify);
+}
+
+void webServer::onReporterStateChanged(int /*state*/)
+{
+    notifyFreedvReporterStatus();
+}
+
+void webServer::onPskReporterStateChanged(int /*state*/)
+{
+    notifyPskReporterStatus();
+}
+
+void webServer::startReporterSnrTimer()
+{
+    if (!reporterSnrTimer) {
+        reporterSnrTimer = new QTimer(this);
+        reporterSnrTimer->setInterval(4000);
+        connect(reporterSnrTimer, &QTimer::timeout, this, [this]() {
+            if (freedvReporter && freedvSync)
+                freedvReporter->updateRxSpot(lastReportedCallsign, freedvModeName, (int)freedvSNR);
+        });
+    }
+    reporterSnrTimer->start();
+}
+
+void webServer::stopReporterSnrTimer()
+{
+    if (reporterSnrTimer)
+        reporterSnrTimer->stop();
+    lastReportedCallsign.clear();
+}
+
+void webServer::onRadeRxReady(audioPacket audio)
+{
+    // Same output path as FreeDV: decoded speech -> converter or direct to browser
+    if (rxConverter) {
+        emit sendToConverter(audio);
+    } else {
+        quint16 rateDiv = static_cast<quint16>(rigSampleRate / 1000);
+        QByteArray msg;
+        int headerSize = 6;
+        msg.resize(headerSize + audio.data.size());
+        msg[0] = 0x02;
+        msg[1] = 0x00;
+        quint16 seq = audioSeq++;
+        memcpy(msg.data() + 2, &seq, 2);
+        memcpy(msg.data() + 4, &rateDiv, 2);
+        memcpy(msg.data() + headerSize, audio.data.constData(), audio.data.size());
+        sendBinaryToAudioClients(msg);
+    }
+}
+
+void webServer::onRadeTxReady(audioPacket audio)
+{
+    // Same output path as FreeDV TX: modem tones -> USB ALSA or LAN converter
+    if (usbAudioOutput && txAudioConfigured) {
+        QByteArray writeData;
+        if (usbOutputChannels == 2) {
+            int numSamples = audio.data.size() / 2;
+            writeData.resize(numSamples * 4);
+            const qint16 *src = reinterpret_cast<const qint16 *>(audio.data.constData());
+            qint16 *dst = reinterpret_cast<qint16 *>(writeData.data());
+            for (int i = 0; i < numSamples; i++) {
+                dst[i * 2] = src[i];
+                dst[i * 2 + 1] = src[i];
+            }
+        } else {
+            writeData = audio.data;
+        }
+
+        // RADE uses a fixed TX level. The modem is a full-duty constant-envelope
+        // signal, and radeprocessor.cpp already applies RADE_TX_SCALE. Multiplying
+        // by a drifting freedvTxGain on top caused progressive power loss — use a
+        // known-good constant instead and keep the ALC loop out of RADE entirely.
+        {
+            qint16 *samples = reinterpret_cast<qint16 *>(writeData.data());
+            int count = writeData.size() / (int)sizeof(qint16);
+            for (int i = 0; i < count; i++)
+                samples[i] = qBound((int)-32768, (int)(samples[i] * RADE_TX_GAIN), (int)32767);
+        }
+
+        freedvTxBuffer.append(writeData);
+
+        if (!freedvTxActive) {
+            freedvTxActive = true;
+            if (usbAudioOutput->state() != QAudio::StoppedState)
+                usbAudioOutput->stop();
+            usbAudioOutputDevice = nullptr;
+            usbTxReset();
+
+            usbAudioOutputDevice = usbAudioOutput->start();
+            if (usbAudioOutputDevice) {
+                txAudioActive = true;
+                preTxBuffering = false;
+                QByteArray prefill(4800 * usbOutputChannels, 0);
+                usbAudioOutputDevice->write(prefill);
+
+                if (!freedvTxDrainTimer) {
+                    freedvTxDrainTimer = new QTimer(this);
+                    freedvTxDrainTimer->setTimerType(Qt::PreciseTimer);
+                    connect(freedvTxDrainTimer, &QTimer::timeout, this, &webServer::drainFreeDVTxBuffer);
+                }
+                freedvTxDrainTimer->start(10);
+                qInfo() << "Web: RADE TX started, ALSA bufSize=" << usbAudioOutput->bufferSize();
+            } else {
+                qWarning() << "Web: RADE TX ALSA start() failed";
+                freedvTxActive = false;
+            }
+        }
+    } else if (txConverter) {
+        emit sendToTxConverter(audio);
+    }
+}
+
+void webServer::onRadeStats(float snr, bool sync, float freqOffset)
+{
+    freedvSNR = snr;
+    freedvFreqOffset = freqOffset;
+    bool wasSync = freedvSync;
+    freedvSync = sync;
+    if (sync != wasSync) {
+        QJsonObject notify;
+        notify["type"] = "freedvStatus";
+        notify["freedvSync"] = sync;
+        notify["freedvSNR"] = (double)snr;
+        notify["freedvFreqOffset"] = (double)freqOffset;
+        sendJsonToAll(notify);
+        if (freedvReporter) {
+            if (sync) {
+                // Sync acquired: send immediate report, start periodic updates
+                lastReportedCallsign.clear();
+                freedvReporter->updateRxSpot(QString(), freedvModeName, (int)snr);
+                startReporterSnrTimer();
+            } else {
+                // Sync lost: stop periodic updates
+                stopReporterSnrTimer();
+            }
+        }
+        // Callsign clearing is handled by a timer started in onRadeRxCallsign.
+    }
+}
+
+void webServer::onRadeRxCallsign(const QString &callsign)
+{
+    radeRxCallsign = callsign;
+
+    // Send to browser
+    QJsonObject notify;
+    notify["type"] = "radeCallsign";
+    notify["callsign"] = callsign;
+    sendJsonToAll(notify);
+
+    // Clear the callsign from the UI after 5 seconds
+    if (!radeCallsignClearTimer) {
+        radeCallsignClearTimer = new QTimer(this);
+        radeCallsignClearTimer->setSingleShot(true);
+        connect(radeCallsignClearTimer, &QTimer::timeout, this, [this]() {
+            radeRxCallsign.clear();
+            QJsonObject csNotify;
+            csNotify["type"] = "radeCallsign";
+            csNotify["callsign"] = QString();
+            sendJsonToAll(csNotify);
+        });
+    }
+    radeCallsignClearTimer->start(5000);
+
+    // Report to FreeDV Reporter with the decoded callsign.
+    // No sync check: the callsign arrives from the EOO frame which is
+    // the last frame — sync is already lost by the time the callback fires.
+    lastReportedCallsign = callsign;
+    if (freedvReporter) {
+        qInfo() << "Web: reporting RX spot to FreeDV Reporter:" << callsign
+                << "mode=" << freedvModeName << "snr=" << (int)freedvSNR;
+        freedvReporter->updateRxSpot(callsign, freedvModeName, (int)freedvSNR);
+    } else {
+        qInfo() << "Web: no FreeDV Reporter instance, skipping RX spot";
+    }
+
+    qInfo() << "Web: RADE decoded callsign:" << callsign;
+}
+
+void webServer::onPacketRxDecoded(int chan, QJsonObject frame)
+{
+    QJsonObject msg = frame;
+    msg["type"] = "packetRxFrame";
+    msg["chan"] = chan;
+    msg["ts"] = QDateTime::currentMSecsSinceEpoch();
+    sendJsonToAll(msg);
+
+    qInfo() << "Web: packet RX chan=" << chan
+            << "src=" << frame.value("src").toString()
+            << "dst=" << frame.value("dst").toString()
+            << "info=" << frame.value("info").toString();
+}
+
+void webServer::onPacketTxDecoded(int chan, QJsonObject frame)
+{
+    QJsonObject msg = frame;
+    msg["type"] = "packetRxFrame";   // shared handler in the web UI
+    msg["chan"] = chan;
+    msg["tx"] = true;
+    msg["ts"] = QDateTime::currentMSecsSinceEpoch();
+    sendJsonToAll(msg);
+}
+
+void webServer::onAprsStationUpdated(QJsonObject station)
+{
+    // Already has type="aprsStation" set inside the processor.
+    sendJsonToAll(station);
+}
+
+void webServer::onAprsStationsCleared()
+{
+    QJsonObject msg;
+    msg["type"] = "aprsSnapshot";
+    msg["stations"] = QJsonArray();
+    sendJsonToAll(msg);
+}
+
+// Pick the DATA MOD OFF input matching our audio transport: LAN when
+// LAN-connected, otherwise USB. The LAN input is matched by name
+// ("LAN"/"WLAN") — its numeric type is inconsistent across rig files
+// (inputLAN on the IC-7610, but inputMICACCA on the IC-9700/IC-7300 MK2),
+// whereas the name is uniform. Fall back to USB if the rig lists no LAN
+// input. (issue #72)
+bool webServer::pickDataModInput(rigInput &out) const
+{
+    if (!rigCaps) return false;
+    if (lanMode) {
+        for (const rigInput &inp : rigCaps->inputs) {
+            if (inp.name.contains("LAN", Qt::CaseInsensitive)) {
+                out = inp;
+                return true;
+            }
+        }
+    }
+    for (const rigInput &inp : rigCaps->inputs) {
+        if (inp.type == inputUSB) {
+            out = inp;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Route the radio's modulator to our audio transport before a packet TX.
+// The mic path does this in enableMic, but packet TX (APRS beacons,
+// terminal sessions) never involves the mic — without this the radio
+// keys up with the DATA MOD OFF input pointing at MIC/USB while the
+// AFSK arrives over LAN, transmitting a dead carrier.
+void webServer::queuePacketModInput()
+{
+    holdCompressorForDigitalTx("packet");
+    rigInput modInput;
+    if (!queue || !pickDataModInput(modInput)) return;
+    queue->addUnique(priorityImmediate,
+                     queueItem(funcDATAOffMod,
+                               QVariant::fromValue<rigInput>(modInput), false, 0));
+    if (!packetModInputLogged) {
+        packetModInputLogged = true;
+        qInfo() << "Web: Set DATA MOD OFF to" << modInput.name << "for packet TX";
+    }
+}
+
+// wfweb's digital modes transmit in plain USB / LSB, where the rig keeps the
+// operator's voice processing, so a COMP left on for voice stays in the path:
+// it distorts RADE's OFDM and shifts the level of an FT8 tone. The older
+// Icoms force it OFF only in the SSB data modes (IC-7600, IC-7100, IC-9100,
+// IC-785x manuals); the IC-7300-generation manuals state no such rule and
+// list COMP as a data-mode preset item. Off for the over, back on after it
+// (#147).
+// SSB only: COMP does nothing in the other modes.
+void webServer::holdCompressorForDigitalTx(const char *why)
+{
+    if (compHeld || !queue || !rigCaps || !rigCaps->commands.contains(funcCompressor))
+        return;
+    cacheItem mode = operatingModeCache(queue->getVfoCommand(vfoA, 0, false));
+    rigMode_t mk = mode.value.isValid() ? mode.value.value<modeInfo>().mk : modeUnknown;
+    if (mk != modeUSB && mk != modeLSB)
+        return;
+    cacheItem comp = queue->getCache(funcCompressor, 0);
+    if (!comp.value.isValid()) {
+        // Not read yet (getCache() has just asked): leave it alone rather
+        // than guess; a guess could leave the operator's COMP off for good.
+        qInfo() << "Web: compressor state unknown, left as is for" << why << "TX";
+        return;
+    }
+    compHeld = true;
+    compRestoreOn = comp.value.toBool();
+    if (compRestoreOn) {
+        queue->addUnique(priorityImmediate, queueItem(funcCompressor, QVariant::fromValue<uchar>(0), false, 0));
+        qInfo() << "Web: speech compressor OFF for" << why << "TX";
+    }
+}
+
+// Queued after the unkey, so the rig is back on receive when COMP returns.
+void webServer::releaseCompressorHold()
+{
+    if (!compHeld) return;
+    compHeld = false;
+    if (compRestoreOn && queue) {
+        queue->addUnique(priorityImmediate, queueItem(funcCompressor, QVariant::fromValue<uchar>(1), false, 0));
+        qInfo() << "Web: speech compressor restored ON";
+    }
+    compRestoreOn = false;
+}
+
+// Beacon TX: AprsProcessor asked us to transmit a UI frame.  Mirror the
+// packetTx command path so PTT / draining / status messages stay
+// consistent with operator-initiated TX.
+void webServer::onAprsBeaconRequested(QString src, QString dst,
+                                      QStringList path, QString info)
+{
+    if (!packetEnabled || !dwProc) {
+        qWarning() << "Web: APRS beacon dropped — packet modem not enabled";
+        return;
+    }
+    if (!(txAudioConfigured && usbAudioOutput) && !txConverter) {
+        qWarning() << "Web: APRS beacon dropped — TX audio not configured";
+        return;
+    }
+    if (packetTxBusy || freedvTxActive) {
+        qInfo() << "Web: APRS beacon dropped — TX already in progress";
+        return;
+    }
+    if (src.isEmpty() || dst.isEmpty() || info.isEmpty()) return;
+
+    QString monitor = src + ">" + dst;
+    if (!path.isEmpty()) monitor += "," + path.join(",");
+    monitor += ":" + info;
+
+    packetTxBusy = true;
+    queuePacketModInput();
+    queue->add(priorityImmediate,
+               queueItem(funcTransceiverStatus,
+                         QVariant::fromValue<bool>(true), false, uchar(0)));
+    queue->addUnique(priorityHighest,
+                     queueItem(funcALCMeter, true, 0));
+
+    QMetaObject::invokeMethod(dwProc, "transmitFrame", Qt::QueuedConnection,
+                              Q_ARG(QString, monitor));
+
+    QJsonObject notify;
+    notify["type"] = "packetTxStarted";
+    notify["monitor"] = monitor;
+    sendJsonToAll(notify);
+    qInfo().noquote() << "Web: APRS beacon TX queued:" << monitor;
+}
+
+// Receives the complete encoded burst for a single AX.25 frame (entire
+// preamble+frame+postamble in one audioPacket).  USB path: appends to the
+// PKT-owned packetUsbTxBuffer and lets drainPacketUsbTxBuffer feed ALSA
+// in 10 ms slices; the radio is unkeyed when QAudioOutput goes
+// IdleState (queue underran), gated by packetTxAwaitingIdle.  LAN path:
+// 20 ms slices into the TX converter, unkey 50 ms after the last chunk.
+// packetTxBusy is held high across both paths until the radio is unkeyed.
+void webServer::onPacketTxReady(audioPacket audio)
+{
+    // Tee the TX PCM to audio clients for waterfall visualisation.  Radios
+    // mute their RX path while keyed, so the browser otherwise sees pure
+    // silence during TX — the web UI feeds this back into the same analyser
+    // so the TX signal is visible.  Binary format mirrors RX (msgType 0x04):
+    //   [0x04][0x00][seq_u16LE][rateDiv_u16LE][PCM_Int16LE...]
+    if (!audioClients.isEmpty() && !audio.data.isEmpty()) {
+        quint32 rate = rigSampleRate ? rigSampleRate : 48000;
+        quint16 rateDiv = static_cast<quint16>(rate / 1000);
+        QByteArray msg;
+        int headerSize = 6;
+        msg.resize(headerSize + audio.data.size());
+        msg[0] = 0x04;
+        msg[1] = 0x00;
+        quint16 seq = audioSeq++;
+        memcpy(msg.data() + 2, &seq, 2);
+        memcpy(msg.data() + 4, &rateDiv, 2);
+        memcpy(msg.data() + headerSize, audio.data.constData(), audio.data.size());
+        sendBinaryToAudioClients(msg);
+    }
+
+    // If a connected-mode file transfer is in progress, this audio burst
+    // is the encoding of the YAPP frame we queued last — advance
+    // progress and pump the next one.  Doing it here (rather than on a
+    // Qt timer) keeps at most one frame in ax25_link's queue, so Abort
+    // doesn't leave a long tail of pre-queued frames on the air.
+    if (TerminalSession *x = yappFindActiveTxXfer()) {
+        x->xfer.framesSent++;
+        if (x->xfer.framesPlanned > 0) {
+            x->xfer.done = qMin<qint64>(x->xfer.total,
+                (qint64)x->xfer.total * x->xfer.framesSent / x->xfer.framesPlanned);
+        }
+        xferBroadcastProgress(x);
+
+        if (x->xfer.framesSent >= x->xfer.framesPlanned) {
+            // EF audio just left the encoder.  Don't tear down yet —
+            // YAPP says the transfer is only complete when the peer's
+            // AF (ACK 0x03) arrives confirming they got the whole file.
+            // The AF handler in yappHandleFrame() does the real
+            // completion (broadcast end, scrollback "File sent",
+            // clear xfer).  yappFindActiveTxXfer() gates on
+            // phase == "active", so this transition stops the pump.
+            x->xfer.phase = QStringLiteral("awaiting_af");
+            QByteArray info = QStringLiteral("*** All frames sent — awaiting AF from peer").toUtf8();
+            QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+            termAppendScrollback(x, e);
+            termBroadcastData(x->sid, e);
+            qInfo().noquote() << "Web: YAPP TX awaiting AF" << x->sid
+                              << x->xfer.name << x->xfer.total << "B";
+
+            // Safety net: if AF never arrives, declare failed after
+            // 60 s.  Mirrors the awaiting_rr timer in yappSendFile.
+            QString sid = x->sid;
+            QTimer::singleShot(60000, this, [this, sid]() {
+                TerminalSession *cur = termSessions.value(sid, nullptr);
+                if (!cur || !cur->xfer.active) return;
+                if (cur->xfer.phase != "awaiting_af") return;
+                QByteArray info = QStringLiteral("*** No AF from peer — transfer may have failed").toUtf8();
+                QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+                termAppendScrollback(cur, e);
+                termBroadcastData(cur->sid, e);
+                xferBroadcastEnd(cur, /*aborted=*/true);
+                cur->xfer = XferState{};
+                qWarning().noquote() << "Web: YAPP TX AF timeout" << sid;
+            });
+        } else {
+            yappPumpNextFrame(x);
+        }
+    }
+
+    auto unkey = [this]() {
+        if (queue) {
+            queue->add(priorityImmediate,
+                       queueItem(funcTransceiverStatus,
+                                 QVariant::fromValue<bool>(false), false, uchar(0)));
+            queue->del(funcALCMeter, 0);
+            releaseCompressorHold();
+        }
+    };
+
+    // Key PTT if no burst is currently in flight.  The packetTx command
+    // does this itself before invoking transmitFrame, so packetTxBusy
+    // is already true on that path; for connected-mode TX (AX25LinkProcessor
+    // → transmitFrameBytes), nothing has keyed the radio yet, so do it
+    // here.  Drain logic (drainPacketUsbTxBuffer / drainPacketLanTxBuffer)
+    // handles the unkey when the buffer empties.
+    if (!packetTxBusy) {
+        if (queue) {
+            queuePacketModInput();
+            queue->add(priorityImmediate,
+                       queueItem(funcTransceiverStatus,
+                                 QVariant::fromValue<bool>(true), false, uchar(0)));
+            queue->addUnique(priorityHighest,
+                             queueItem(funcALCMeter, true, 0));
+        }
+        packetTxBusy = true;
+    }
+
+    // LAN path: route through the TX converter instead of USB output.
+    // The Opus encoder inside audioConverter only accepts specific frame
+    // sizes (2.5 / 5 / 10 / 20 / 40 / 60 ms at sample rate), so a single
+    // multi-hundred-ms blob would be dropped.  Chunk into 20 ms slices
+    // and emit them at wall-clock rate — matches the mic path and keeps
+    // the rig's UDP audio jitter buffer happy.
+    if (!usbAudioOutput || !txAudioConfigured) {
+        if (txConverter) {
+            quint32 rate = rigSampleRate ? rigSampleRate : 48000;
+            packetLanTxChunkBytes = (int)(rate / 50) * (int)sizeof(qint16);
+            // APPEND — multiple YAPP frames arrive back-to-back during a
+            // file transfer; replacing the buffer here would truncate any
+            // audio still being drained from the previous frame and garble
+            // the on-air stream, triggering AX.25 retries.  Timer only
+            // starts on the first frame; subsequent calls just extend the
+            // playout.
+            bool wasIdle = packetLanTxBuffer.isEmpty()
+                           && (!packetLanTxTimer || !packetLanTxTimer->isActive());
+            packetLanTxBuffer.append(audio.data);
+            if (!packetLanTxTimer) {
+                packetLanTxTimer = new QTimer(this);
+                packetLanTxTimer->setTimerType(Qt::PreciseTimer);
+                connect(packetLanTxTimer, &QTimer::timeout,
+                        this, &webServer::drainPacketLanTxBuffer);
+            }
+            qInfo() << "Web: Packet LAN TX"
+                    << (wasIdle ? "started" : "appended")
+                    << "bytes=" << audio.data.size()
+                    << "total=" << packetLanTxBuffer.size()
+                    << "chunkBytes=" << packetLanTxChunkBytes;
+            if (wasIdle) packetLanTxTimer->start(20);
+            return;
+        }
+        qWarning() << "Web: Packet TX: no USB output and no TX converter";
+        packetTxBusy = false;
+        unkey();
+        QJsonObject notify;
+        notify["type"] = "packetTxFailed";
+        notify["reason"] = "no TX audio path available";
+        sendJsonToAll(notify);
+        return;
+    }
+
+    // USB path: append raw mono to PKT-owned buffer, kick off ALSA on
+    // first data, drain via packetUsbTxDrainTimer at 10 ms ticks.  The
+    // unkey is driven by QAudioOutput::stateChanged → IdleState (Qt's
+    // queue underran) instead of a fixed post-empty timer, so the PTT
+    // drops within ~30 ms of the last sample actually leaving the
+    // soundcard rather than ~300 ms after the app buffer emptied.
+    packetUsbTxBuffer.append(audio.data);
+    packetTxBusy = true;
+
+    // New frame arrived during the post-empty wait — cancel pending unkey
+    // and resume pacing so the radio stays keyed across the gap.  This
+    // matters most for back-to-back YAPP frames where a small gap between
+    // dwThread bursts must not unkey the radio.
+    if (packetTxAwaitingIdle) {
+        packetTxAwaitingIdle = false;
+        if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
+        if (packetUsbTxDrainTimer && !packetUsbTxDrainTimer->isActive())
+            packetUsbTxDrainTimer->start(10);
+    }
+
+    if (!packetUsbTxActive) {
+        packetUsbTxActive = true;
+        // Stop any prior ALSA session (e.g. mic was active).  Mode mutex
+        // means this is rare; keep the safety net.
+        if (usbAudioOutput->state() != QAudio::StoppedState)
+            usbAudioOutput->stop();
+        usbAudioOutputDevice = nullptr;
+        usbTxReset();
+
+        usbAudioOutputDevice = usbAudioOutput->start();
+        if (!usbAudioOutputDevice) {
+            qWarning() << "Web: PKT TX ALSA start() failed";
+            packetUsbTxActive = false;
+            packetTxBusy = false;
+            packetUsbTxBuffer.clear();
+            unkey();
+            QJsonObject notify;
+            notify["type"] = "packetTxFailed";
+            notify["reason"] = "audio output start failed";
+            sendJsonToAll(notify);
+            return;
+        }
+        txAudioActive = true;
+        preTxBuffering = false;
+        // 20 ms silence prefill — enough headroom that the 10 ms drain
+        // timer can be jittered by ~one tick without underrunning the
+        // first symbol, but small enough that ALSA's tail at end-of-
+        // burst (~prefill) drains quickly when we stop writing.  The
+        // FreeDV/RADE paths still use a larger 50 ms prefill because
+        // their continuous codec output is more sensitive to underrun.
+        const int prefillBytes = (int)((rigSampleRate ? rigSampleRate : 48000) / 50)
+                                 * (int)sizeof(qint16) * usbOutputChannels;
+        QByteArray prefill(prefillBytes, 0);
+        usbAudioOutputDevice->write(prefill);
+
+        if (!packetUsbTxDrainTimer) {
+            packetUsbTxDrainTimer = new QTimer(this);
+            packetUsbTxDrainTimer->setTimerType(Qt::PreciseTimer);
+            connect(packetUsbTxDrainTimer, &QTimer::timeout,
+                    this, &webServer::drainPacketUsbTxBuffer);
+        }
+        packetUsbTxDrainTimer->start(10);
+        qInfo() << "Web: PKT USB TX started, audioBytes=" << audio.data.size()
+                << "bufSize=" << usbAudioOutput->bufferSize();
+    }
+}
+
+void webServer::onPacketTxFailed(QString reason)
+{
+    qWarning() << "Web: Packet TX failed:" << reason;
+    // Release the TX slot and unkey if we already keyed.
+    packetTxBusy = false;
+    packetTxAwaitingIdle = false;
+    if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
+    if (packetUsbTxDrainTimer) packetUsbTxDrainTimer->stop();
+    packetUsbTxBuffer.clear();
+    bool tookUsbSession = packetUsbTxActive;
+    packetUsbTxActive = false;
+    // Mirror the unkey path's mic recovery: if PKT had taken over the ALSA
+    // session, stop it and re-arm the mic pre-buffer for the still-
+    // streaming mic client.
+    if (tookUsbSession && usbAudioOutput) {
+        if (usbAudioOutput->state() != QAudio::StoppedState)
+            usbAudioOutput->stop();
+        usbAudioOutputDevice = nullptr;
+        txAudioActive = false;
+        usbTxReset();
+        if (micActiveClient) {
+            preTxBuffer.clear();
+            preTxBuffering = true;
+        }
+    }
+    if (queue) {
+        queue->add(priorityImmediate,
+                   queueItem(funcTransceiverStatus,
+                             QVariant::fromValue<bool>(false), false, uchar(0)));
+        queue->del(funcALCMeter, 0);
+        releaseCompressorHold();
+    }
+    QJsonObject notify;
+    notify["type"] = "packetTxFailed";
+    notify["reason"] = reason;
+    sendJsonToAll(notify);
+}
+
+// LAN path drain: feeds one 20 ms chunk per tick into the TX converter.
+// The chunker emits at real-time rate, so when packetLanTxBuffer empties
+// the audio is already in flight to the rig (UDP send queue + network +
+// rig's UDP audio jitter buffer).  Add a small slack for the rig-side
+// jitter buffer (~40–60 ms typical on Icom UDP audio); 50 ms covers it
+// without the wasteful airtime of the old 300 ms guess.
+void webServer::drainPacketLanTxBuffer()
+{
+    if (packetLanTxBuffer.isEmpty()) {
+        if (packetLanTxTimer) packetLanTxTimer->stop();
+        qDebug() << "Web: Packet LAN TX drained, scheduling unkey";
+        QTimer::singleShot(50, this, [this]() {
+            packetTxBusy = false;
+            if (queue) {
+                queue->add(priorityImmediate,
+                           queueItem(funcTransceiverStatus,
+                                     QVariant::fromValue<bool>(false), false, uchar(0)));
+                queue->del(funcALCMeter, 0);
+                releaseCompressorHold();
+            }
+            QJsonObject notify;
+            notify["type"] = "packetTxComplete";
+            sendJsonToAll(notify);
+        });
+        return;
+    }
+
+    int take = qMin(packetLanTxChunkBytes, packetLanTxBuffer.size());
+    audioPacket chunk;
+    chunk.data = packetLanTxBuffer.left(take);
+    chunk.time = QTime::currentTime();
+    chunk.volume = 1.0;
+    packetLanTxBuffer.remove(0, take);
+    emit sendToTxConverter(chunk);
+}
+
+// PKT USB drain.  Pops one 10 ms chunk per tick and writes it via the
+// shared writer.  When the last byte goes out we stop the timer in the
+// same tick (not the next one — that wasted ~10 ms of PTT-on time) and
+// flip into packetTxAwaitingIdle; QAudioOutput's stateChanged →
+// IdleState then drives the unkey (no fixed-300 ms guess).
+void webServer::drainPacketUsbTxBuffer()
+{
+    if (!usbAudioOutputDevice) return;
+
+    // 10 ms @ rigSampleRate, mono int16.  rigSampleRate is 48000 in
+    // practice; chunkSize falls out at 960 bytes mono.
+    const quint32 rate = rigSampleRate ? rigSampleRate : 48000;
+    const int chunkSize = (int)(rate / 100) * (int)sizeof(qint16);
+
+    auto enterAwaitingIdle = [this]() {
+        packetUsbTxDrainTimer->stop();
+        packetTxAwaitingIdle = true;
+        qInfo() << "Web: PKT USB drain complete — awaiting ALSA idle";
+
+        // If ALSA is already idle right now (rare race where the prefill
+        // never queued behind real audio), stateChanged won't fire again
+        // — schedule the handler to run on the next event loop tick.
+        if (usbAudioOutput && usbAudioOutput->state() == QAudio::IdleState) {
+            QMetaObject::invokeMethod(this, [this]() {
+                onUsbAudioOutputStateChanged(QAudio::IdleState);
+            }, Qt::QueuedConnection);
+            return;
+        }
+
+        // Backstop watchdog.  On some Qt5/ALSA configurations — notably
+        // raw hw: devices that fell back to nearestFormat (e.g. IC-7300
+        // CODEC negotiating 44100/stereo when 48000/mono was requested)
+        // — QAudioOutput::stateChanged(IdleState) is never delivered when
+        // the buffer underruns, leaving the radio keyed indefinitely.
+        // Fire the unkey ourselves after a generous bound: the device
+        // queue cannot exceed ~prefill (20 ms) plus drain-rate skew over
+        // the burst (~10 % of the burst duration), so 500 ms is well past
+        // any legitimate drain even for the longest single AX.25 frame.
+        if (!packetTxIdleWatchdog) {
+            packetTxIdleWatchdog = new QTimer(this);
+            packetTxIdleWatchdog->setSingleShot(true);
+            connect(packetTxIdleWatchdog, &QTimer::timeout, this, [this]() {
+                if (!packetTxAwaitingIdle) return;
+                qInfo() << "Web: PKT USB idle watchdog — IdleState never fired, forcing unkey";
+                onUsbAudioOutputStateChanged(QAudio::IdleState);
+            });
+        }
+        packetTxIdleWatchdog->start(500);
+    };
+
+    if (packetUsbTxBuffer.size() >= chunkSize) {
+        QByteArray chunk = packetUsbTxBuffer.left(chunkSize);
+        packetUsbTxBuffer.remove(0, chunkSize);
+        txWritePcmFrame(chunk, /*applyGain=*/true);
+        // If that was the last full chunk and nothing's queued behind it,
+        // there's no more useful work for the timer — flip to awaiting
+        // now instead of burning another 10 ms tick to discover empty.
+        if (packetUsbTxBuffer.isEmpty()) enterAwaitingIdle();
+    } else if (!packetUsbTxBuffer.isEmpty()) {
+        // Partial trailing data: pad with silence to maintain timing.
+        QByteArray chunk = packetUsbTxBuffer;
+        chunk.append(QByteArray(chunkSize - chunk.size(), 0));
+        packetUsbTxBuffer.clear();
+        txWritePcmFrame(chunk, /*applyGain=*/true);
+        enterAwaitingIdle();
+    } else {
+        enterAwaitingIdle();
+    }
+}
+
+// Triggers the PKT USB unkey precisely when Qt's queue underruns —
+// i.e. the tail samples have actually been emitted.  Replaces the old
+// 300 ms blind guard with an event-driven completion plus a tiny 5 ms
+// slack for the rig's USB-audio chip buffer between Qt and the
+// modulator.  Qt5's IdleState in ALSA push mode fires after the PCM
+// device underruns, so the audio is already on the wire by then —
+// the slack only covers the small DMA buffer downstream of ALSA.
+void webServer::onUsbAudioOutputStateChanged(QAudio::State state)
+{
+    if (state != QAudio::IdleState) return;
+    if (!packetTxAwaitingIdle) return;
+
+    // Latch immediately so a follow-up Idle (e.g. from a stop/start
+    // race during back-to-back transfers) can't queue a duplicate.
+    packetTxAwaitingIdle = false;
+    if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
+
+    QTimer::singleShot(5, this, [this]() {
+        if (usbAudioOutput && usbAudioOutput->state() != QAudio::StoppedState)
+            usbAudioOutput->stop();
+        usbAudioOutputDevice = nullptr;
+        packetUsbTxActive = false;
+        txAudioActive = false;
+        packetTxBusy = false;
+
+        // PKT stole the ALSA session and left the device null.  If a mic
+        // client is still streaming (its frames were dropped during the
+        // burst), re-arm the pre-buffer so the next mic frames restart the
+        // device — otherwise they'd hit a null device and be silently
+        // dropped until the user toggled the mic.
+        usbTxReset();
+        if (micActiveClient && usbAudioOutput) {
+            preTxBuffer.clear();
+            preTxBuffering = true;
+        }
+
+        if (queue) {
+            queue->add(priorityImmediate,
+                       queueItem(funcTransceiverStatus,
+                                 QVariant::fromValue<bool>(false), false, uchar(0)));
+            queue->del(funcALCMeter, 0);
+            releaseCompressorHold();
+        }
+        QJsonObject notify;
+        notify["type"] = "packetTxComplete";
+        sendJsonToAll(notify);
+        qInfo() << "Web: PKT TX idle-driven unkey";
+    });
+}
+
+// ---- Packet-modem pref persistence ----
+//
+// packetEnabled and packetMode survive a wfweb restart via the same
+// QSettings file the rest of servermain uses.  Load at setupAudio() /
+// setupUsbAudio() time (after dwProc exists so we can apply them);
+// save on every user change.
+
+void webServer::setSettingsFile(const QString &path)
+{
+    packetSettingsFile_ = path;
+}
+
+std::unique_ptr<QSettings> webServer::openSettings() const
+{
+    return std::unique_ptr<QSettings>(packetSettingsFile_.isEmpty()
+        ? new QSettings()
+        : new QSettings(packetSettingsFile_, QSettings::IniFormat));
+}
+
+void webServer::applyStationCallsign(const QString &callIn, const QString &gridIn, bool persist)
+{
+    const QString call = callIn.toUpper().trimmed();
+    const QString grid = gridIn.toUpper().trimmed();
+    const bool changed = call != reporterCallsign || (!grid.isEmpty() && grid != reporterGrid);
+    reporterCallsign = call;
+    if (!grid.isEmpty()) reporterGrid = grid;
+    if (persist) {
+        auto settings = openSettings();
+        settings->setValue("Station/Callsign", reporterCallsign);
+        settings->setValue("Station/Grid", reporterGrid);
+    }
+    qInfo().noquote() << "Station:" << (reporterCallsign.isEmpty() ? QStringLiteral("<no callsign>") : reporterCallsign)
+                      << reporterGrid << (persist ? "(saved)" : "(from settings)");
+    if (radeProcessor)
+        QMetaObject::invokeMethod(radeProcessor, "setTxCallsign", Qt::QueuedConnection,
+                                  Q_ARG(QString, reporterCallsign));
+    if (freedvReporter) freedvReporter->setStation(reporterCallsign, reporterGrid);
+    if (pskReporter)    pskReporter->setStation(reporterCallsign, reporterGrid);
+    if (changed)
+        sendJsonToAll(QJsonObject{{"type", "stationChanged"}, {"callsign", reporterCallsign}, {"grid", reporterGrid}});
+}
+
+// The CW bar has ten macro keys (slot 5 is the EDIT key, so it never holds
+// one).  They used to live in each browser's localStorage, which meant
+// setting them up again on every device and after every cache wipe (#141);
+// now the settings file holds them under [CW] Macro1..Macro10 and every
+// browser shows the same set, like the station callsign.
+static const int kCwMacroSlots = 10;
+
+static QString cwMacroKey(int slot)
+{
+    return QStringLiteral("CW/Macro%1").arg(slot);
+}
+
+void webServer::loadCwMacros()
+{
+    auto settings = openSettings();
+    cwMacros_.clear();
+    for (int slot = 1; slot <= kCwMacroSlots; slot++) {
+        const QString text = settings->value(cwMacroKey(slot)).toString().trimmed();
+        if (!text.isEmpty()) cwMacros_.insert(slot, text);
+    }
+    if (!cwMacros_.isEmpty())
+        qInfo().noquote() << "CW macros:" << cwMacros_.size() << "(from settings)";
+}
+
+QJsonObject webServer::cwMacrosJson() const
+{
+    QJsonObject out;
+    for (auto it = cwMacros_.cbegin(); it != cwMacros_.cend(); ++it)
+        out[QString::number(it.key())] = it.value();
+    return out;
+}
+
+void webServer::applyCwMacros(const QJsonObject &macros, const char *who)
+{
+    QMap<int, QString> next;
+    for (auto it = macros.begin(); it != macros.end(); ++it) {
+        bool ok = false;
+        const int slot = it.key().toInt(&ok);
+        if (!ok || slot < 1 || slot > kCwMacroSlots) continue;
+        // The keyer takes upper-case text; 500 characters is far beyond any
+        // macro and keeps a stray paste out of the settings file.
+        const QString text = it.value().toString().trimmed().toUpper().left(500);
+        if (!text.isEmpty()) next.insert(slot, text);
+    }
+    if (next == cwMacros_) return;
+    cwMacros_ = next;
+
+    auto settings = openSettings();
+    for (int slot = 1; slot <= kCwMacroSlots; slot++) {
+        if (cwMacros_.contains(slot)) settings->setValue(cwMacroKey(slot), cwMacros_.value(slot));
+        else settings->remove(cwMacroKey(slot));
+    }
+    qInfo().noquote() << "CW macros:" << cwMacros_.size() << QString("(saved, from %1)").arg(who);
+    sendJsonToAll(QJsonObject{{"type", "cwMacrosChanged"}, {"macros", cwMacrosJson()}});
+}
+
+void webServer::configureLogbook(const QString &logbookOverride,
+                                 const QString &remoteLogOverride,
+                                 bool noRemoteLog, bool remoteLogDecodes)
+{
+    auto settings = openSettings();
+
+    // Station identity first: the logbook and the remote logger both stamp
+    // QSOs with it.
+    applyStationCallsign(settings->value("Station/Callsign").toString(),
+                         settings->value("Station/Grid").toString(), false);
+    loadCwMacros();
+
+    // --logbook wins over Logbook= in the settings file.  A relative path in
+    // a named profile resolves next to that profile, so contest.conf can
+    // carry its own contest.adi.
+    QString path = logbookOverride.isEmpty() ? settings->value("Logbook").toString()
+                                             : logbookOverride;
+    if (path.isEmpty())
+        path = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+                   .filePath(QStringLiteral("logbook.adi"));
+    else if (QFileInfo(path).isRelative() && !packetSettingsFile_.isEmpty())
+        path = QFileInfo(packetSettingsFile_).dir().filePath(path);
+    path = QDir::cleanPath(path);
+
+    if (logbook_.open(path))
+        qInfo().noquote() << "Logbook:" << path << QString("(%1 QSOs)").arg(logbook_.count());
+    else
+        qWarning().noquote() << "Logbook: cannot open or create" << path << "- QSOs will not be saved";
+
+    // A container without a volume keeps the file only as long as the
+    // container lives, and since browsers now hand their log to the server
+    // that would be silent data loss for anyone upgrading a `docker run`
+    // without a -v.  Detection lives in Logbook::isPersistentLocation (see
+    // the block comment there for how and its limits); here we log it and
+    // pass `persistent` to every browser, which keeps its own copy of what
+    // it logs while this is false (SPA: logbookPersistent).
+    logbookPersistent_ = Logbook::isPersistentLocation(QFileInfo(path).absolutePath());
+    if (!logbookPersistent_)
+        qWarning().noquote() << "Logbook: NOT PERSISTENT -" << path
+                             << "is inside the container's own filesystem and will be lost when the"
+                             << "container is recreated. Mount a volume at /data (see DOCKER.md).";
+
+    // Remote logging is a server-side setting only ([RemoteLog] in the
+    // settings file, --remote-log on the command line): where the station's
+    // QSO stream goes is deployment configuration, and the browser has no
+    // login, so it only gets to see the state (rigInfo.remoteLog*).
+    // --remote-log implies enable, --no-remote-log wins (same rules as
+    // rigctld).  The WSJTX/* keys are read as a fallback for the dev builds
+    // that briefly used them.
+    const auto setting = [&settings](const char *key, const QVariant &def) {
+        const QVariant v = settings->value(QString("RemoteLog/") + key);
+        return v.isValid() ? v : settings->value(QString("WSJTX/") + key, def);
+    };
+    wsjtxDecodes_ = remoteLogDecodes || setting("Decodes", false).toBool();
+    wsjtxTarget_ = remoteLogOverride.isEmpty() ? setting("Target", QString()).toString()
+                                               : remoteLogOverride;
+    const bool enabled = !remoteLogOverride.isEmpty() || setting("Enabled", false).toBool();
+    if (noRemoteLog || !enabled || wsjtxTarget_.isEmpty())
+        qInfo() << "Remote log: disabled";
+    else if (configureWsjtxTarget(wsjtxTarget_))
+        qInfo().noquote() << "Remote log: sending QSOs to" << wsjtxAddress_.toString() + ':' + QString::number(wsjtxPort_)
+                          << "as" << wsjtxId_ << (wsjtxDecodes_ ? "(WSJT-X UDP protocol, with decodes)" : "(WSJT-X UDP protocol)");
+    else
+        qWarning() << "Remote log: cannot resolve target" << wsjtxTarget_;
+}
+
+// --- Logbook mutations: file, then WebSocket delta, then WSJT-X ---
+// Every browser applies the delta to whatever page it has loaded; nobody
+// ever receives the whole log.
+
+QJsonObject webServer::logbookSummary() const
+{
+    return QJsonObject{{"type", "logbook"}, {"count", logbook_.count()},
+                       {"unexported", logbook_.unexportedCount()}, {"persistent", logbookPersistent_}};
+}
+
+bool webServer::logbookAdd(QsoRecord &r)
+{
+    if (r.isValid() && r.stationCall.isEmpty()) r.stationCall = reporterCallsign;
+    if (!r.isValid() || !logbook_.add(r)) return false;
+    sendJsonToAll(QJsonObject{{"type", "qsoAdded"}, {"qso", r.toJson()}, {"count", logbook_.count()},
+                              {"unexported", logbook_.unexportedCount()}});
+    wsjtxSendQso(r);
+    return true;
+}
+
+bool webServer::logbookUpdate(const QString &id, const QsoRecord &r)
+{
+    if (!logbook_.update(id, r)) return false;
+    sendJsonToAll(QJsonObject{{"type", "qsoUpdated"}, {"qso", logbook_.find(id)->toJson()}});
+    return true;
+}
+
+bool webServer::logbookRemove(const QString &id)
+{
+    if (!logbook_.remove(id)) return false;
+    sendJsonToAll(QJsonObject{{"type", "qsoDeleted"}, {"id", id}, {"count", logbook_.count()},
+                              {"unexported", logbook_.unexportedCount()}});
+    return true;
+}
+
+// Whole-log change (clear, merge, import): browsers reload their first page.
+void webServer::logbookReset()
+{
+    sendJsonToAll(logbookSummary());
+}
+
+bool webServer::logbookClear(const char *who)
+{
+    QString backup;
+    if (!logbook_.clear(&backup)) {
+        qWarning() << "Logbook: clear failed (" << who << ")";
+        return false;
+    }
+    if (backup.isEmpty()) qInfo().noquote() << "Logbook: cleared (" << who << "), it was already empty";
+    else qInfo().noquote() << "Logbook: cleared (" << who << "), previous file kept as" << backup;
+    logbookReset();
+    return true;
+}
+
+// --- WSJT-X UDP emitter ---
+
+bool webServer::configureWsjtxTarget(const QString &target)
+{
+    QString host = target.trimmed();
+    quint16 port = 2237;
+    const int colon = host.lastIndexOf(':');
+    // host:port — but leave a bare IPv6 literal alone
+    if (colon > 0 && !host.mid(colon + 1).contains(':')) {
+        bool ok = false;
+        const int p = host.mid(colon + 1).toInt(&ok);
+        if (ok && p > 0 && p < 65536) {
+            port = quint16(p);
+            host = host.left(colon);
+        }
+    }
+    QHostAddress address;
+    if (!address.setAddress(host)) {
+        const auto found = QHostInfo::fromName(host).addresses();
+        if (found.isEmpty()) return false;
+        address = found.first();
+    }
+    wsjtxAddress_ = address;
+    wsjtxPort_ = port;
+    wsjtxEnabled_ = true;
+    if (!wsjtxSocket_) wsjtxSocket_ = new QUdpSocket(this);
+    if (!wsjtxHeartbeatTimer_) {
+        wsjtxHeartbeatTimer_ = new QTimer(this);
+        connect(wsjtxHeartbeatTimer_, &QTimer::timeout, this, &webServer::wsjtxSendHeartbeat);
+    }
+    // Listeners (JTAlert, GridTracker) drop a client whose heartbeats stop.
+    wsjtxHeartbeatTimer_->start(15000);
+    wsjtxSendHeartbeat();
+    return true;
+}
+
+void webServer::wsjtxSendDatagram(const QByteArray &packet)
+{
+    if (!wsjtxEnabled_ || !wsjtxSocket_) return;
+    wsjtxSocket_->writeDatagram(packet, wsjtxAddress_, wsjtxPort_);
+}
+
+void webServer::wsjtxSendHeartbeat()
+{
+    wsjtxSendDatagram(WsjtxMessage::heartbeat(wsjtxId_, WsjtxMessage::Schema,
+                                              QString(WFWEB_VERSION), QString()));
+    wsjtxSendStatus();
+}
+
+void webServer::wsjtxSendStatus()
+{
+    WsjtxMessage::StatusFields status;
+    if (queue && rigCaps) {
+        const vfoCommandType v = queue->getVfoCommand(vfoA, 0, false);
+        const cacheItem fc = operatingFreqCache(v);
+        if (fc.value.isValid()) status.dialFrequency = fc.value.value<freqt>().Hz;
+        const cacheItem mc = operatingModeCache(v);
+        if (mc.value.isValid()) status.mode = modeToString(mc.value.value<modeInfo>());
+    }
+    if (digiActive && (digiMode == QLatin1String("FT8") || digiMode == QLatin1String("FT4")))
+        status.mode = digiMode;
+    status.txMode = status.mode;
+    status.deCall = reporterCallsign;
+    status.deGrid = reporterGrid;
+    wsjtxSendDatagram(WsjtxMessage::status(wsjtxId_, status));
+}
+
+void webServer::wsjtxSendClose()
+{
+    if (wsjtxEnabled_) wsjtxSendDatagram(WsjtxMessage::close(wsjtxId_));
+}
+
+void webServer::wsjtxSendQso(const QsoRecord &q)
+{
+    if (!wsjtxEnabled_) return;
+    wsjtxSendStatus();
+    QDateTime when(QDate::fromString(q.date, "yyyyMMdd"), QTime::fromString(q.time, "hhmmss"), Qt::UTC);
+    if (!when.isValid()) when = QDateTime::currentDateTimeUtc();
+
+    WsjtxMessage::QsoFields f;
+    f.dateOff = when;
+    f.dateOn = when;
+    f.dxCall = q.call;
+    f.dxGrid = q.theirGrid;
+    f.txFrequency = quint64(q.freq);
+    f.mode = q.mode;
+    f.reportSent = q.rstSent;
+    f.reportReceived = q.rstRcvd;
+    f.comments = q.comment;
+    f.name = q.name;
+    f.myCall = q.stationCall.isEmpty() ? reporterCallsign : q.stationCall;
+    f.myGrid = q.grid.isEmpty() ? reporterGrid : q.grid;
+    // Both messages, exactly as WSJT-X does: loggers pick whichever they parse.
+    wsjtxSendDatagram(WsjtxMessage::qsoLogged(wsjtxId_, f));
+    wsjtxSendDatagram(WsjtxMessage::loggedAdif(wsjtxId_, (Logbook::adifHeader() + q.toAdif()).trimmed()));
+}
+
+void webServer::wsjtxSendDecode(const QJsonObject &cmd)
+{
+    // Two browsers decoding the same audio report the same decode; forward
+    // each distinct (slot time, offset, text) once within 30 s.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const QString key = cmd["time"].toString() + '|' + QString::number(cmd["df"].toInt())
+                      + '|' + cmd["message"].toString();
+    for (auto it = wsjtxDecodesSent_.begin(); it != wsjtxDecodesSent_.end();) {
+        if (now - it.value() > 30000) it = wsjtxDecodesSent_.erase(it);
+        else ++it;
+    }
+    if (wsjtxDecodesSent_.contains(key)) return;
+    wsjtxDecodesSent_.insert(key, now);
+
+    WsjtxMessage::DecodeFields d;
+    d.time = QTime::fromString(cmd["time"].toString(), "hh:mm:ss");
+    d.snr = cmd["snr"].toInt();
+    d.deltaTime = cmd["dt"].toDouble();
+    d.deltaFrequency = quint32(qMax(0, cmd["df"].toInt()));
+    d.mode = cmd["mode"].toString();
+    d.message = cmd["message"].toString();
+    wsjtxSendDatagram(WsjtxMessage::decode(wsjtxId_, d));
+}
+
+void webServer::setInstanceName(const QString &name)
+{
+    instanceName_ = name;
+    // Same convention as WSJT-X's "--rig-name": listeners show the tag.
+    wsjtxId_ = name.isEmpty() ? QStringLiteral("wfweb") : QStringLiteral("wfweb - ") + name;
+}
+
+static QSettings *packetSettingsFor(const QString &file)
+{
+    return file.isEmpty()
+        ? new QSettings()
+        : new QSettings(file, QSettings::IniFormat);
+}
+
+void webServer::packetLoadSettings()
+{
+    QSettings *s = packetSettingsFor(packetSettingsFile_);
+    packetEnabled = s->value("Packet/Enabled", false).toBool();
+    int m = s->value("Packet/Mode", 300).toInt();
+    if (m == 300 || m == 1200 || m == 9600) packetMode = m;
+    delete s;
+    qInfo() << "Web: Packet prefs loaded — enabled=" << packetEnabled
+            << "mode=" << packetMode;
+}
+
+void webServer::packetSaveSettings()
+{
+    QSettings *s = packetSettingsFor(packetSettingsFile_);
+    s->setValue("Packet/Enabled", packetEnabled);
+    s->setValue("Packet/Mode", packetMode);
+    s->sync();
+    delete s;
+}
+
+// ---- AX.25 connected-mode terminal session helpers ----
+
+QString webServer::termMakeSid()
+{
+    return QStringLiteral("t%1").arg(termNextSidNum++);
+}
+
+QJsonObject webServer::termSessionToJson(const TerminalSession *s) const
+{
+    QJsonObject j;
+    j["sid"] = s->sid;
+    j["chan"] = s->chan;
+    j["ownCall"] = s->ownCall;
+    j["peerCall"] = s->peerCall;
+    QJsonArray digisJ;
+    for (const QString &d : s->digis) digisJ.append(d);
+    j["digis"] = digisJ;
+    const char *st = "disconnected";
+    switch (s->state) {
+    case TerminalSession::Disconnected:  st = "disconnected"; break;
+    case TerminalSession::Connecting:    st = "connecting";   break;
+    case TerminalSession::Connected:     st = "connected";    break;
+    case TerminalSession::Disconnecting: st = "disconnecting";break;
+    }
+    j["state"] = QString::fromLatin1(st);
+    j["incoming"] = s->incoming;
+    j["createdMs"] = (qint64)s->createdMs;
+    return j;
+}
+
+QJsonObject webServer::termScrollbackEntry(const QString &dir, const QByteArray &data)
+{
+    QJsonObject e;
+    e["ts"] = QDateTime::currentMSecsSinceEpoch();
+    e["dir"] = dir;          // "rx" | "tx" | "info"
+    // Send as UTF-8 string for printable text; binary payloads still survive
+    // round-tripping because Qt's QString::fromUtf8 preserves byte sequences
+    // it can decode and uses replacement characters otherwise.  YAPP-C
+    // (M6) will switch to base64.
+    e["data"] = QString::fromUtf8(data);
+    return e;
+}
+
+void webServer::termAppendScrollback(TerminalSession *s, const QJsonObject &entry)
+{
+    s->scrollback.append(entry);
+    while (s->scrollback.size() > TERM_SCROLLBACK_MAX) s->scrollback.removeFirst();
+    s->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+}
+
+void webServer::termBroadcastSession(const TerminalSession *s)
+{
+    QJsonObject notify = termSessionToJson(s);
+    notify["type"] = "termSession";
+    sendJsonToAll(notify);
+}
+
+void webServer::termBroadcastData(const QString &sid, const QJsonObject &entry)
+{
+    QJsonObject notify = entry;
+    notify["type"] = "termData";
+    notify["sid"] = sid;
+    sendJsonToAll(notify);
+}
+
+webServer::TerminalSession *webServer::termFindByEndpoints(int chan,
+                                                            const QString &own,
+                                                            const QString &peer)
+{
+    for (TerminalSession *s : termSessions) {
+        if (s->chan == chan && s->ownCall == own && s->peerCall == peer)
+            return s;
+    }
+    return nullptr;
+}
+
+void webServer::termEnsureRegistered(int chan, const QString &ownCall)
+{
+    if (termRegisteredOwnCalls.contains(ownCall)) return;
+    if (!axProc) return;
+    termRegisteredOwnCalls.insert(ownCall);
+    QMetaObject::invokeMethod(axProc, "registerCallsign", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT),
+                              Q_ARG(int, chan),
+                              Q_ARG(QString, ownCall));
+}
+
+void webServer::onAxLinkEstablished(int client, int chan,
+                                    const QString &peerCall, const QString &ownCall,
+                                    bool incoming)
+{
+    (void)client;
+    TerminalSession *s = termFindByEndpoints(chan, ownCall, peerCall);
+    if (!s) {
+        // Inbound to a registered own_call: create a session record so the
+        // browser can attach.  The user might not have a UI tab open yet —
+        // termList will surface it on next refresh.
+        s = new TerminalSession();
+        s->sid = termMakeSid();
+        s->chan = chan;
+        s->ownCall = ownCall;
+        s->peerCall = peerCall;
+        s->incoming = true;
+        s->createdMs = QDateTime::currentMSecsSinceEpoch();
+        s->lastActivityMs = s->createdMs;
+        termSessions.insert(s->sid, s);
+    }
+    s->state = TerminalSession::Connected;
+    // Session first, data second: a brand-new (inbound) sid must reach the
+    // browser as a termSession so the tab is created and promoted; the
+    // termData then lands in that tab.  The browser only pulls termHistory
+    // when the active tab changes, so without the termData broadcast these
+    // info lines were invisible until a reload.
+    QJsonObject e = termScrollbackEntry(QStringLiteral("info"),
+        QString("*** CONNECTED to %1").arg(peerCall).toUtf8());
+    termAppendScrollback(s, e);
+    termBroadcastSession(s);
+    termBroadcastData(s->sid, e);
+    qInfo().noquote() << "Web: AX.25 link up" << s->sid
+                      << ownCall << "<->" << peerCall
+                      << (incoming ? "(inbound)" : "(outbound)");
+}
+
+void webServer::onAxLinkTerminated(int client, int chan,
+                                   const QString &peerCall, const QString &ownCall,
+                                   int timeout)
+{
+    (void)client;
+    TerminalSession *s = termFindByEndpoints(chan, ownCall, peerCall);
+    if (!s) return;
+    s->state = TerminalSession::Disconnected;
+    QString reason = timeout ? QStringLiteral("*** DISCONNECTED (link timeout)")
+                             : QStringLiteral("*** DISCONNECTED");
+    QJsonObject e = termScrollbackEntry(QStringLiteral("info"), reason.toUtf8());
+    termAppendScrollback(s, e);
+    termBroadcastSession(s);
+    termBroadcastData(s->sid, e);
+    qInfo().noquote() << "Web: AX.25 link down" << s->sid
+                      << "timeout=" << timeout;
+}
+
+void webServer::onAxRxData(int client, int chan,
+                           const QString &peerCall, const QString &ownCall,
+                           int pid, const QByteArray &data)
+{
+    (void)client; (void)pid;
+    TerminalSession *s = termFindByEndpoints(chan, ownCall, peerCall);
+    if (!s) {
+        qWarning() << "Web: AX.25 rxData for unknown session"
+                   << ownCall << "<->" << peerCall << "chan=" << chan;
+        return;
+    }
+    // Split the incoming stream into ordinary text + YAPP frames.  YAPP
+    // frames (SOH-led) are dispatched by yappHandleFrame; what comes back
+    // in textOut is just the non-YAPP bytes, which become normal scrollback.
+    QByteArray textOut;
+    yappFeedIncoming(s, data, textOut);
+    if (!textOut.isEmpty()) {
+        QJsonObject entry = termScrollbackEntry(QStringLiteral("rx"), textOut);
+        termAppendScrollback(s, entry);
+        termBroadcastData(s->sid, entry);
+    }
+}
+
+void webServer::onAxDataAcked(int client, int chan,
+                              const QString &ownCall, const QString &peerCall,
+                              int count)
+{
+    (void)client;
+    if (count <= 0) return;
+    TerminalSession *s = termFindByEndpoints(chan, ownCall, peerCall);
+    if (!s) return;     // ack for a session we don't track — silent drop
+    QJsonObject notify;
+    notify["type"]  = "termAck";
+    notify["sid"]   = s->sid;
+    notify["count"] = count;
+    sendJsonToAll(notify);
+}
+
+// ---- YAPP framing (per IW3FQG spec, www.ir3ip.net/iw3fqg/doc/yapp.htm) ----
+//
+// Each packet is identified by its leading control byte; the remaining
+// bytes are either a fixed 1-byte signature (for ENQ/ACK/ETX forms) or
+// a length-prefixed payload (for SOH/STX/CAN forms).
+//
+//   SI (Send_Init)  ENQ(0x05) 0x01
+//   RR (Rcv_Rdy)    ACK(0x06) 0x01
+//   AF (Ack_EOF)    ACK(0x06) 0x03
+//   HD (Header)     SOH(0x01) len  "<filename>\0<size-ascii>\0"  [data also
+//                                   optionally carries date/time per YAPP-C]
+//   DT (Data)       STX(0x02) len  <bytes>   ; len==0 means 256 bytes
+//   EF (End_Of_File) ETX(0x03) 0x01
+//   CN (Cancel)     CAN(0x18) len  [optional ASCII reason]
+//
+// The earlier implementation used SOH-led frames with a type letter
+// inside — that framing interoperates only with its mirror image and
+// fails against real YAPP peers (BPQ, classic YAPP clients).
+
+QByteArray webServer::yappBuildSI() { return QByteArray("\x05\x01", 2); }
+QByteArray webServer::yappBuildRR() { return QByteArray("\x06\x01", 2); }
+QByteArray webServer::yappBuildRF() { return QByteArray("\x06\x02", 2); }
+QByteArray webServer::yappBuildAF() { return QByteArray("\x06\x03", 2); }
+QByteArray webServer::yappBuildAT() { return QByteArray("\x06\x04", 2); }
+QByteArray webServer::yappBuildEF() { return QByteArray("\x03\x01", 2); }
+QByteArray webServer::yappBuildET() { return QByteArray("\x04\x01", 2); }
+
+QByteArray webServer::yappBuildHD(const QString &name, qint64 size)
+{
+    QByteArray body;
+    body.append(name.toUtf8());
+    body.append('\0');
+    body.append(QString::number(size).toLatin1());
+    body.append('\0');
+    // No date/time — classic YAPP accepts an HD with just name\0size\0.
+    Q_ASSERT(body.size() > 0 && body.size() <= 255);
+    QByteArray out;
+    out.reserve(body.size() + 2);
+    out.append((char)0x01);                        // SOH
+    out.append((char)(uchar)body.size());
+    out.append(body);
+    return out;
+}
+
+QByteArray webServer::yappBuildDT(const QByteArray &chunk)
+{
+    Q_ASSERT(chunk.size() > 0 && chunk.size() <= 256);
+    QByteArray out;
+    out.reserve(chunk.size() + 2);
+    out.append((char)0x02);                        // STX
+    // len=0 encodes 256 per spec — only legal when chunk is exactly 256
+    out.append((char)(uchar)(chunk.size() == 256 ? 0 : chunk.size()));
+    out.append(chunk);
+    return out;
+}
+
+QByteArray webServer::yappBuildCN(const QString &reason)
+{
+    QByteArray body = reason.toUtf8();
+    if (body.size() > 255) body.truncate(255);
+    QByteArray out;
+    out.reserve(body.size() + 2);
+    out.append((char)0x18);                        // CAN
+    out.append((char)(uchar)body.size());
+    out.append(body);
+    return out;
+}
+
+void webServer::yappFeedIncoming(TerminalSession *s, const QByteArray &chunk,
+                                 QByteArray &textOut)
+{
+    YappRxState &y = s->yapp;
+    for (int i = 0; i < chunk.size(); i++) {
+        quint8 b = (quint8)chunk[i];
+        switch (y.phase) {
+        case YappRxState::Idle:
+            switch (b) {
+            case 0x05:                             // ENQ → SI start
+                y.phase = YappRxState::AwaitSISig;
+                break;
+            case 0x06:                             // ACK → RR or AF
+                y.phase = YappRxState::AwaitACKSub;
+                break;
+            case 0x01:                             // SOH → HD
+                y.pendingKind = YappKind::HD;
+                y.phase = YappRxState::AwaitLen;
+                break;
+            case 0x02:                             // STX → DT
+                y.pendingKind = YappKind::DT;
+                y.phase = YappRxState::AwaitLen;
+                break;
+            case 0x03:                             // ETX → EF
+                y.phase = YappRxState::AwaitEFSig;
+                break;
+            case 0x04:                             // EOT → ET (session end)
+                y.phase = YappRxState::AwaitETSig;
+                break;
+            case 0x18:                             // CAN → CN
+                y.pendingKind = YappKind::CN;
+                y.phase = YappRxState::AwaitLen;
+                break;
+            default:
+                // Plain terminal text — everything else falls through
+                // to the scrollback.  Control bytes that *aren't* YAPP
+                // openings (e.g., BEL, VT, FF) also land here; they're
+                // rare in practice and a mis-triggered YAPP parse is a
+                // bigger UX hit than a stray control char.
+                textOut.append((char)b);
+                break;
+            }
+            break;
+
+        case YappRxState::AwaitSISig:
+            // Per spec, SI is exactly ENQ+0x01.  If the second byte is
+            // not 0x01, treat the ENQ as noise and drop it (do not push
+            // the current byte to textOut — it may still be a valid
+            // YAPP lead byte, but the preceding stray ENQ is gone).
+            if (b == 0x01) yappHandleFrame(s, YappKind::SI, QByteArray());
+            y.phase = YappRxState::Idle;
+            break;
+
+        case YappRxState::AwaitACKSub:
+            switch (b) {
+            case 0x01: yappHandleFrame(s, YappKind::RR, QByteArray()); break;
+            case 0x02: yappHandleFrame(s, YappKind::RF, QByteArray()); break;
+            case 0x03: yappHandleFrame(s, YappKind::AF, QByteArray()); break;
+            case 0x04: yappHandleFrame(s, YappKind::AT, QByteArray()); break;
+            case 0x05: yappHandleFrame(s, YappKind::CA, QByteArray()); break;
+            // 0x06 (ACK ACK = RT, YappC enable) and other variants
+            // are silently dropped — we only speak base YAPP today.
+            default: break;
+            }
+            y.phase = YappRxState::Idle;
+            break;
+
+        case YappRxState::AwaitEFSig:
+            if (b == 0x01) yappHandleFrame(s, YappKind::EF, QByteArray());
+            y.phase = YappRxState::Idle;
+            break;
+
+        case YappRxState::AwaitETSig:
+            if (b == 0x01) yappHandleFrame(s, YappKind::ET, QByteArray());
+            y.phase = YappRxState::Idle;
+            break;
+
+        case YappRxState::AwaitLen: {
+            // Spec: DT treats len=0 as 256 bytes.  HD and CN don't have
+            // a documented 256-byte form — a zero-length HD/CN means
+            // "no payload" and is dispatched immediately.
+            int len = (b == 0 && y.pendingKind == YappKind::DT)
+                          ? 256 : (int)b;
+            if (len == 0) {
+                yappHandleFrame(s, y.pendingKind, QByteArray());
+                y.phase = YappRxState::Idle;
+            } else {
+                y.remaining = len;
+                y.buffer.clear();
+                y.phase = YappRxState::AwaitData;
+            }
+            break;
+        }
+
+        case YappRxState::AwaitData:
+            y.buffer.append((char)b);
+            if (--y.remaining == 0) {
+                yappHandleFrame(s, y.pendingKind, y.buffer);
+                y.phase = YappRxState::Idle;
+            }
+            break;
+        }
+    }
+}
+
+void webServer::xferBroadcastStart(const TerminalSession *s)
+{
+    QJsonObject notify;
+    notify["type"]  = "termXferStart";
+    notify["sid"]   = s->sid;
+    notify["dir"]   = s->xfer.dir;
+    notify["name"]  = s->xfer.name;
+    notify["total"] = (qint64)s->xfer.total;
+    notify["phase"] = s->xfer.phase;
+    sendJsonToAll(notify);
+    qInfo().noquote() << "Web: xferStart" << s->sid << s->xfer.dir
+                      << s->xfer.phase
+                      << s->xfer.name << s->xfer.total << "B"
+                      << "wsClients=" << wsClients.size();
+}
+
+void webServer::xferBroadcastProgress(TerminalSession *s, bool force)
+{
+    // Throttle to at most 10 updates/sec so WS doesn't get flooded on
+    // large files.
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (!force && now - s->xfer.lastProgressMs < 100) return;
+    s->xfer.lastProgressMs = now;
+
+    QJsonObject notify;
+    notify["type"]  = "termXferProgress";
+    notify["sid"]   = s->sid;
+    notify["done"]  = (qint64)s->xfer.done;
+    notify["total"] = (qint64)s->xfer.total;
+    sendJsonToAll(notify);
+    qInfo().noquote() << "Web: xferProgress" << s->sid
+                      << s->xfer.done << "/" << s->xfer.total;
+}
+
+void webServer::xferBroadcastEnd(const TerminalSession *s, bool aborted)
+{
+    QJsonObject notify;
+    notify["type"]    = "termXferEnd";
+    notify["sid"]     = s->sid;
+    notify["aborted"] = aborted;
+    sendJsonToAll(notify);
+}
+
+void webServer::yappHandleFrame(TerminalSession *s, YappKind kind, const QByteArray &data)
+{
+    YappRxState &y = s->yapp;
+    switch (kind) {
+    case YappKind::SI: {             // peer wants to send a file
+        if (s->xfer.active) {
+            // Already busy with another xfer; reject.
+            yappSendAB(s);
+            return;
+        }
+        // YAPP SI carries no payload — the sender identity comes from
+        // the AX.25 source callsign (which we already have in peerCall).
+        QString senderInfo = s->peerCall.isEmpty()
+            ? QStringLiteral("(unknown)") : s->peerCall;
+        s->xfer.active = true;
+        s->xfer.dir    = QStringLiteral("rx");
+        s->xfer.phase  = QStringLiteral("awaiting_accept");
+        s->xfer.name.clear();
+        s->xfer.total  = 0;
+        s->xfer.done   = 0;
+
+        QJsonObject notify;
+        notify["type"]       = "termXferRequest";
+        notify["sid"]        = s->sid;
+        notify["senderInfo"] = senderInfo;
+        sendJsonToAll(notify);
+
+        QByteArray info = QString("*** %1 wants to send you a file — accept or reject")
+            .arg(senderInfo).toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+        qInfo().noquote() << "Web: YAPP SI received" << s->sid << "from" << senderInfo;
+        break;
+    }
+
+    case YappKind::RR:               // peer accepted our SI
+        if (s->xfer.active && s->xfer.dir == "tx" && s->xfer.phase == "awaiting_rr") {
+            yappStartDataPhase(s);
+        } else {
+            qWarning().noquote() << "Web: unexpected YAPP RR" << s->sid
+                                 << "active=" << s->xfer.active
+                                 << "dir="    << s->xfer.dir
+                                 << "phase="  << s->xfer.phase;
+        }
+        break;
+
+    case YappKind::AF:               // peer ACKed our EF — TX transfer done
+        if (s->xfer.active && s->xfer.dir == "tx"
+            && s->xfer.phase == "awaiting_af") {
+            QByteArray info = QString("*** File sent: %1 (%2 bytes)")
+                .arg(s->xfer.name).arg(s->xfer.total).toUtf8();
+            QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+            termAppendScrollback(s, e);
+            termBroadcastData(s->sid, e);
+            xferBroadcastEnd(s, /*aborted=*/false);
+            qInfo().noquote() << "Web: YAPP TX complete (AF received)" << s->sid
+                              << s->xfer.name << s->xfer.total << "B";
+            s->xfer = XferState{};
+        } else {
+            qWarning().noquote() << "Web: unexpected YAPP AF" << s->sid
+                                 << "active=" << s->xfer.active
+                                 << "dir="    << s->xfer.dir
+                                 << "phase="  << s->xfer.phase;
+        }
+        break;
+
+    case YappKind::HD: {             // HD — new file starting
+        int nul1 = data.indexOf('\0');
+        if (nul1 < 0) return;
+        QString name = QString::fromUtf8(data.constData(), nul1);
+        int nul2 = data.indexOf('\0', nul1 + 1);
+        QString szStr = (nul2 < 0)
+            ? QString::fromLatin1(data.constData() + nul1 + 1, data.size() - nul1 - 1)
+            : QString::fromLatin1(data.constData() + nul1 + 1, nul2 - nul1 - 1);
+        qint64 sz = szStr.toLongLong();
+        y.filename = name;
+        y.filesize = sz;
+        y.fileBuf.clear();
+        y.active = true;
+
+        // Kick off the shared transfer widget on the UI.
+        s->xfer.active = true;
+        s->xfer.dir    = QStringLiteral("rx");
+        s->xfer.name   = name;
+        s->xfer.total  = sz;
+        s->xfer.done   = 0;
+        xferBroadcastStart(s);
+
+        QByteArray info = QString("*** Incoming file: %1 (%2 bytes)")
+            .arg(name).arg(sz).toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+        qInfo().noquote() << "Web: YAPP RX start" << s->sid << name << sz << "B";
+
+        // Per the IW3FQG state table, the receiver must send RF
+        // (ACK 0x02) after HD before the sender will start streaming
+        // DT chunks.  Without this the link goes silent right after
+        // the file header parses.
+        yappSendRF(s);
+        break;
+    }
+
+    case YappKind::RF:               // peer ACKed our HD — start data
+        // We don't currently gate DT TX on RF (yappStartDataPhase
+        // queues HD+DTs+EF up-front and pumps them).  Logged for
+        // visibility; once we add gated-TX, this is where it'd fire.
+        qInfo().noquote() << "Web: YAPP RF received (peer ready for DT)" << s->sid;
+        break;
+
+    case YappKind::AT:               // peer ACKed end-of-transmission (multi-file)
+    case YappKind::CA:               // peer ACKed our cancel — finalize teardown
+        // Single-file flows don't normally see these; nothing to do
+        // beyond noting that they arrived.
+        qInfo().noquote() << "Web: YAPP" << (kind == YappKind::AT ? "AT" : "CA")
+                          << "received" << s->sid;
+        break;
+
+    case YappKind::ET:               // peer's "end of transmission" — session done
+        // Sender is telling us no more files will come in this YAPP
+        // session.  We must ACK with AT or the sender stays in
+        // YAPP-transfer state and rejects any subsequent terminal text
+        // as "Unexpected message during YAPP Transfer".  BPQ sends ET
+        // immediately after we AF the last EF.
+        yappSendAT(s);
+        qInfo().noquote() << "Web: YAPP ET received — AT sent" << s->sid;
+        break;
+
+    case YappKind::DT:               // DT — data block
+        if (y.active) {
+            y.fileBuf.append(data);
+            s->xfer.done = y.fileBuf.size();
+            xferBroadcastProgress(s);
+        }
+        break;
+
+    case YappKind::EF: {             // EF — end of file
+        if (!y.active) return;
+        s->xfer.done = y.fileBuf.size();
+        xferBroadcastProgress(s, /*force=*/true);
+
+        // Tell the sender we got the whole file — per spec, the
+        // receiver owes AF in response to EF.
+        yappSendAF(s);
+
+        QByteArray info = QString("*** File complete: %1 (%2 bytes)")
+            .arg(y.filename).arg(y.fileBuf.size()).toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+
+        QJsonObject notify;
+        notify["type"]    = "termFile";
+        notify["sid"]     = s->sid;
+        notify["name"]    = y.filename;
+        notify["bytes"]   = (qint64)y.fileBuf.size();
+        notify["dataB64"] = QString::fromLatin1(y.fileBuf.toBase64());
+        sendJsonToAll(notify);
+
+        xferBroadcastEnd(s, /*aborted=*/false);
+        s->xfer = XferState{};
+
+        qInfo().noquote() << "Web: YAPP RX complete" << s->sid
+                          << y.filename << y.fileBuf.size() << "B";
+
+        y.filename.clear();
+        y.fileBuf.clear();
+        y.filesize = 0;
+        y.active = false;
+        break;
+    }
+
+    case YappKind::CN: {             // cancel from peer
+        if (!s->xfer.active) return;
+        QString peerReason = QString::fromUtf8(data).trimmed();
+        QString reason;
+        if (s->xfer.dir == "tx") {
+            reason = (s->xfer.phase == "awaiting_rr")
+                ? QStringLiteral("*** Peer rejected the transfer")
+                : QStringLiteral("*** Transfer aborted by peer");
+        } else {
+            reason = QString("*** Transfer aborted by sender: %1").arg(y.filename);
+        }
+        if (!peerReason.isEmpty()) reason += QString(" (%1)").arg(peerReason);
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), reason.toUtf8());
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+
+        xferBroadcastEnd(s, /*aborted=*/true);
+        s->xfer = XferState{};
+
+        y.filename.clear();
+        y.fileBuf.clear();
+        y.filesize = 0;
+        y.active = false;
+        qInfo().noquote() << "Web: YAPP cancel from peer" << s->sid
+                          << "reason=" << peerReason;
+        break;
+    }
+    }
+}
+
+void webServer::yappSendFile(TerminalSession *s, const QString &name,
+                             const QByteArray &data)
+{
+    if (!axProc || s->state != TerminalSession::Connected) return;
+    if (s->xfer.active) return;     // already transferring
+
+    // Classic YAPP handshake: announce intent with SI, wait for RR
+    // before any file bytes hit the air.  SI carries no payload per
+    // spec — the sender's identity comes from the AX.25 source call.
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildSI()));
+
+    s->xfer.active       = true;
+    s->xfer.dir          = QStringLiteral("tx");
+    s->xfer.name         = name;
+    s->xfer.total        = data.size();
+    s->xfer.done         = 0;
+    s->xfer.abortPending = false;
+    s->xfer.phase        = QStringLiteral("awaiting_rr");
+    s->xfer.pendingData  = data;
+    xferBroadcastStart(s);
+
+    QByteArray info = QString("*** Requesting to send %1 (%2 bytes) — awaiting peer acceptance...")
+        .arg(name).arg(data.size()).toUtf8();
+    QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+    termAppendScrollback(s, e);
+    termBroadcastData(s->sid, e);
+    qInfo().noquote() << "Web: YAPP SI sent" << s->sid
+                      << name << data.size() << "B — awaiting RR";
+
+    // Safety net: if the peer never replies within 60 s, tear down.
+    QString sid = s->sid;
+    QTimer::singleShot(60000, this, [this, sid]() {
+        TerminalSession *cur = termSessions.value(sid, nullptr);
+        if (!cur || !cur->xfer.active) return;
+        if (cur->xfer.phase != "awaiting_rr") return;
+        QByteArray info = QStringLiteral("*** Transfer timed out — peer did not respond").toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(cur, e);
+        termBroadcastData(cur->sid, e);
+        xferBroadcastEnd(cur, /*aborted=*/true);
+        cur->xfer = XferState{};
+    });
+}
+
+void webServer::yappSendRR(TerminalSession *s)
+{
+    if (!axProc) return;
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildRR()));
+}
+
+void webServer::yappSendAF(TerminalSession *s)
+{
+    if (!axProc) return;
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildAF()));
+}
+
+void webServer::yappSendRF(TerminalSession *s)
+{
+    if (!axProc) return;
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildRF()));
+}
+
+void webServer::yappSendAT(TerminalSession *s)
+{
+    if (!axProc) return;
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildAT()));
+}
+
+void webServer::yappSendAB(TerminalSession *s)
+{
+    // "AB" in the old type-letter framing; in real YAPP it's a Cancel
+    // frame (CAN) with an optional reason.  Callers ignore the reason,
+    // so send it empty.
+    if (!axProc) return;
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                              Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                              Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                              Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                              Q_ARG(QByteArray, yappBuildCN()));
+}
+
+void webServer::yappStartDataPhase(TerminalSession *s)
+{
+    s->xfer.phase = QStringLiteral("active");
+
+    // Build the complete YAPP frame list up front: HD + DTs + EF.
+    // Frames are then pumped out one at a time via onPacketTxReady so
+    // at most one frame ever sits in ax25_link's I-frame queue.
+    QByteArray payload = s->xfer.pendingData;
+    s->xfer.pendingData.clear();
+
+    s->xfer.pendingYappFrames.clear();
+    s->xfer.pendingYappFrames.append(yappBuildHD(s->xfer.name, s->xfer.total));
+
+    // DT chunk size: keep each DT inside one I-frame.  AX.25 paclen is
+    // baud-scaled (64 on HF/300, 128 on 1200, 256 on 9600); subtract 2
+    // for the STX + len YAPP header.  YAPP's len=0=256 special case
+    // means the encoded DT frame is at most 258 bytes, so paclen=256
+    // emits 256-byte data chunks correctly via yappBuildDT.
+    int paclen = AX25LinkProcessor::currentPaclen();
+    if (paclen < 8)   paclen = 8;
+    if (paclen > 256) paclen = 256;
+    const int kDataChunk = paclen - 2;
+    for (int off = 0; off < payload.size(); off += kDataChunk) {
+        s->xfer.pendingYappFrames.append(yappBuildDT(payload.mid(off, kDataChunk)));
+    }
+    s->xfer.pendingYappFrames.append(yappBuildEF());
+    s->xfer.framesPlanned = s->xfer.pendingYappFrames.size();
+    s->xfer.framesSent = 0;
+
+    QByteArray info = QString("*** Peer accepted — sending %1 (%2 bytes, %3 frames)")
+        .arg(s->xfer.name).arg(s->xfer.total).arg(s->xfer.framesPlanned).toUtf8();
+    QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+    termAppendScrollback(s, e);
+    termBroadcastData(s->sid, e);
+
+    // Re-broadcast xferStart so the UI transitions from "awaiting" to "active".
+    xferBroadcastStart(s);
+    qInfo().noquote() << "Web: YAPP TX start (post-RR)" << s->sid
+                      << s->xfer.name << s->xfer.total << "B"
+                      << s->xfer.framesPlanned << "frames";
+
+    // Queue the first frame; subsequent frames are pumped from
+    // onPacketTxReady once the previous one's audio is ready.
+    yappPumpNextFrame(s);
+}
+
+void webServer::yappPumpNextFrame(TerminalSession *s)
+{
+    if (!axProc || !s->xfer.active || s->xfer.dir != "tx") return;
+
+    // Abort interrupts the pump.  AB jumps the queue: we clear any
+    // remaining YAPP frames that haven't been handed to ax25_link yet,
+    // then send AB as the very next frame.
+    if (s->xfer.abortPending) {
+        s->xfer.pendingYappFrames.clear();
+        QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+            Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+            Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+            Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+            Q_ARG(QByteArray, yappBuildCN(QStringLiteral("user abort"))));
+        QByteArray info = QStringLiteral("*** Transfer aborted").toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+        xferBroadcastEnd(s, /*aborted=*/true);
+        s->xfer = XferState{};
+        return;
+    }
+
+    if (s->xfer.pendingYappFrames.isEmpty()) return;
+
+    QByteArray frame = s->xfer.pendingYappFrames.takeFirst();
+    QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+        Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+        Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+        Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+        Q_ARG(QByteArray, frame));
+}
+
+webServer::TerminalSession *webServer::yappFindActiveTxXfer()
+{
+    for (TerminalSession *s : termSessions) {
+        if (s->xfer.active && s->xfer.dir == "tx"
+            && s->xfer.phase == "active") return s;
+    }
+    return nullptr;
+}
+
+void webServer::yappAbortSend(TerminalSession *s)
+{
+    if (!s || !s->xfer.active) return;
+    if (s->xfer.dir == "tx") {
+        // Flagged: the timer will send AB and tear down next tick.
+        s->xfer.abortPending = true;
+    } else {
+        // RX-side abort: send CN and clear our state.
+        if (axProc) {
+            QMetaObject::invokeMethod(axProc, "sendData", Qt::QueuedConnection,
+                Q_ARG(int, TERM_FIXED_CLIENT), Q_ARG(int, s->chan),
+                Q_ARG(QString, s->ownCall), Q_ARG(QString, s->peerCall),
+                Q_ARG(QStringList, s->digis), Q_ARG(int, 0xF0),
+                Q_ARG(QByteArray, yappBuildCN(QStringLiteral("user abort"))));
+        }
+        QByteArray info = QStringLiteral("*** Transfer aborted").toUtf8();
+        QJsonObject e = termScrollbackEntry(QStringLiteral("info"), info);
+        termAppendScrollback(s, e);
+        termBroadcastData(s->sid, e);
+        xferBroadcastEnd(s, /*aborted=*/true);
+        s->xfer = XferState{};
+        s->yapp.active = false;
+        s->yapp.fileBuf.clear();
+        s->yapp.filename.clear();
+        s->yapp.filesize = 0;
+    }
+}
+
+void webServer::onRxConverted(audioPacket audio)
+{
+    // Fan decoded PCM out to the packet processor. Independent of audio clients:
+    // decoding can happen even when no browser is listening to audio.
+    if (packetEnabled) {
+        emit sendToPacketRx(audio);
+    }
+
+    if (audioClients.isEmpty()) return;
+
+    // Binary format: [0x02][0x00][seq_u16LE][rateDiv_u16LE][PCM_Int16LE...]
+    // rateDiv = sampleRate / 1000 (e.g. 48 for 48kHz)
+    quint16 rateDiv = static_cast<quint16>(rigSampleRate / 1000);
+    QByteArray msg;
+    int headerSize = 6;
+    msg.resize(headerSize + audio.data.size());
+    msg[0] = 0x02;  // msgType: RX audio
+    msg[1] = 0x00;  // reserved
+
+    quint16 seq = audioSeq++;
+    memcpy(msg.data() + 2, &seq, 2);
+    memcpy(msg.data() + 4, &rateDiv, 2);
+    memcpy(msg.data() + headerSize, audio.data.constData(), audio.data.size());
+
+    sendBinaryToAudioClients(msg);
+}
+
+
+void webServer::setupUsbAudio(quint32 sampleRate, QString preferredInputName,
+                              QString preferredOutputName)
+{
+    if (sampleRate > 0) {
+        rigSampleRate = sampleRate;
+    }
+
+    if (audioConfigured) {
+        return;
+    }
+
+#ifdef Q_OS_WIN
+    // Ensure COM is initialized on this thread (required for Windows audio APIs).
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
+
+    // Prefer the resolved name (so we pin to the same physical device the
+    // rigCommander side picked). Fall back to the legacy USB/CODEC heuristic
+    // for single-CODEC setups where no name was supplied.
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    QAudioDeviceInfo usbDevice;
+    bool found = false;
+    qInfo() << "Web: Available audio input devices:";
+    QList<QAudioDeviceInfo> inputDevices = QAudioDeviceInfo::availableDevices(QAudio::AudioInput);
+    for (const QAudioDeviceInfo &dev : inputDevices) {
+        qInfo() << "Web:  " << dev.deviceName();
+    }
+    if (inputDevices.isEmpty()) {
+        // A working backend always lists something (ALSA reports at least
+        // "default"), so an empty list means no Qt audio backend plugin is
+        // loaded.  On Debian/Ubuntu the ALSA and PulseAudio backends ship in
+        // libqt5multimedia5-plugins, not in libqt5multimedia5 (#98).
+        qWarning() << "Web: Qt Multimedia found no audio input devices at all:"
+                   << "no audio backend plugin is loaded. On Debian/Ubuntu install"
+                   << "libqt5multimedia5-plugins.";
+    }
+    if (!preferredInputName.isEmpty()) {
+        for (const QAudioDeviceInfo &dev : inputDevices) {
+            if (dev.deviceName() == preferredInputName) {
+                usbDevice = dev;
+                found = true;
+                qInfo() << "Web: Selected rig audio device (exact match):" << dev.deviceName();
+                break;
+            }
+        }
+        if (!found) {
+            for (const QAudioDeviceInfo &dev : inputDevices) {
+                if (dev.deviceName().contains(preferredInputName, Qt::CaseInsensitive)) {
+                    usbDevice = dev;
+                    found = true;
+                    qInfo() << "Web: Selected rig audio device (substring match):" << dev.deviceName();
+                    break;
+                }
+            }
+        }
+    }
+    if (!found) {
+        for (const QAudioDeviceInfo &dev : inputDevices) {
+            if (dev.deviceName().contains("USB", Qt::CaseInsensitive) ||
+                dev.deviceName().contains("CODEC", Qt::CaseInsensitive)) {
+                usbDevice = dev;
+                found = true;
+                qInfo() << "Web: Selected rig audio device:" << dev.deviceName();
+                break;
+            }
+        }
+    }
+    if (!found) {
+        qWarning() << "Web: No rig audio device found for direct capture";
+        audioErrorReason = inputDevices.isEmpty()
+            ? "No audio backend loaded (on Debian/Ubuntu install libqt5multimedia5-plugins)."
+            : "No compatible audio device found.";
+        if (!wsClients.isEmpty()) {
+            QJsonObject err;
+            err["type"] = "audioError";
+            err["reason"] = audioErrorReason;
+            sendJsonToAll(err);
+        }
+        return;
+    }
+
+    QAudioFormat format;
+    format.setSampleRate(sampleRate);
+    format.setChannelCount(1);
+    format.setSampleSize(16);
+    format.setSampleType(QAudioFormat::SignedInt);
+    format.setByteOrder(QAudioFormat::LittleEndian);
+    format.setCodec("audio/pcm");
+
+    rigCaptureDeviceName = usbDevice.deviceName();
+    if (!usbDevice.isFormatSupported(format)) {
+        // Try stereo (some USB codecs only support stereo)
+        format.setChannelCount(2);
+        if (!usbDevice.isFormatSupported(format)) {
+            format = usbDevice.nearestFormat(format);
+            qInfo() << "Web: Using nearest format:" << format.sampleRate()
+                     << "ch=" << format.channelCount()
+                     << "size=" << format.sampleSize();
+        }
+    }
+
+    usbAudioInput = new QAudioInput(usbDevice, format, this);
+
+#ifdef Q_OS_WIN
+    // Monitor state changes (Windows audio diagnostics)
+    connect(usbAudioInput, &QAudioInput::stateChanged, this, &webServer::onAudioStateChanged);
+#endif
+
+#else
+    QAudioDevice usbDevice;
+    bool found = false;
+    QList<QAudioDevice> inputDevices = QMediaDevices::audioInputs();
+    for (const QAudioDevice &dev : inputDevices) {
+        qInfo() << "Web:  " << dev.description();
+    }
+    if (!preferredInputName.isEmpty()) {
+        for (const QAudioDevice &dev : inputDevices) {
+            if (dev.description() == preferredInputName) {
+                usbDevice = dev;
+                found = true;
+                qInfo() << "Web: Selected rig audio device (exact match):" << dev.description();
+                break;
+            }
+        }
+        if (!found) {
+            for (const QAudioDevice &dev : inputDevices) {
+                if (dev.description().contains(preferredInputName, Qt::CaseInsensitive)) {
+                    usbDevice = dev;
+                    found = true;
+                    qInfo() << "Web: Selected rig audio device (substring match):" << dev.description();
+                    break;
+                }
+            }
+        }
+    }
+    if (!found) {
+        for (const QAudioDevice &dev : inputDevices) {
+            if (dev.description().contains("USB", Qt::CaseInsensitive) ||
+                dev.description().contains("CODEC", Qt::CaseInsensitive)) {
+                usbDevice = dev;
+                found = true;
+                qInfo() << "Web: Selected rig audio device:" << dev.description();
+                break;
+            }
+        }
+    }
+    if (!found) {
+        qWarning() << "Web: No rig audio device found for direct capture";
+        audioErrorReason = "No compatible audio device found.";
+        if (!wsClients.isEmpty()) {
+            QJsonObject err;
+            err["type"] = "audioError";
+            err["reason"] = audioErrorReason;
+            sendJsonToAll(err);
+        }
+        return;
+    }
+
+    QAudioFormat format;
+    format.setSampleRate(sampleRate);
+    format.setChannelCount(1);
+    format.setSampleFormat(QAudioFormat::Int16);
+
+    rigCaptureDeviceName = usbDevice.description();
+    usbAudioInput = new QAudioSource(usbDevice, format, this);
+#ifdef Q_OS_WIN
+    connect(usbAudioInput, &QAudioSource::stateChanged, this, &webServer::onAudioStateChanged);
+#endif
+#endif
+
+    rigSampleRate = format.sampleRate();
+
+    usbAudioDevice = usbAudioInput->start();
+    if (!usbAudioDevice) {
+        qWarning() << "Web: Failed to start USB audio capture";
+        delete usbAudioInput;
+        usbAudioInput = nullptr;
+        audioErrorReason = "Found audio device but failed to open it. It may be in use by another application.";
+        if (!wsClients.isEmpty()) {
+            QJsonObject err;
+            err["type"] = "audioError";
+            err["reason"] = audioErrorReason;
+            sendJsonToAll(err);
+        }
+        return;
+    }
+
+    connect(usbAudioDevice, &QIODevice::readyRead, this, &webServer::readUsbAudio);
+
+    // readyRead is not reliably emitted for QAudioInput in pull mode on
+    // Windows and ALSA backends.  Use a poll timer as a fallback.
+    usbAudioPollTimer = new QTimer(this);
+    connect(usbAudioPollTimer, &QTimer::timeout, this, &webServer::readUsbAudio);
+    usbAudioPollTimer->start(20);  // 20ms = 960 samples at 48kHz
+
+    audioConfigured = true;
+
+    // FreeDV processor thread (created once, activated on demand)
+    if (!freedvProcessor) {
+        freedvProcessor = new FreeDVProcessor();
+        freedvThread = new QThread(this);
+        freedvThread->setObjectName("webFreeDV()");
+        freedvProcessor->moveToThread(freedvThread);
+
+        connect(this, &webServer::setupFreeDV, freedvProcessor, &FreeDVProcessor::init);
+        connect(this, &webServer::sendToFreeDVRx, freedvProcessor, &FreeDVProcessor::processRx);
+        connect(this, &webServer::sendToFreeDVTx, freedvProcessor, &FreeDVProcessor::processTx);
+        connect(freedvProcessor, &FreeDVProcessor::rxReady, this, &webServer::onFreeDVRxReady);
+        connect(freedvProcessor, &FreeDVProcessor::txReady, this, &webServer::onFreeDVTxReady);
+        connect(freedvProcessor, &FreeDVProcessor::statsUpdate, this, &webServer::onFreeDVStats);
+        connect(freedvProcessor, &FreeDVProcessor::rxCallsign, this, &webServer::onFreeDVRxCallsign);
+        connect(freedvThread, &QThread::finished, freedvProcessor, &QObject::deleteLater);
+
+        freedvThread->start();
+    }
+
+    // RADE V1 processor thread (created once, activated on demand)
+    if (!radeProcessor) {
+        radeProcessor = new RadeProcessor();
+        radeThread = new QThread(this);
+        radeThread->setObjectName("webRADE()");
+        radeProcessor->moveToThread(radeThread);
+
+        connect(this, &webServer::setupRade, radeProcessor, &RadeProcessor::init);
+        connect(this, &webServer::sendToRadeRx, radeProcessor, &RadeProcessor::processRx);
+        connect(this, &webServer::sendToRadeTx, radeProcessor, &RadeProcessor::processTx);
+        connect(radeProcessor, &RadeProcessor::rxReady, this, &webServer::onRadeRxReady);
+        connect(radeProcessor, &RadeProcessor::txReady, this, &webServer::onRadeTxReady);
+        connect(radeProcessor, &RadeProcessor::statsUpdate, this, &webServer::onRadeStats);
+        connect(radeProcessor, &RadeProcessor::rxCallsign, this, &webServer::onRadeRxCallsign);
+        connect(radeThread, &QThread::finished, radeProcessor, &QObject::deleteLater);
+
+        radeThread->start();
+    }
+
+    // Dire Wolf packet processor (mirrors the LAN path in setupAudio()).
+    if (!dwProc) {
+        dwProc = new DireWolfProcessor();
+        dwThread = new QThread(this);
+        dwThread->setObjectName("webPacket()");
+        dwProc->moveToThread(dwThread);
+
+        connect(this, &webServer::setupPacket, dwProc, &DireWolfProcessor::init);
+        connect(this, &webServer::sendToPacketRx, dwProc, &DireWolfProcessor::processRx);
+        connect(dwProc, &DireWolfProcessor::rxFrameDecoded, this, &webServer::onPacketRxDecoded);
+        connect(dwProc, &DireWolfProcessor::txFrameDecoded, this, &webServer::onPacketTxDecoded);
+        connect(dwProc, &DireWolfProcessor::txReady, this, &webServer::onPacketTxReady);
+        connect(dwProc, &DireWolfProcessor::txFailed, this, &webServer::onPacketTxFailed);
+        connect(dwThread, &QThread::finished, dwProc, &QObject::deleteLater);
+
+        dwThread->start();
+        emit setupPacket(rigSampleRate);
+    }
+
+    if (!axProc) {
+        axProc = new AX25LinkProcessor(this);
+        connect(axProc, &AX25LinkProcessor::transmitFrameBytes,
+                dwProc, &DireWolfProcessor::transmitFrameBytes,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::linkEstablished,
+                this,   &webServer::onAxLinkEstablished,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::linkTerminated,
+                this,   &webServer::onAxLinkTerminated,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::rxData,
+                this,   &webServer::onAxRxData,
+                Qt::QueuedConnection);
+        connect(axProc, &AX25LinkProcessor::dataAcked,
+                this,   &webServer::onAxDataAcked,
+                Qt::QueuedConnection);
+        axProc->start();
+
+        // APRS layer.  Mirrors the LAN-audio path in setupAudio(): without
+        // this the USB capture path decodes UI frames into the Monitor view
+        // but the Heard Stations list never populates because nothing is
+        // listening on rxFrameDecoded for parsing.
+        aprsProc = new AprsProcessor(this);
+        connect(dwProc, &DireWolfProcessor::rxFrameDecoded,
+                aprsProc, &AprsProcessor::onRxFrame,
+                Qt::QueuedConnection);
+        connect(aprsProc, &AprsProcessor::stationUpdated,
+                this, &webServer::onAprsStationUpdated);
+        connect(aprsProc, &AprsProcessor::stationsCleared,
+                this, &webServer::onAprsStationsCleared);
+        connect(aprsProc, &AprsProcessor::txBeaconRequested,
+                this, &webServer::onAprsBeaconRequested);
+
+        // Load persisted enable/mode state, then apply it to the processors
+        // and broadcast a packetStatus so the UI picks up the restored value.
+        packetLoadSettings();
+        QMetaObject::invokeMethod(axProc, "setLinkParamsForBaud", Qt::QueuedConnection,
+                                  Q_ARG(int, packetMode));
+        QMetaObject::invokeMethod(dwProc, "setMode", Qt::QueuedConnection,
+                                  Q_ARG(int, packetMode));
+        if (packetEnabled) {
+            QMetaObject::invokeMethod(dwProc, "setEnabled", Qt::QueuedConnection,
+                                      Q_ARG(bool, true));
+        }
+    }
+
+    qInfo() << "Web: USB audio capture configured, sampleRate=" << rigSampleRate
+            << "channels=" << format.channelCount();
+
+    // Also configure USB audio output (playback) for TX audio.
+    // Same matching strategy as the input above.
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    QAudioDeviceInfo usbOutDevice;
+    bool outFound = false;
+    QList<QAudioDeviceInfo> outputDevices = QAudioDeviceInfo::availableDevices(QAudio::AudioOutput);
+    if (!preferredOutputName.isEmpty()) {
+        for (const QAudioDeviceInfo &dev : outputDevices) {
+            if (dev.deviceName() == preferredOutputName) {
+                usbOutDevice = dev;
+                outFound = true;
+                qInfo() << "Web: Found rig audio output device (exact match):" << dev.deviceName();
+                break;
+            }
+        }
+        if (!outFound) {
+            for (const QAudioDeviceInfo &dev : outputDevices) {
+                if (dev.deviceName().contains(preferredOutputName, Qt::CaseInsensitive)) {
+                    usbOutDevice = dev;
+                    outFound = true;
+                    qInfo() << "Web: Found rig audio output device (substring match):" << dev.deviceName();
+                    break;
+                }
+            }
+        }
+    }
+    if (!outFound) {
+        for (const QAudioDeviceInfo &dev : outputDevices) {
+            if (dev.deviceName().contains("USB", Qt::CaseInsensitive) ||
+                dev.deviceName().contains("CODEC", Qt::CaseInsensitive)) {
+                usbOutDevice = dev;
+                outFound = true;
+                qInfo() << "Web: Found rig audio output device:" << dev.deviceName();
+                break;
+            }
+        }
+    }
+    if (outFound) {
+        QAudioFormat outFormat;
+        outFormat.setSampleRate(sampleRate);
+        outFormat.setChannelCount(1);
+        outFormat.setSampleSize(16);
+        outFormat.setSampleType(QAudioFormat::SignedInt);
+        outFormat.setByteOrder(QAudioFormat::LittleEndian);
+        outFormat.setCodec("audio/pcm");
+
+        usbOutputChannels = 1;
+        if (!usbOutDevice.isFormatSupported(outFormat)) {
+            outFormat.setChannelCount(2);
+            usbOutputChannels = 2;
+            if (!usbOutDevice.isFormatSupported(outFormat)) {
+                outFormat = usbOutDevice.nearestFormat(outFormat);
+                usbOutputChannels = outFormat.channelCount();
+                qInfo() << "Web: TX using nearest format:" << outFormat.sampleRate()
+                         << "ch=" << outFormat.channelCount()
+                         << "size=" << outFormat.sampleSize();
+            }
+        }
+
+        usbAudioOutput = new QAudioOutput(usbOutDevice, outFormat, this);
+        connect(usbAudioOutput, &QAudioOutput::stateChanged,
+                this, &webServer::onUsbAudioOutputStateChanged);
+        // Device starts stopped; it is started fresh on each enableMic=true via pre-buffer.
+        txAudioConfigured = true;
+        qInfo() << "Web: USB audio output configured for TX, channels=" << usbOutputChannels;
+    }
+#else
+    QAudioDevice usbOutDevice;
+    bool outFound = false;
+    QList<QAudioDevice> outputDevices = QMediaDevices::audioOutputs();
+    if (!preferredOutputName.isEmpty()) {
+        for (const QAudioDevice &dev : outputDevices) {
+            if (dev.description() == preferredOutputName) {
+                usbOutDevice = dev;
+                outFound = true;
+                qInfo() << "Web: Found rig audio output device (exact match):" << dev.description();
+                break;
+            }
+        }
+        if (!outFound) {
+            for (const QAudioDevice &dev : outputDevices) {
+                if (dev.description().contains(preferredOutputName, Qt::CaseInsensitive)) {
+                    usbOutDevice = dev;
+                    outFound = true;
+                    qInfo() << "Web: Found rig audio output device (substring match):" << dev.description();
+                    break;
+                }
+            }
+        }
+    }
+    if (!outFound) {
+        for (const QAudioDevice &dev : outputDevices) {
+            if (dev.description().contains("USB", Qt::CaseInsensitive) ||
+                dev.description().contains("CODEC", Qt::CaseInsensitive)) {
+                usbOutDevice = dev;
+                outFound = true;
+                qInfo() << "Web: Found rig audio output device:" << dev.description();
+                break;
+            }
+        }
+    }
+    if (outFound) {
+        QAudioFormat outFormat;
+        outFormat.setSampleRate(sampleRate);
+        outFormat.setChannelCount(1);
+        outFormat.setSampleFormat(QAudioFormat::Int16);
+
+        usbOutputChannels = 1;
+        // Qt6 QAudioSink handles format negotiation internally
+
+        usbAudioOutput = new QAudioSink(usbOutDevice, outFormat, this);
+        connect(usbAudioOutput, &QAudioSink::stateChanged,
+                this, &webServer::onUsbAudioOutputStateChanged);
+        usbAudioOutputDevice = usbAudioOutput->start();
+        if (usbAudioOutputDevice) {
+            txAudioConfigured = true;
+            qInfo() << "Web: USB audio output configured for TX";
+        } else {
+            qWarning() << "Web: Failed to start USB audio output";
+            delete usbAudioOutput;
+            usbAudioOutput = nullptr;
+        }
+    }
+#endif
+
+    // Notify connected clients
+    if (!wsClients.isEmpty()) {
+        QJsonObject notify;
+        notify["type"] = "audioAvailable";
+        notify["available"] = true;
+        notify["sampleRate"] = (int)rigSampleRate;
+        notify["txAudioAvailable"] = txAudioConfigured;
+        notify["rigAudioInputName"] = rigCaptureDeviceName;
+        sendJsonToAll(notify);
+    }
+}
+
+void webServer::onAudioStateChanged(QAudio::State state)
+{
+#ifdef Q_OS_WIN
+    if (state == QAudio::StoppedState && usbAudioInput && usbAudioInput->error() != QAudio::NoError) {
+        qWarning() << "Web: Audio stopped with error, attempting restart...";
+        QTimer::singleShot(1000, this, [this]() {
+            if (usbAudioInput && usbAudioInput->state() == QAudio::StoppedState) {
+                usbAudioDevice = usbAudioInput->start();
+                if (usbAudioDevice) {
+                    connect(usbAudioDevice, &QIODevice::readyRead, this, &webServer::readUsbAudio);
+                    qInfo() << "Web: Audio restart successful";
+                } else {
+                    qWarning() << "Web: Audio restart failed";
+                }
+            }
+        });
+    }
+#else
+    Q_UNUSED(state)
+#endif
+}
+
+void webServer::readUsbAudio()
+{
+    if (!usbAudioDevice) return;
+    // Forward whenever *any* consumer cares: browser audio clients, an
+    // active packet modem, or anything we need to drain so the input
+    // buffer doesn't pile up.
+    bool haveConsumer = !audioClients.isEmpty();
+    haveConsumer = haveConsumer || packetEnabled;
+    if (!haveConsumer) {
+        // Still drain so the input buffer stays healthy.
+        usbAudioDevice->readAll();
+        return;
+    }
+
+    QByteArray data = usbAudioDevice->readAll();
+    if (data.isEmpty()) return;
+
+    // If stereo, mix down to mono (average L+R)
+    int channels = usbAudioInput ? usbAudioInput->format().channelCount() : 1;
+    if (channels == 2) {
+        int numSamples = data.size() / (2 * channels); // 16-bit stereo
+        QByteArray mono;
+        mono.resize(numSamples * 2);
+        const qint16 *src = reinterpret_cast<const qint16 *>(data.constData());
+        qint16 *dst = reinterpret_cast<qint16 *>(mono.data());
+        for (int i = 0; i < numSamples; i++) {
+            dst[i] = static_cast<qint16>((static_cast<qint32>(src[i*2]) + src[i*2+1]) / 2);
+        }
+        data = mono;
+    }
+
+    // FreeDV RX path: decode modem tones before sending to browser.
+    // This also works during TX when the radio's MONITOR is on,
+    // providing a loopback test of the full TX/RX chain.
+    // When freedvMonitor is set, bypass decoding to hear raw SSB.
+    if (freedvEnabled && !freedvMonitor) {
+        audioPacket pkt;
+        pkt.data = data;
+        pkt.time = QTime::currentTime();
+        pkt.seq = audioSeq++;
+        pkt.sent = 0;
+        pkt.volume = 1.0;
+        if (freedvModeName == "RADE")
+            emit sendToRadeRx(pkt);
+        else
+            emit sendToFreeDVRx(pkt);
+        return;
+    }
+
+    // Fan out to the Dire Wolf demod.  The LAN path feeds packet via the
+    // audioConverter (onRxConverted); USB is already PCM Int16 at
+    // rigSampleRate, so send it straight in.
+    if (packetEnabled) {
+        audioPacket pkt;
+        pkt.data = data;
+        pkt.time = QTime::currentTime();
+        pkt.seq = audioSeq;
+        pkt.sent = 0;
+        pkt.volume = 1.0;
+        emit sendToPacketRx(pkt);
+    }
+
+    if (audioClients.isEmpty()) return;
+
+    // Build binary message: [0x02][0x00][seq_u16LE][rateDiv_u16LE][PCM_Int16LE...]
+    quint16 rateDiv = static_cast<quint16>(rigSampleRate / 1000);
+    QByteArray msg;
+    int headerSize = 6;
+    msg.resize(headerSize + data.size());
+    msg[0] = 0x02;
+    msg[1] = 0x00;
+
+    quint16 seq = audioSeq++;
+    memcpy(msg.data() + 2, &seq, 2);
+    memcpy(msg.data() + 4, &rateDiv, 2);
+    memcpy(msg.data() + headerSize, data.constData(), data.size());
+
+    sendBinaryToAudioClients(msg);
+}

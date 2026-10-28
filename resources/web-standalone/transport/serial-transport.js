@@ -1,0 +1,3750 @@
+// Serial transport: drives the rig directly over Web Serial CI-V.
+// No C++ server in the loop for control. Audio is intentionally not handled
+// here — Phase 2 routes audio through Web Audio + setSinkId.
+//
+// Design:
+//   * Auto-detect — when the user picks a port, the transport probes a list
+//     of common baud rates with a broadcast read-transceiver-ID frame. The
+//     first baud that elicits a reply is the right one; the reply's "from"
+//     byte is the rig's CI-V address. Detected baud + addr are cached in
+//     localStorage; subsequent connects skip detection.
+//   * Auto-reconnect — `tryAutoReconnect()` uses navigator.serial.getPorts()
+//     to find ports the user has already paired with this origin and opens
+//     the first one without showing a picker.
+//   * Maintains a small JS rig-state cache (frequency, mode, filter, PTT,
+//     S-meter) and synthesizes the JSON shapes the SPA already consumes
+//     (rigInfo, status, update, meters) so handleMessage works unchanged.
+//   * Outbound commands flow through a deduping FIFO keyed by command name,
+//     mirroring cachingQueue::addUnique() semantics.
+//   * Inbound CI-V frames flow through IcomCiv.CivParser; echoes (frames
+//     whose "from" equals our controllerAddr) are filtered out.
+
+(function (global) {
+    'use strict';
+
+    if (!global.RigTransport || !global.IcomCiv) {
+        console.error('serial-transport.js: missing prerequisite modules');
+        return;
+    }
+
+    var civ = global.IcomCiv;
+    var RIG_CAPS = global.IcomRigCaps || {};
+    // Standard tone tables, emitted once by tools/extract-rig-caps.py because
+    // every Icom that has them has the same ones.
+    var CTCSS_TONES = global.IcomCtcssTones || [];
+    var DTCS_CODES  = global.IcomDtcsCodes || [];
+    var cwFrameSeq = 0;   // unique queue keys for consecutive keyer frames
+    // A memory channel stores the repeater shift as a 4-bit direction, not
+    // the 0x1x duplexMode_t register the live 0x0F command uses.
+    var DUPLEX_MEM_NIBBLE = { 'OFF': 0, 'DUP-': 1, 'DUP+': 2 };
+
+    // CI-V address → display name. The full table is generated from
+    // rigs/*.rig by tools/extract-rig-caps.py and lives in IcomRigCaps;
+    // we look up names from there. This minimal fallback covers the
+    // common modern rigs in case rig-caps.js failed to load.
+    function rigDisplayName(addr) {
+        var entry = RIG_CAPS[addr];
+        if (entry && entry.model) return entry.model;
+        return 'Icom 0x' + addr.toString(16).toUpperCase();
+    }
+
+    // Bauds tried during auto-detect, ordered by likelihood. 19200 is the
+    // most common Icom default; 115200 is what people set for snappy SDR
+    // operation; 9600 is the original factory default for older rigs.
+    var PROBE_BAUDS = [19200, 115200, 9600, 57600, 38400, 4800];
+    var PROBE_TIMEOUT_MS = 500;
+
+    // Substring patterns the rig's USB audio device usually advertises.
+    // Used to identify the rig's audio interface among the OS audio devices
+    // (PulseAudio/Pipewire labels them with the chip name on Linux, e.g.
+    // "USB Audio CODEC" or "PCM2901"). Same pattern for input + output —
+    // a USB audio gadget typically shows under both kinds.
+    var RIG_AUDIO_PATTERN = /(USB Audio CODEC|USB-PCM Audio|IC-7300|IC-705|IC-9700|IC-7610|IC-7100|IC-9100|CP210|Burr-Brown|PCM29|PCM30)/i;
+
+    // The SPA's populateModes() expects a flat array of mode-name strings —
+    // mirrors what the C++ webserver sends.
+    var DEFAULT_MODES = ['LSB', 'USB', 'AM', 'CW', 'RTTY', 'FM', 'CW-R', 'RTTY-R'];
+    // populateFilters() takes [{num, name}, ...]
+    var DEFAULT_FILTERS = [
+        { num: 1, name: 'FIL1' }, { num: 2, name: 'FIL2' }, { num: 3, name: 'FIL3' },
+    ];
+
+    // Icom scope center-span table. Identical across IC-7300 / IC-705 /
+    // IC-9700 (the modern HF/VHF rigs).
+    // hz is the half-span the rig takes (0x27 0x15); freq repeats it under the
+    // name the C++ server's rigInfo uses, so the SPA sizes Fixed windows from
+    // either build alike.
+    var DEFAULT_SPANS = [
+        { num: 0, name: '±2.5k', hz: 2500,   freq: 2500   },
+        { num: 1, name: '±5k',   hz: 5000,   freq: 5000   },
+        { num: 2, name: '±10k',  hz: 10000,  freq: 10000  },
+        { num: 3, name: '±25k',  hz: 25000,  freq: 25000  },
+        { num: 4, name: '±50k',  hz: 50000,  freq: 50000  },
+        { num: 5, name: '±100k', hz: 100000, freq: 100000 },
+        { num: 6, name: '±250k', hz: 250000, freq: 250000 },
+    ];
+
+    // 0x15 sub-command -> the SPA status field and the IcomRigCaps meter
+    // table used to calibrate it. Power/SWR/ALC are polled on every TX tick;
+    // Comp/Vd/Id only while the switchable second meter bar is showing them.
+    var TX_METER_SUBCMDS = {
+        0x11: { field: 'powerMeter', cal: 'power'   },
+        0x12: { field: 'swrMeter',   cal: 'swr'     },
+        0x13: { field: 'alcMeter',   cal: 'alc'     },
+        0x14: { field: 'compMeter',  cal: 'comp'    },
+        0x15: { field: 'vdMeter',    cal: 'voltage' },
+        0x16: { field: 'idMeter',    cal: 'current' },
+    };
+    // The switchable bar's kinds, in the order the SPA cycles them, mapped to
+    // their read command and the IcomRigCaps meter table that draws the face.
+    var TX_METER_KINDS = {
+        swr:  { read: 'cmdReadSwrMeter',  cal: 'swr'     },
+        alc:  { read: 'cmdReadAlcMeter',  cal: 'alc'     },
+        comp: { read: 'cmdReadCompMeter', cal: 'comp'    },
+        vd:   { read: 'cmdReadVdMeter',   cal: 'voltage' },
+        id:   { read: 'cmdReadIdMeter',   cal: 'current' },
+    };
+
+    // Icom S-meter raw BCD (0..241) → dB relative to S9 (-54..+60), the
+    // scale the SPA's drawSMeter() expects. Uses the per-rig table from
+    // IcomRigCaps when available (rigs/IC-*.rig has per-model curves);
+    // falls back to the IC-7300 default in icom.js for unknown rigs.
+    function rawSMeterToDb(raw, civAddr) {
+        var tbl = civ.getRigMeterTable(civAddr, 'sMeter');
+        return civ.calMeter('sMeter', raw, tbl);
+    }
+
+    // Build the SPA's txMeters list for a rig: the meters whose command the
+    // .rig declares AND for which it carries a calibration table. Without a
+    // table a reading is raw 0..255 counts, which no face can label honestly,
+    // so that meter is left out rather than shown lying. Mirrors
+    // webServer::addTxMeterCaps() on the server fork.
+    function txMeterDescriptors(entry) {
+        var kinds = (entry && entry.caps && entry.caps.txMeters) || [];
+        var out = [];
+        for (var i = 0; i < kinds.length; i++) {
+            var spec = TX_METER_KINDS[kinds[i]];
+            var cal = spec && entry.meters && entry.meters[spec.cal];
+            if (!cal || !cal.length) continue;
+            var red;
+            for (var j = 0; j < cal.length; j++) if (cal[j][2]) red = cal[j][1];
+            var d = { kind: kinds[i], cal: cal };
+            if (red !== undefined) d.red = red;
+            out.push(d);
+        }
+        return out;
+    }
+
+    // SPA command name → 0x14 NN sub byte (analog levels 0..255)
+    var ANALOG_SUB = {
+        setAfGain:      0x01,
+        setRfGain:      0x02,
+        setSquelch:     0x03,
+        setRfPower:     0x0A,
+        setMicGain:     0x0B,
+        setMonitorGain: 0x15,
+        setCompLevel:   0x0E,  // speech compressor level (GAIN COMP row)
+        setPBTInner:    0x07,
+        setPBTOuter:    0x08,
+        setCWSpeed:     0x0C,
+    };
+    // 0x14 sub → field name reported to the SPA in 'update' messages.
+    var ANALOG_SUB_TO_FIELD = {
+        0x01: 'afGain',
+        0x02: 'rfGain',
+        0x03: 'squelch',
+        0x0A: 'rfPower',
+        0x0B: 'micGain',
+        0x15: 'monitorGain',  // 0x0F is Break-in delay, NOT monitor — common confusion
+        0x0E: 'compLevel',
+        0x07: 'pbtInner',
+        0x08: 'pbtOuter',
+        0x0C: 'cwSpeed',
+        0x09: 'cwPitch',     // read-only here; reported in Hz (see the 0x14 reply)
+    };
+
+    // SPA command name → 0x16 NN sub byte (bool toggles)
+    var BOOL_SUB = {
+        setAutoNotch:      0x41,
+        setNoiseBlanker:   0x22,
+        setNoiseReduction: 0x40,
+        setMonitor:        0x45,
+        setCompressor:     0x44,  // speech compressor (FUNC COMP tile)
+    };
+    var BOOL_SUB_TO_FIELD = {
+        0x41: 'autoNotch',
+        0x22: 'nb',
+        0x40: 'nr',
+        0x45: 'monitor',
+        0x44: 'compressor',
+        0x02: 'preamp',  // multi-state but reply still parses through here
+        0x47: 'breakIn', // CW break-in, multi-state: 0 OFF, 1 SEMI, 2 FULL
+    };
+
+    var HANDLED_CMDS = {
+        // Already implemented
+        getStatus: true, setFrequency: true, setMode: true,
+        setFilter: true, setPTT: true,
+        // BAND key -> band stacking register recall
+        setBand: true,
+        // Audio plumbing — Phase 2 will fill these in; for now silently drop
+        // so they don't noisily fall back to a closed WS.
+        enableMic: true, enableAudio: true,
+        // Analog levels
+        setAfGain: true, setRfGain: true, setRfPower: true, setSquelch: true,
+        setMicGain: true, setMonitorGain: true, setCompLevel: true, setPBTInner: true,
+        setPBTOuter: true, setCWSpeed: true,
+        // Bool toggles
+        setAutoNotch: true, setNoiseBlanker: true, setNoiseReduction: true,
+        setMonitor: true, setCompressor: true, setPreamp: true, setAttenuator: true, setBreakIn: true,
+        setAntenna: true,
+        // VFO ops
+        selectVFO: true, swapVFO: true, equalizeVFO: true, setSplit: true,
+        // Repeater duplex (direction + offset)
+        setDuplex: true, setDuplexOffset: true,
+        // Repeater access tone (TONE / TSQL / DTCS) + software tone scan
+        setToneMode: true, setToneFreq: true, setTsqlFreq: true,
+        setDtcsCode: true,
+        // Misc
+        setTuner: true, setPower: true, setSpan: true, setScopeRef: true, setScopeSpeed: true, setScopeMode: true, setScopeEdges: true,
+        // CW
+        sendCW: true, stopCW: true,
+        // Filter width / shape
+        setFilterWidth: true, setFilterShape: true,
+        // Packet (WASM Direwolf modem) + APRS station db / beacon scheduler.
+        packetEnable: true, packetSetMode: true,
+        aprsTxBeacon: true, aprsBeaconConfig: true, aprsClearStations: true,
+        // AX.25 connected-mode terminal sessions.
+        termList: true, termRegister: true,
+        termConnect: true, termDisconnect: true,
+        termSend: true, termHistory: true,
+        // RADE V1 (LPCNet + FARGAN + RADE modem) — browser-only voice.
+        setRadeMode: true, setRadeCallsign: true,
+        // Memory channels (scan / write / clear / recall on the rig / rename)
+        getMemories: true, writeMemory: true, clearMemory: true,
+        recallMemory: true, renameMemory: true,
+        // Anything else (FreeDV, LAN ops, reporters …)
+        // falls through to the WS path which is closed in Direct mode.
+    };
+
+    function lsGetInt(key) {
+        try { var v = localStorage.getItem(key); return v ? parseInt(v) : null; }
+        catch (e) { return null; }
+    }
+    function lsSetInt(key, val) {
+        try { localStorage.setItem(key, String(val)); } catch (e) { /* ignore */ }
+    }
+    function lsGetJson(key) {
+        try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : null; }
+        catch (e) { return null; }
+    }
+    function lsSetJson(key, val) {
+        try { localStorage.setItem(key, JSON.stringify(val)); return true; }
+        catch (e) { return false; }
+    }
+
+    // Decode a BCD-encoded byte (0x12 -> 12) — used for scope sequence numbers.
+    function bcdByteToInt(b) {
+        return ((b >> 4) & 0x0F) * 10 + (b & 0x0F);
+    }
+
+    // Pick how to read the second VFO/receiver for a given Icom CI-V address.
+    // Cmd29 rigs (Main/Sub) take precedence over the 0x25 (Selected/Unselected)
+    // path; rigs with neither — single-VFO models or older A/B rigs that don't
+    // implement 0x25 — get 'single' so we just keep the active VFO populated.
+    function _dualVfoModeFor(civAddr) {
+        var entry = RIG_CAPS[civAddr];
+        var caps  = entry && entry.caps;
+        if (!caps) return 'single';
+        if (caps.hasCommand29) return 'cmd29';
+        if (caps.hasSelectedFreq) return 'selectedUnselected';
+        return 'single';
+    }
+
+    class SerialRigTransport extends global.RigTransport {
+        constructor(opts) {
+            super();
+            opts = opts || {};
+            this.controllerAddr = opts.controllerAddr || 0xE0;
+            this.onProgress = opts.onProgress || function () {};
+
+            this.civAddr = lsGetInt('directCivAddr') || 0;       // 0 means "not yet detected"
+            this.baudRate = lsGetInt('directBaudRate') || 0;
+
+            this.parser = new civ.CivParser({
+                controllerAddr: this.controllerAddr,
+                onFrame: this._onFrame.bind(this),
+            });
+
+            this.port = null;
+            this.writer = null;
+            this.reader = null;
+            this._open = false;
+            this._connecting = false;
+
+            this._queue = [];
+            this._payloads = {};
+            this._draining = false;
+
+            this._sMeterTimer = null;
+            this._safetyPollTimer = null;
+            this._otherVfoPollTimer = null;
+            this._lastFreqStamp = 0;
+            this._lastModeStamp = 0;
+            this._lastRealVfo = 'A';   // A/B to return to when leaving MEM
+            this._memCaps = null;      // filled on connect from rig-caps
+            this._memCache = {};       // last parsed channel per group/channel key
+
+            this.state = {
+                frequency: 0, mode: null, filter: null,
+                sMeter: 0, transmitting: false,
+                // VFO B / Sub frequency. Populated on rigs that expose a
+                // second VFO via the 0x25 (Selected/Unselected) or 0x29
+                // (Main/Sub) commands; left at 0 on single-VFO rigs so the
+                // SPA's side display stays at the "---.---.---" placeholder.
+                vfoAFrequency: 0, vfoBFrequency: 0,
+                // Best-effort tracking of which VFO is currently selected on
+                // the rig. We default to 'A' on connect and update when the
+                // user clicks the VFO label or 0x25 0x00 confirms it. 'MEM'
+                // while the rig is in memory mode (#92); memChannel is then
+                // the last channel we selected (Icom never reports it).
+                selectedVfo: 'A',
+                memChannel: null, memGroup: null,
+                // Repeater shift. 'OFF' until the rig reports otherwise;
+                // duplexOffset stays null until 0x0C answers.
+                duplex: 'OFF', duplexOffset: null,
+                // Repeater access tone. Names match the server build's
+                // toneModeName() so the SPA is identical in both forks.
+                toneMode: 'OFF', toneFreq: null, tsqlFreq: null,
+                dtcsCode: null, dtcsPolarity: 0,
+            };
+
+            // Dual-VFO read mode, derived from rig caps in _finalizeDetection.
+            // 'cmd29'              — IC-7610 / IC-785x / IC-7760 / IC-7600:
+            //                        Main/Sub rigs, read both bands via
+            //                        0x25 0x00 / 0x25 0x01 (fixed Main/Sub,
+            //                        not selected/unselected), select them
+            //                        with 07 D0 / 07 D1
+            // 'selectedUnselected' — IC-7300 / IC-705 / IC-7100 / IC-905 /
+            //                        IC-9700 / IC-7300MK2: read both VFOs via
+            //                        0x25 0x00 / 0x25 0x01
+            // 'single'             — older / RX-only rigs without either:
+            //                        only the active VFO is queried.
+            this._dualVfoMode = 'single';
+
+            // Antenna selector caps — filled in by _finalizeDetection from
+            // the rig-caps registry; null/empty on single-antenna rigs (#76).
+            this._antCmd = null;
+            this._antennas = [];
+            this._hasRxAnt = false;
+
+            // Repeater duplex caps — true only for rigs whose .rig declares
+            // the offset command (IC-705/9700/905/785x). Set in
+            // _finalizeDetection from the rig-caps registry.
+            this._hasDuplex = false;
+
+            // Antenna tuner caps — true only for rigs whose .rig declares the
+            // ATU command (CI-V 0x1C 0x01). Set in _finalizeDetection.
+            this._hasTuner = false;
+            // Comp/Vd/Id when the SPA's switchable meter bar asks for one.
+            this._txMeterKind = null;
+
+            // Repeater-tone command bytes, filled in by _finalizeDetection.
+            // Rigs speak one of two dialects: `sqlType` (0x16 0x5D) carries
+            // the whole TONE/TSQL/DTCS selection in one register, otherwise
+            // rptTone/rptTsql/rptDtcs are independent booleans.
+            this._toneCmds = {};
+            // Cached TONE/TSQL/DTCS flags for the boolean dialect — they
+            // arrive in separate replies and have to be folded together.
+            this._rptTone = false;
+            this._rptTsql = false;
+            this._rptDtcs = false;
+
+            // RX audio capture state — getUserMedia → AudioWorklet → Int16
+            // PCM → 0x02 binary frame → SPA's handleAudioData.
+            this._rxAudio = {
+                ctx: null,        // AudioContext at 48kHz
+                stream: null,     // MediaStream from getUserMedia
+                source: null,     // MediaStreamAudioSourceNode
+                node: null,       // AudioWorkletNode (capture)
+                seq: 0,           // 0x02 frame sequence counter
+                enabled: false,
+            };
+
+            // TX audio playback state — 0x03 frame → AudioWorklet ring buffer
+            // → AudioContext destination routed via setSinkId() to the rig's
+            // USB audio output. Lazy-initialised on first sendAudioFrame.
+            this._txAudio = {
+                ctx: null,
+                node: null,         // AudioWorkletNode (ring buffer playback)
+                deviceId: null,
+                initPromise: null,  // dedupes concurrent _ensureTxAudioCtx() calls
+            };
+
+            // Saved mod-input baselines (Data-Off and DATA1 registers),
+            // captured on connect before we flip the rig to USB so we can
+            // put the rig back the way the user had it — on mic-off, mode
+            // disable, and disconnect (issue #79).
+            this._savedDataOffMod = null;
+            this._savedDataMod = null;
+
+            // Speech compressor taken out for wfweb's own digital overs
+            // (#147): they run in plain USB/LSB, where the rig keeps the
+            // voice COMP. _compRestoreOn = turn it back on when the over ends.
+            this._compHeld = false;
+            this._compRestoreOn = false;
+
+            // Per-rig MOD INPUT command bytes + USB/MIC register values.
+            // Filled in once we identify the rig (default = IC-7300 layout
+            // until we have a CI-V address).
+            this._modIn = civ.getRigModInputs(this.civAddr);
+
+            // Spectrum scope assembly state. The Icom scope command (0x27 0x00)
+            // arrives as a sequence of frames: seq 1 carries header (mode +
+            // start/end freq + out-of-range flag), seq 2..N carry pixels.
+            this._scope = {
+                seqMax: 0, mode: 0,
+                startFreq: 0, endFreq: 0,
+                pixels: [], capturing: false,
+            };
+
+            // Packet (Direwolf WASM) state. Lazy-loaded — we don't pay the
+            // ~140 KB module download cost unless the user opens the packet
+            // panel and toggles enable. modem stays alive across mode
+            // changes; init() reconfigures it in place. mode here is just
+            // the boot default; the SPA pushes packetSetMode on every
+            // transport-open via Packet.syncToTransport (see issue #60).
+            this._packet = {
+                enabled: false, mode: 300, modem: null,
+                modulePromise: null, txInFlight: false,
+            };
+            // RADE V1 voice modem state. Lazy-loaded — the WASM payload is
+            // ~10 MB and we only pull it down when the user picks RADE mode.
+            // _rade.txActive flips on PTT-key, off on PTT-unkey; while it's
+            // on, mic 0x03 frames are diverted through rade.processTx instead
+            // of being shipped raw to the rig USB output.
+            this._rade = {
+                enabled: false, modem: null, modulePromise: null,
+                txActive:  false,           // mic → modem encode is live
+                eooSent:   false,           // EOO already shipped this over
+                rxSpeechSeq: 0,             // 0x02 sequence for synthesized speech
+                callsign:  null,            // station callsign (for EOO)
+            };
+            // Connected-mode AX.25 terminal sessions. sid (string) keys
+            // an entry; client (small int) is the id we hand to ax25_link.
+            // Sessions are reaped when linkTerminated fires, so the maps
+            // stay consistent without explicit cleanup.
+            this._terminal = {
+                sessions:    new Map(),    // sid -> session
+                byClient:    new Map(),    // client -> session
+                regsByCall:  new Map(),    // CALL@chan -> { client, ownCall, chan }
+                nextSid:     1,
+                nextClient:  1,
+                txQueue:     [],           // pending Int16Array audio chunks from link
+                txDraining:  false,
+            };
+        }
+
+        // ----------------------------------------------------------------
+        // RigTransport interface
+        // ----------------------------------------------------------------
+
+        async connect(prePicked) {
+            if (this._open || this._connecting) return;
+            this._connecting = true;
+            try {
+                var port = prePicked || (await navigator.serial.requestPort({}));
+                await this._openWithDetection(port);
+            } finally {
+                this._connecting = false;
+            }
+        }
+
+        // Opens the first previously-paired port without showing a picker.
+        // Returns true if a port was opened, false if none paired.
+        async tryAutoReconnect() {
+            if (this._open || this._connecting) return true;
+            if (!navigator.serial || !navigator.serial.getPorts) return false;
+            var ports = await navigator.serial.getPorts();
+            if (!ports || !ports.length) return false;
+            this._connecting = true;
+            try {
+                await this._openWithDetection(ports[0]);
+                return true;
+            } catch (e) {
+                console.warn('SerialRigTransport auto-reconnect failed:', e);
+                return false;
+            } finally {
+                this._connecting = false;
+            }
+        }
+
+        async close() {
+            // Put the rig's mod inputs back the way the user had them
+            // before we drop the link (issue #79). The command queue is
+            // about to be cleared, so the frames are written directly.
+            await this._restoreCompressorDirect();
+            await this._restoreModInputsDirect();
+            this._stopPolling();
+            this._open = false;
+            await this._stopRxAudio();
+            await this._stopTxAudio();
+            try { if (this.writer) this.writer.releaseLock(); } catch (e) { /* ignore */ }
+            this.writer = null;
+            try { if (this.reader) await this.reader.cancel(); } catch (e) { /* ignore */ }
+            this.reader = null;
+            try { if (this.port) await this.port.close(); } catch (e) { /* ignore */ }
+            this.port = null;
+            this._queue = [];
+            this._payloads = {};
+            this.dispatchEvent(new CustomEvent('close', { detail: { reason: 'user-close' } }));
+        }
+
+        isOpen() { return this._open; }
+
+        sendCommand(obj) {
+            if (!obj || !obj.cmd) return;
+
+            // Analog levels — uniform 0x14 NN <BCD level> shape.
+            if (ANALOG_SUB.hasOwnProperty(obj.cmd)) {
+                var aSub = ANALOG_SUB[obj.cmd];
+                // setCWSpeed uses obj.wpm; everything else uses obj.value.
+                var aVal = (obj.cmd === 'setCWSpeed') ? obj.wpm : obj.value;
+                if (typeof aVal !== 'number') return;
+                var aField = ANALOG_SUB_TO_FIELD[aSub];
+                this.state[aField] = aVal;
+                // CW key speed is the only analog level that's not on the
+                // raw 0..255 BCD scale: the UI exposes WPM and the level spans
+                // the rig file's keyer range (level = (wpm - min) * 255 /
+                // (max - min)), matching icomcommander.cpp funcKeySpeed.
+                // Without this, a WPM of 35 sends level=35 which the rig
+                // decodes back to ~12 WPM, and small UI changes look like no
+                // change at all.
+                var wireVal = aVal;
+                if (obj.cmd === 'setCWSpeed') {
+                    var ksr = this._keySpeedRange || { min: 6, max: 48 };
+                    wireVal = Math.round((aVal - ksr.min) * 255 / (ksr.max - ksr.min));
+                    if (wireVal < 0) wireVal = 0;
+                    if (wireVal > 255) wireVal = 255;
+                }
+                this._enqueue(obj.cmd, civ.cmdSetAnalogLevel(aSub, wireVal));
+                var aUpd = {}; aUpd[aField] = aVal;
+                this._emit('update', aUpd);
+                return;
+            }
+
+            // Bool toggles — uniform 0x16 NN <0/1> shape.
+            if (BOOL_SUB.hasOwnProperty(obj.cmd)) {
+                // The operator's word wins over a digital-TX hold: the end of
+                // the over must not put the old state back on top of it.
+                if (obj.cmd === 'setCompressor' && this._compHeld) this._compRestoreOn = false;
+                var bSub = BOOL_SUB[obj.cmd];
+                var bOn = !!obj.value;
+                var bField = BOOL_SUB_TO_FIELD[bSub];
+                this.state[bField] = bOn;
+                this._enqueue(obj.cmd, civ.cmdSetBoolFunc(bSub, bOn));
+                var bUpd = {}; bUpd[bField] = bOn;
+                this._emit('update', bUpd);
+                return;
+            }
+
+            switch (obj.cmd) {
+                case 'getStatus':
+                    this._emitFullStatus();
+                    return;
+                case 'setFrequency':
+                    if (typeof obj.value !== 'number' || obj.value <= 0) return;
+                    this.state.frequency = obj.value;
+                    this._enqueue('setFreq', civ.cmdSetFrequency(obj.value));
+                    this._emit('update', { frequency: obj.value, vfoAFrequency: obj.value });
+                    return;
+                case 'setBand':
+                    // BAND key: read the rig's band stacking register for
+                    // this band; the 0x1A 0x01 reply branch in _onFrame
+                    // applies it. The page only sends this for bands whose
+                    // rig-caps entry carries a bsr code.
+                    if (typeof obj.bsr !== 'number' || obj.bsr <= 0) return;
+                    var bsrReg = Math.max(1, Math.min(3, (obj.reg | 0) || 1));
+                    // The rig only stores the VFO into a register from its
+                    // own BAND key, never on CI-V tuning. So first do what
+                    // the key does: store the current VFO in the register
+                    // of the band being left (`save`), read-modify-write
+                    // so its tone bytes survive. The reply branch below
+                    // writes it back once the read comes in.
+                    this._pendingBsrSave = null;
+                    var save = obj.save;
+                    if (save && typeof save.bsr === 'number' && save.bsr > 0
+                            && this.state.frequency > 0 && this.state.mode) {
+                        var saveReg = Math.max(1, Math.min(3, (save.reg | 0) || 1));
+                        if (!(save.bsr === obj.bsr && saveReg === bsrReg)) {
+                            this._pendingBsrSave = { bsr: save.bsr, reg: saveReg,
+                                frequency: this.state.frequency, mode: this.state.mode,
+                                filter: this.state.filter || 1 };
+                            this._enqueue('readBsr:' + save.bsr + ':' + saveReg,
+                                          civ.cmdReadBandStack(save.bsr, saveReg));
+                        }
+                    }
+                    this._enqueue('readBsr:' + obj.bsr + ':' + bsrReg,
+                                  civ.cmdReadBandStack(obj.bsr, bsrReg));
+                    return;
+                case 'setMode':
+                    if (typeof obj.value !== 'string') return;
+                    this.state.mode = obj.value;
+                    // Send mode WITHOUT a filter byte — cmdSetMode emits
+                    // the bare 0x06 mode form, which makes the rig keep
+                    // its per-mode remembered filter. Sending an explicit
+                    // filter forces e.g. FIL1 every time something else
+                    // changes the mode (packet.js auto-restoring its
+                    // saved-enabled state on reload was clobbering the
+                    // user's filter selection back to FIL1 every refresh).
+                    // An explicit filter (1..3) rides in the same 06 frame:
+                    // the panel-close restore needs mode + filter as one
+                    // command, a trailing setFilter would race it.
+                    var modeFilter = (obj.filter >= 1 && obj.filter <= 3) ? obj.filter : null;
+                    if (modeFilter) this.state.filter = modeFilter;
+                    this._enqueue('setMode', civ.cmdSetMode(obj.value, modeFilter));
+                    this._emit('update', modeFilter ? { mode: obj.value, filter: modeFilter }
+                                                    : { mode: obj.value });
+                    return;
+                case 'setFilter':
+                    if (typeof obj.value !== 'number') return;
+                    this.state.filter = obj.value;
+                    if (this.state.mode) {
+                        this._enqueue('setMode', civ.cmdSetMode(this.state.mode, obj.value));
+                    }
+                    this._emit('update', { filter: obj.value });
+                    // Each filter has its own stored bandwidth and shape on
+                    // Icoms. Re-read so the window reflects the new filter's.
+                    this._enqueue('readFilterWidth', civ.cmdReadFilterWidth());
+                    this._enqueue('readFilterShape', civ.cmdReadBoolFunc(0x56));
+                    return;
+                case 'setFilterWidth':
+                    if (typeof obj.value !== 'number' || obj.value <= 0) return;
+                    this.state.filterWidth = obj.value;
+                    var fwBytes = civ.cmdSetFilterWidth(obj.value, this.state.mode || 'USB');
+                    console.log('setFilterWidth:', obj.value, 'Hz mode=', this.state.mode,
+                        '→ bytes', Array.from(fwBytes).map(function(b){return b.toString(16).padStart(2,'0');}).join(' '));
+                    this._enqueue('setFilterWidth', fwBytes);
+                    this._emit('update', { filterWidth: obj.value });
+                    return;
+                case 'setFilterShape':
+                    // 0x16 0x56 <0 sharp / 1 soft> for the current filter.
+                    if (typeof obj.value !== 'number') return;
+                    var shape = obj.value ? 1 : 0;
+                    this.state.filterShape = shape;
+                    this._enqueue('setFilterShape', civ.cmdSetBoolFunc(0x56, shape === 1));
+                    this._emit('update', { filterShape: shape });
+                    return;
+                case 'setPTT':
+                    // Receiver-only rigs (R-series) won't accept PTT — drop
+                    // the request silently rather than NAK the bus.
+                    if (!this._rigCanTransmit()) return;
+                    var ptt = !!obj.value;
+                    // What wfweb modulates itself is a digital signal: the page
+                    // flags FT8/FT4, JS8 and TUNE, packet flags its own keys,
+                    // and RADE voice is a modem too. COMP goes out first.
+                    if (ptt && (obj.digital || (this._rade.enabled && this._rade.modem)))
+                        this._holdCompressor();
+                    if (this._rade.enabled && this._rade.modem) {
+                        // RADE intercept: on PTT-off, ship the EOO frame
+                        // (carries the encoded callsign) before unkeying so
+                        // the receiving station can decode it. Mirrors
+                        // RadeProcessor::generateEooAudio + 300 ms unkey delay.
+                        if (ptt) {
+                            this._rade.txActive = true;
+                            this._rade.eooSent  = false;
+                            this.state.transmitting = true;
+                            this._enqueue('setPTT', civ.cmdSetPTT(true));
+                            this._emit('update', { transmitting: true });
+                        } else {
+                            this._radePttOff();
+                        }
+                        return;
+                    }
+                    this.state.transmitting = ptt;
+                    this._enqueue('setPTT', civ.cmdSetPTT(ptt));
+                    this._emit('update', { transmitting: ptt });
+                    if (!ptt) this._releaseCompressor();
+                    return;
+                case 'setPreamp':
+                    var pre = (typeof obj.value === 'number') ? obj.value : 0;
+                    this.state.preamp = pre;
+                    this._enqueue('setPreamp', civ.cmdSetPreamp(pre));
+                    this._emit('update', { preamp: pre });
+                    return;
+                case 'setBreakIn':
+                    // CW break-in, 0x16 0x47: same three-state shape as the preamp.
+                    if (!this._hasBreakIn) return;
+                    var bk = Math.max(0, Math.min(2, obj.value | 0));
+                    this.state.breakIn = bk;
+                    this._enqueue('setBreakIn', civ.cmdSetBreakIn(bk));
+                    this._emit('update', { breakIn: bk });
+                    return;
+                case 'setAttenuator':
+                    var att = (typeof obj.value === 'number') ? obj.value : 0;
+                    this.state.attenuator = att;
+                    this._enqueue('setAttenuator', civ.cmdSetAttenuator(att));
+                    this._emit('update', { attenuator: att });
+                    return;
+                case 'setAntenna':
+                    if (!this._antCmd) return;  // rig has no antenna selector
+                    var antSel = (typeof obj.antenna === 'number') ? obj.antenna : 0;
+                    var antRx = !!obj.rx;
+                    this.state.antenna = antSel;
+                    this.state.rxAntenna = antRx;
+                    this._enqueue('setAntenna',
+                        civ.cmdSetAntenna(this._antCmd, antSel, antRx, this._hasRxAnt));
+                    this._emit('update', { antenna: antSel, rxAntenna: antRx });
+                    return;
+                case 'selectVFO':
+                    if (obj.value === 'MEM') {
+                        // Memory mode — the front-panel V/M (bare CI-V 08) on
+                        // whatever channel the rig has current.
+                        if (!this._memCaps || !this._memCaps.hasMemoryMode) return;
+                        this._enqueue('memoryMode', civ.cmdMemoryMode());
+                        this._setSelectedVfo('MEM');
+                        this._enqueueMemReadback();
+                        return;
+                    }
+                    var vfo = (obj.value === 'B') ? 'B' : 'A';
+                    // Leaving memory mode on a cmd29 rig needs a real VFO-mode
+                    // select (bare 07) first: Main/Sub select alone does not
+                    // exit memory mode. On A/B rigs 07 00/01 exits it by itself.
+                    if (this.state.selectedVfo === 'MEM' && this._dualVfoMode === 'cmd29'
+                            && this._memCaps && this._memCaps.hasVfoModeSelect) {
+                        this._enqueue('vfoMode', civ.cmdVfoMode(this._memCaps.vfoModeCmd29));
+                    }
+                    var wasMem = this.state.selectedVfo === 'MEM';
+                    this._setSelectedVfo(vfo);
+                    this._enqueue('selectVFO', civ.cmdSelectVFO(vfo, this._dualVfoMode === 'cmd29'));
+                    // Re-pull both VFOs so the side display flips to the new
+                    // "other" VFO and the main display ends up matching the
+                    // rig. The 0x25 replies will land in
+                    // _applyVfoFreq and update the SPA.
+                    this._enqueueDualVfoReads();
+                    // Back from a memory channel the VFO's own mode / tone /
+                    // shift come back too — re-read them like a recall does.
+                    if (wasMem) this._enqueueMemReadback();
+                    return;
+                case 'swapVFO':
+                    this._enqueue('swapVFO', civ.cmdSwapVFO());
+                    // The browser already mirrors the swap on its local
+                    // vfoAFreq/vfoBFreq cache for instant UX. Re-pull both
+                    // VFOs so the rig's actual post-swap values overwrite
+                    // that optimistic guess once the round-trip completes.
+                    this._enqueueDualVfoReads();
+                    return;
+                case 'equalizeVFO':
+                    this._enqueue('equalizeVFO', civ.cmdEqualizeVFO(this._dualVfoMode === 'cmd29'));
+                    this._enqueueDualVfoReads();
+                    return;
+                case 'setTxMeter':
+                    // Which reading the SPA's second TX bar is showing. Only
+                    // Comp/Vd/Id cost an extra poll — SWR and ALC are already
+                    // read on every TX tick.
+                    this._txMeterKind = (obj.value === 'comp' || obj.value === 'vd'
+                                         || obj.value === 'id') ? obj.value : null;
+                    break;
+                case 'setSplit':
+                    var sp = !!obj.value;
+                    this.state.split = sp;
+                    this._enqueue('setSplit', civ.cmdSetSplit(sp));
+                    this._emit('update', { split: sp });
+                    return;
+                case 'setDuplex':
+                    // Shares CI-V 0x0F with split: the sub-command byte picks
+                    // simplex / DUP- / DUP+ instead of the split flag.
+                    var dp = obj.value === 'DUP-' || obj.value === 'DUP+' ? obj.value : 'OFF';
+                    this.state.duplex = dp;
+                    this._enqueue('setDuplex', civ.cmdSetDuplex(dp));
+                    this._emit('update', { duplex: dp });
+                    return;
+                case 'setDuplexOffset':
+                    var doff = Math.max(0, Math.round((obj.value || 0) / 100) * 100);
+                    this.state.duplexOffset = doff;
+                    this._enqueue('setDuplexOffset', civ.cmdSetDuplexOffset(doff));
+                    this._emit('update', { duplexOffset: doff });
+                    return;
+                case 'setToneMode':
+                    this._setToneMode(obj.value);
+                    return;
+                case 'setToneFreq':
+                    this._setToneValue('toneFreq', this._toneCmds.toneFreq, obj.value | 0, 0);
+                    return;
+                case 'setTsqlFreq':
+                    this._setToneValue('tsqlFreq', this._toneCmds.tsqlFreq, obj.value | 0, 0);
+                    return;
+                case 'setDtcsCode':
+                    this._setToneValue('dtcsCode', this._toneCmds.dtcsCode, obj.value | 0,
+                                       obj.polarity | 0);
+                    return;
+                case 'setTuner':
+                    if (!this._hasTuner) return;
+                    var tn = (typeof obj.value === 'number') ? obj.value : 0;
+                    this.state.tuner = tn;
+                    this._enqueue('setTuner', civ.cmdSetTuner(tn));
+                    this._emit('update', { tuner: tn });
+                    return;
+                case 'setPower':
+                    if (obj.value) {
+                        // Power-on needs the baud-dependent FE preamble to wake
+                        // the rig's CI-V receiver — bypass the normal builder
+                        // by enqueuing a pre-framed raw frame.
+                        this._enqueueRaw('setPower',
+                            civ.buildPowerOnFrame(this.civAddr, this.controllerAddr, this.baudRate));
+                        // Resume polling that was stopped on power-off and arm
+                        // the "rig is up" detector. Mirror wfweb's heuristic:
+                        // require 3 consecutive valid CI-V replies before
+                        // declaring power-on, so a stray frame during boot
+                        // doesn't trigger us before the rig is ready to
+                        // accept scope-enable commands.
+                        this._awaitingPowerOnRemaining = 3;
+                        this._startPolling();
+                    } else {
+                        this._enqueue('setPower', civ.cmdSetPower(false));
+                        // The rig is going dark — stop polling (otherwise
+                        // every 200 ms we queue queries to a dead radio) and
+                        // tell the UI so it can show the off-overlay. Wait
+                        // briefly for the off command to leave the wire.
+                        var self = this;
+                        setTimeout(function () {
+                            self._stopPolling();
+                            self._emit('update', { powerState: false });
+                        }, 800);
+                    }
+                    return;
+                case 'setSpan':
+                    var spIdx = (typeof obj.value === 'number') ? obj.value : -1;
+                    if (spIdx >= 0 && spIdx < DEFAULT_SPANS.length) {
+                        var spHz = DEFAULT_SPANS[spIdx].hz;
+                        this.state.spanIndex = spIdx;
+                        this._enqueue('setSpan', civ.cmdSetScopeSpan(spHz));
+                        this._emit('update', { spanIndex: spIdx });
+                    }
+                    return;
+                case 'setScopeRef':
+                    // Tenths of a dB; the SPA renders the shift itself, the
+                    // rig just gets the same value so its screen matches.
+                    if (typeof obj.value === 'number' && this._hasSpectrum)
+                        this._enqueue('setScopeRef', civ.cmdSetScopeRef(obj.value));
+                    return;
+                case 'setScopeSpeed':
+                    if (typeof obj.value === 'number' && this._hasSpectrum)
+                        this._enqueue('setScopeSpeed', civ.cmdSetScopeSpeed(obj.value));
+                    return;
+                case 'setScopeMode':
+                    // Center / Fixed / Scroll (issue #113). Same queue key as
+                    // the connect-time setup so a tap replaces a pending frame.
+                    if (typeof obj.value === 'number' && this._hasSpectrum)
+                        this._enqueue('scopeMode', civ.cmdSetScopeMode(obj.value));
+                    return;
+                case 'setScopeEdges': {
+                    // Fixed-mode window in Hz (issue #113): written into edge
+                    // set 3 of the frequency range that holds it, then that
+                    // set is selected. Same policy as the C++ server.
+                    var lo = obj.lower, hi = obj.upper;
+                    if (!this._hasSpectrum || typeof lo !== 'number' || typeof hi !== 'number' || !(hi > lo)) return;
+                    var ranges = (RIG_CAPS[this.civAddr] && RIG_CAPS[this.civAddr].scopeEdgeRanges) || [];
+                    for (var ri = 0; ri < ranges.length; ri++) {
+                        if (lo >= ranges[ri].minFreq && hi <= ranges[ri].maxFreq) {
+                            this._enqueue('scopeEdges', civ.cmdSetScopeFixedEdges(ranges[ri].num, 3, lo, hi));
+                            this._enqueue('scopeEdge', civ.cmdSetScopeEdge(3));
+                            return;
+                        }
+                    }
+                    return;
+                }
+                case 'sendCW': {
+                    if (!this._rigCanTransmit()) return;
+                    if (typeof obj.text !== 'string' || !obj.text.length) return;
+                    // One frame per <= 30-char piece, each under its own key:
+                    // a shared key would let a piece still in the queue be
+                    // overwritten by the next one.
+                    var cwPieces = civ.splitCWText(obj.text, 30);
+                    for (var cp = 0; cp < cwPieces.length; cp++)
+                        this._enqueue('sendCW:' + (++cwFrameSeq), civ.cmdSendCW(cwPieces[cp]));
+                    // The rig auto-keys to send the CW buffer; we never issue a
+                    // PTT command, so flip transmitting optimistically to switch
+                    // the meter UI to power/SWR and start polling TX meters
+                    // immediately. The PTT poll added below detects auto-unkey.
+                    if (!this.state.transmitting) {
+                        this.state.transmitting = true;
+                        this._emit('update', { transmitting: true });
+                    }
+                    return;
+                }
+                case 'stopCW':
+                    if (!this._rigCanTransmit()) return;
+                    this._enqueue('stopCW', civ.cmdStopCW());
+                    return;
+                case 'packetEnable':
+                    if (!this._rigCanTransmit()) return;
+                    this._packetSetEnabled(!!obj.value);
+                    return;
+                case 'packetSetMode':
+                    if (!this._rigCanTransmit()) return;
+                    this._packetSetMode(obj.value | 0);
+                    return;
+                case 'aprsTxBeacon':
+                    if (!this._rigCanTransmit()) return;
+                    this._packetTxBeacon(obj);
+                    return;
+                case 'aprsBeaconConfig':
+                    // Periodic beacon scheduler — feed straight into the
+                    // AprsProcessor's setBeaconConfig. The processor's
+                    // 'txBeacon' event lands in _packetTxBeacon (wired
+                    // when the modem loads), so periodic beacons take the
+                    // same TX path as the one-shot button.
+                    this._packetEnsureModem().then((m) => {
+                        m._aprsProc.setBeaconConfig({
+                            enabled: !!obj.enabled,
+                            intervalSec: obj.intervalSec | 0,
+                            src: obj.src, lat: obj.lat, lon: obj.lon,
+                            symTable: obj.symTable, symCode: obj.symCode,
+                            comment: obj.comment, path: obj.path,
+                        });
+                    }).catch(function (err) {
+                        console.error('aprsBeaconConfig: modem load failed:', err);
+                    });
+                    return;
+                case 'aprsClearStations':
+                    if (this._packet.aprsProc) {
+                        this._packet.aprsProc.clearStations();
+                        // Echo an empty snapshot so the SPA's heard list
+                        // re-renders to nothing immediately.
+                        this._emit('message', this._packet.aprsProc.snapshot());
+                    }
+                    return;
+                case 'termList':       this._termList();             return;
+                case 'termRegister':   this._termRegister(obj);      return;
+                case 'termConnect':
+                    if (!this._rigCanTransmit()) return;
+                    this._termConnect(obj);                          return;
+                case 'termDisconnect': this._termDisconnect(obj);    return;
+                case 'termSend':
+                    if (!this._rigCanTransmit()) return;
+                    this._termSend(obj);                             return;
+                case 'termHistory':    this._termHistory(obj);       return;
+                case 'setRadeMode':
+                    if (obj.value) {
+                        this._radeEnable().catch(function (err) {
+                            console.error('SerialRigTransport: rade enable failed:', err);
+                        });
+                    } else {
+                        this._radeDisable();
+                    }
+                    return;
+                case 'setRadeCallsign':
+                    this._rade.callsign = String(obj.value || '').toUpperCase().trim();
+                    if (this._rade.modem && this._rade.callsign) {
+                        this._rade.modem.setTxCallsign(this._rade.callsign);
+                    }
+                    return;
+                case 'enableAudio':
+                    if (obj.value) {
+                        this._startRxAudio().catch(function (err) {
+                            console.error('SerialRigTransport: enableAudio failed:', err);
+                        });
+                    } else {
+                        this._stopRxAudio().catch(function () {});
+                    }
+                    return;
+                case 'enableMic':
+                    // Re-assert USB as the modulation source. The registers
+                    // are already set at connect and stay on USB for the
+                    // whole session (restored only on disconnect), but the
+                    // user may have twiddled the rig menu in between —
+                    // mic-on is the moment it must be right.
+                    if (!this._rigCanTransmit() || !obj.value) return;
+                    this._setModInput('setDataOffMod', this._modIn.off, this._modIn.usbReg);
+                    this._setModInput('setDataMod', this._modIn.data1, this._modIn.usbReg);
+                    return;
+                case 'getMemories':
+                    this._memScanStart(obj);
+                    return;
+                case 'writeMemory':
+                    this._memWrite(obj);
+                    return;
+                case 'clearMemory':
+                    this._memClear(obj);
+                    return;
+                case 'recallMemory':
+                    this._memRecall(obj);
+                    return;
+                case 'renameMemory':
+                    this._memRename(obj);
+                    return;
+                default:
+                    return;
+            }
+        }
+
+        sendAudioFrame(buffer) {
+            // Frame format: [0x03][0x00][seq u16LE][rsv u16LE][PCM Int16 LE]
+            if (!buffer || buffer.byteLength < 8) return;
+            var view = new DataView(buffer);
+            if (view.getUint8(0) !== 0x03) return;
+
+            // Lazy-init the TX context the first time we get audio. The
+            // SPA fires this from a user gesture (PTT click, FT8 TX click,
+            // mic click) so AudioContext + setSinkId calls are allowed.
+            var self = this;
+            if (!this._txAudio.ctx) {
+                this._ensureTxAudioCtx().catch(function (e) {
+                    console.error('SerialRigTransport: TX audio init failed:', e);
+                });
+                return;  // drop this chunk; subsequent chunks will play
+            }
+            if (!this._txAudio.node) return;
+
+            // RADE intercept: while RADE TX is live, divert mic samples
+            // through rade.processTx — its 'txReady' listener writes the
+            // encoded modem audio into the same playback worklet, so the
+            // post-encode path is identical. Skip the raw-mic playback
+            // below otherwise the rig would see voice + modem on top of
+            // each other.
+            if (this._rade.enabled && this._rade.txActive && this._rade.modem) {
+                var int16Mic = new Int16Array(buffer, 6);
+                try { this._rade.modem.processTx(int16Mic); }
+                catch (err) { console.warn('rade processTx:', err); }
+                return;
+            }
+
+            // Single-writer rule: modem-generated audio (FT8/JS8/tune
+            // pacers, packet bursts) tags byte 1 with 0x01; mic frames are
+            // untagged. While a tagged stream is flowing, drop untagged
+            // frames — otherwise a still-streaming mic queues its chunks
+            // between the modem's in the same playback worklet and garbles
+            // the transmission.
+            var isModem = (view.getUint8(1) & 0x01) !== 0;
+            var nowMs = performance.now();
+            var burstStart = false;
+            if (isModem) {
+                burstStart = !this._modemAudioMs || nowMs - this._modemAudioMs >= 300;
+                this._modemAudioMs = nowMs;
+            } else if (this._modemAudioMs && nowMs - this._modemAudioMs < 300) {
+                return;
+            }
+
+            // Convert Int16 PCM to Float32 [-1..1] for the playback worklet.
+            var int16 = new Int16Array(buffer, 6);
+            var f32 = new Float32Array(int16.length);
+            for (var i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+            try {
+                // A new modem burst flushes whatever is still queued (any
+                // residual voice backlog) so the burst starts clean and
+                // on time; voice frames are tagged so the worklet can cap
+                // their queued depth at ~250 ms.
+                if (burstStart) this._txAudio.node.port.postMessage({ cmd: 'flush' });
+                this._txAudio.node.port.postMessage({ pcm: f32, voice: !isModem });
+            } catch (e) {
+                /* node may have been closed mid-call */
+            }
+        }
+
+        async _ensureTxAudioCtx() {
+            if (this._txAudio.ctx) return;
+            if (this._txAudio.initPromise) return this._txAudio.initPromise;
+            var self = this;
+            this._txAudio.initPromise = (async function () {
+                var ctx = new AudioContext({ sampleRate: 48000 });
+
+                // Pick the rig USB audio output device. Use a saved id if
+                // available; otherwise look for a label that matches the
+                // rig family. The user must have already granted audio
+                // permission via RX audio for labels to be readable.
+                var deviceId = null;
+                try { deviceId = localStorage.getItem('directTxAudioId'); } catch (e) { /* ignore */ }
+                if (!deviceId) {
+                    try {
+                        var devices = await navigator.mediaDevices.enumerateDevices();
+                        for (var i = 0; i < devices.length; i++) {
+                            var d = devices[i];
+                            if (d.kind === 'audiooutput' && RIG_AUDIO_PATTERN.test(d.label)) {
+                                deviceId = d.deviceId;
+                                console.log('SerialRigTransport: using TX audio device:', d.label);
+                                try { localStorage.setItem('directTxAudioId', deviceId); } catch (e) { /* ignore */ }
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Could not enumerate audio devices for TX:', e);
+                    }
+                }
+                self._txAudio.deviceId = deviceId;
+
+                if (deviceId && typeof ctx.setSinkId === 'function') {
+                    try {
+                        await ctx.setSinkId(deviceId);
+                    } catch (e) {
+                        console.warn('AudioContext.setSinkId failed:', e);
+                    }
+                }
+                // Chromium creates AudioContexts in 'suspended' state until a
+                // user gesture; without resume() the worklet never runs and
+                // the rig hears silence. PTT firing in FT8 (control-plane
+                // gesture) doesn't auto-resume an unrelated context.
+                if (ctx.state === 'suspended') {
+                    try { await ctx.resume(); } catch (e) {
+                        console.warn('AudioContext.resume failed:', e);
+                    }
+                }
+
+                // Playback worklet: ring buffer fed by main-thread postMessage.
+                // 10 s capacity so a whole modem burst (300 bd beacons are
+                // ~2.3 s, YAPP frames longer) queues without overwriting its
+                // own head.  Voice (mic) audio is latency-capped instead:
+                // the mic streams continuously in RX and its clock is not
+                // the codec's clock, so an uncapped ring slowly accumulates
+                // a permanent voice backlog — which then plays out FIRST
+                // when a modem burst keys the rig ("mic audio transmitted
+                // during FT8/packet TX").  Messages: {cmd:'flush'} empties
+                // the ring; {pcm, voice} queues audio (voice dropped when
+                // more than 250 ms is already buffered); a bare Float32Array
+                // is treated as modem audio for backward compatibility.
+                var workletCode =
+                    'class TxPlayback extends AudioWorkletProcessor {' +
+                    '  constructor() {' +
+                    '    super();' +
+                    '    this.buffer = new Float32Array(sampleRate * 10);' +
+                    '    this.voiceCap = sampleRate * 0.25;' +
+                    '    this.writePos = 0; this.readPos = 0; this.buffered = 0;' +
+                    '    this.port.onmessage = (e) => {' +
+                    '      var d = e.data;' +
+                    '      if (d && d.cmd === "flush") { this.readPos = this.writePos; this.buffered = 0; return; }' +
+                    '      var s = (d && d.pcm) ? d.pcm : d;' +
+                    '      if (d && d.voice && this.buffered > this.voiceCap) return;' +
+                    '      var len = s.length; var bufLen = this.buffer.length;' +
+                    '      for (var i = 0; i < len; i++) { this.buffer[this.writePos] = s[i]; this.writePos = (this.writePos + 1) % bufLen; }' +
+                    '      this.buffered += len; if (this.buffered > bufLen) this.buffered = bufLen;' +
+                    '    };' +
+                    '  }' +
+                    '  process(inputs, outputs) {' +
+                    '    var output = outputs[0][0]; if (!output) return true;' +
+                    '    var bufLen = this.buffer.length;' +
+                    '    for (var i = 0; i < output.length; i++) {' +
+                    '      if (this.buffered > 0) { output[i] = this.buffer[this.readPos]; this.readPos = (this.readPos + 1) % bufLen; this.buffered--; }' +
+                    '      else { output[i] = 0; }' +
+                    '    }' +
+                    '    return true;' +
+                    '  }' +
+                    '}' +
+                    'registerProcessor("wfweb-tx-playback", TxPlayback);';
+                var url = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+                await ctx.audioWorklet.addModule(url);
+                URL.revokeObjectURL(url);
+
+                var node = new AudioWorkletNode(ctx, 'wfweb-tx-playback');
+                node.connect(ctx.destination);
+
+                self._txAudio.ctx = ctx;
+                self._txAudio.node = node;
+                console.log('SerialRigTransport: TX audio ready — sinkId=' +
+                    (ctx.sinkId || '(default)') + ', deviceId=' +
+                    (deviceId ? deviceId.slice(0, 12) + '…' : '(none)') +
+                    ', state=' + ctx.state);
+            })();
+            // Clear the cached promise on failure so the next call (which
+            // will hopefully arrive from a real user gesture) gets a fresh
+            // attempt instead of awaiting a permanently-rejected promise.
+            this._txAudio.initPromise.catch(function () {
+                if (!self._txAudio.ctx) self._txAudio.initPromise = null;
+            });
+            return this._txAudio.initPromise;
+        }
+
+        async _stopTxAudio() {
+            if (this._txAudio.node) {
+                try { this._txAudio.node.disconnect(); } catch (e) { /* ignore */ }
+                this._txAudio.node = null;
+            }
+            if (this._txAudio.ctx) {
+                try { await this._txAudio.ctx.close(); } catch (e) { /* ignore */ }
+                this._txAudio.ctx = null;
+            }
+            this._txAudio.initPromise = null;
+        }
+
+        // ----------------------------------------------------------------
+        // Detection + open
+        // ----------------------------------------------------------------
+
+        async _openWithDetection(port) {
+            // Optimistic path: we have saved baud/addr from a previous
+            // successful connect — try those first.
+            var savedBaud = this.baudRate;
+            var savedAddr = this.civAddr;
+
+            if (savedBaud) {
+                this.onProgress({ stage: 'opening', baud: savedBaud });
+                try {
+                    await port.open({
+                        baudRate: savedBaud, dataBits: 8, stopBits: 1,
+                        parity: 'none', flowControl: 'none',
+                    });
+                } catch (e) {
+                    throw new Error('Could not open serial port (' +
+                        (e && e.message ? e.message : e) + '). Is another program using it?');
+                }
+                var addr = await this._probePort(port, PROBE_TIMEOUT_MS);
+                if (addr) {
+                    this._finalizeDetection(port, savedBaud, addr);
+                    return;
+                }
+                // Saved baud didn't elicit a reply — fall through to full probe.
+                try { await port.close(); } catch (e) { /* ignore */ }
+            }
+
+            // Full auto-detect across PROBE_BAUDS. Saved baud (if any) tried
+            // first since the user almost certainly hasn't changed it.
+            var bauds = savedBaud
+                ? [savedBaud].concat(PROBE_BAUDS.filter(function (b) { return b !== savedBaud; }))
+                : PROBE_BAUDS.slice();
+
+            for (var i = 0; i < bauds.length; i++) {
+                var baud = bauds[i];
+                this.onProgress({ stage: 'probing', baud: baud, attempt: i + 1, total: bauds.length });
+                try {
+                    await port.open({
+                        baudRate: baud, dataBits: 8, stopBits: 1,
+                        parity: 'none', flowControl: 'none',
+                    });
+                } catch (e) {
+                    if (i === 0) {
+                        throw new Error('Could not open serial port (' +
+                            (e && e.message ? e.message : e) + '). Is another program using it?');
+                    }
+                    continue;
+                }
+                var found = await this._probePort(port, PROBE_TIMEOUT_MS);
+                if (found) {
+                    this._finalizeDetection(port, baud, found);
+                    return;
+                }
+                try { await port.close(); } catch (e) { /* ignore */ }
+            }
+
+            // Last resort: nothing replied at any baud. If we have saved
+            // baud/addr, the rig is most likely powered off — send the
+            // wake-up preamble + power-on at the saved baud, give the rig
+            // time to boot, and probe one more time.
+            if (savedBaud && savedAddr) {
+                this.onProgress({ stage: 'wakingRadio', baud: savedBaud });
+                var openedForWake = false;
+                try {
+                    await port.open({
+                        baudRate: savedBaud, dataBits: 8, stopBits: 1,
+                        parity: 'none', flowControl: 'none',
+                    });
+                    openedForWake = true;
+                    var w = port.writable.getWriter();
+                    try {
+                        await w.write(civ.buildPowerOnFrame(savedAddr, this.controllerAddr, savedBaud));
+                    } finally {
+                        w.releaseLock();
+                    }
+                    // The rig is silent during boot, so wait first and then
+                    // poll: firing probes during early boot is wasted, but
+                    // once the CI-V receiver is up it replies immediately.
+                    // Total budget ~7 s of polling — exits as soon as the
+                    // rig answers.
+                    await new Promise(function (r) { setTimeout(r, 1500); });
+                    var deadline = Date.now() + 7000;
+                    var wokenAddr = null;
+                    while (Date.now() < deadline) {
+                        wokenAddr = await this._probePort(port, PROBE_TIMEOUT_MS);
+                        if (wokenAddr) break;
+                    }
+                    if (wokenAddr) {
+                        this._finalizeDetection(port, savedBaud, wokenAddr);
+                        return;
+                    }
+                } catch (e) { /* fall through */ }
+                if (openedForWake) {
+                    try { await port.close(); } catch (e) { /* ignore */ }
+                }
+            }
+
+            throw new Error('No CI-V reply at any common baud rate. ' +
+                'Check the radio is on, CI-V is enabled, and the cable is connected to the correct port.');
+        }
+
+        // Sends a broadcast read-TX-ID on an already-open port and listens
+        // up to timeoutMs for a reply. Returns the rig's CI-V address (the
+        // 'from' byte of the first reply frame), or null on timeout.
+        async _probePort(port, timeoutMs) {
+            if (!port) return null;
+            // Send probe frame
+            var writer = port.writable.getWriter();
+            try {
+                await writer.write(civ.PROBE_FRAME);
+            } catch (e) {
+                writer.releaseLock();
+                return null;
+            }
+            writer.releaseLock();
+
+            // Listen until timeout or first non-echo frame.
+            var localParser = new civ.CivParser({ controllerAddr: this.controllerAddr });
+            var detected = null;
+            localParser.onFrame = function (frame) {
+                if (!detected && frame.payload && frame.payload[0] === 0x19) {
+                    detected = frame.from;
+                }
+            };
+
+            var reader = port.readable.getReader();
+            var aborted = false;
+            var timer = setTimeout(function () {
+                aborted = true;
+                reader.cancel().catch(function () {});
+            }, timeoutMs);
+
+            try {
+                while (!detected && !aborted) {
+                    var result = await reader.read();
+                    if (result.done) break;
+                    if (result.value && result.value.length) localParser.feed(result.value);
+                }
+            } catch (e) { /* expected on cancel */ }
+
+            clearTimeout(timer);
+            try { reader.releaseLock(); } catch (e) { /* ignore */ }
+            return detected;
+        }
+
+        _finalizeDetection(port, baud, addr) {
+            this.baudRate = baud;
+            this.civAddr = addr;
+            this._modIn = civ.getRigModInputs(addr);
+            this._dualVfoMode = _dualVfoModeFor(addr);
+            // Antenna selector caps (#76) — per-rig command bytes + antenna
+            // list from the registry; empty/null on single-antenna rigs.
+            var capsEntry = RIG_CAPS[addr];
+            this._antCmd = (capsEntry && capsEntry.cmds && capsEntry.cmds.antenna) || null;
+            this._antennas = (capsEntry && capsEntry.antennas) || [];
+            this._hasRxAnt = !!(capsEntry && capsEntry.cmds && capsEntry.cmds.rxAntenna)
+                && this._antennas.length > 0;
+            this._hasDuplex = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasDuplex);
+            this._hasTuner = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasTuner);
+            this._hasBreakIn = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasBreakIn);
+            this._hasCompressor = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasCompressor);
+            this._hasCompLevel = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasCompLevel);
+            this._hasSpectrum = !!(capsEntry && capsEntry.caps && capsEntry.caps.hasSpectrum);
+            // Keyer speed span of 0x14 0x0C's 0..255 (6-48 WPM on most Icoms,
+            // 6-60 on the IC-7600 family), from the rig file (#141).
+            var ksc = (capsEntry && capsEntry.caps) || {};
+            this._keySpeedRange = (ksc.keySpeedMax > ksc.keySpeedMin) ? { min: ksc.keySpeedMin, max: ksc.keySpeedMax } : { min: 6, max: 48 };
+            // Memory channels (#92): V/M switch, addressing range, group
+            // handling. Same facts webserver.cpp pulls from rigCaps.
+            var mc = (capsEntry && capsEntry.caps) || {};
+            var mcmds = (capsEntry && capsEntry.cmds) || {};
+            this._memCaps = {
+                hasMemoryMode: !!mc.hasMemoryMode,
+                memGroups: mc.memGroups | 0,
+                memStart: (mc.memStart === undefined) ? 1 : (mc.memStart | 0),
+                memMax: mc.memMax | 0,
+                hasGroupCmd: !!mcmds.memoryGroup,
+                hasVfoModeSelect: !!mcmds.vfoModeSelect,
+                vfoModeCmd29: !!mc.vfoModeSelectCmd29,
+            };
+            this._memCache = {};
+            var toneCmds = (capsEntry && capsEntry.cmds) || {};
+            this._toneCmds = {
+                sqlType:   toneCmds.toneSqlType || null,
+                rptTone:   toneCmds.rptTone   || null,
+                rptTsql:   toneCmds.rptTsql   || null,
+                rptDtcs:   toneCmds.rptDtcs   || null,
+                toneFreq:  toneCmds.toneFreq  || null,
+                tsqlFreq:  toneCmds.tsqlFreq  || null,
+                dtcsCode:  toneCmds.dtcsCode  || null,
+                sqlStatus: toneCmds.sqlStatus || null,
+            };
+            lsSetInt('directBaudRate', baud);
+            lsSetInt('directCivAddr', addr);
+
+            this.port = port;
+            this.writer = port.writable.getWriter();
+            this._open = true;
+
+            this.onProgress({
+                stage: 'connected', baud: baud, civAddr: addr,
+                model: rigDisplayName(addr),
+            });
+
+            this._readLoop().catch((err) => {
+                console.error('SerialRigTransport read loop ended:', err);
+                this._notifyClose(err);
+            });
+
+            this.dispatchEvent(new Event('open'));
+            this._emitRigInfo();
+
+            // Initial reads — freq / mode / ptt / s-meter.
+            this._enqueue('readFreq',   civ.cmdReadFrequency());
+            this._enqueueDualVfoReads();
+            this._enqueue('readMode',   civ.cmdReadMode());
+            this._enqueue('readPTT',    civ.cmdReadPTT());
+            this._enqueue('readSMeter', civ.cmdReadSMeter());
+
+            // Initial reads — analog levels (so the UI sliders show the
+            // rig's current values rather than zeros).
+            for (var cmdName in ANALOG_SUB) {
+                if (cmdName === 'setCWSpeed') continue;  // CW speed is rare; skip
+                if (cmdName === 'setCompLevel' && !this._hasCompLevel) continue;
+                var sub = ANALOG_SUB[cmdName];
+                this._enqueue('read_' + cmdName, civ.cmdReadAnalogLevel(sub));
+            }
+            // CW pitch, for the browser sidetone (no set command: it is the rig's).
+            this._enqueue('read_cwPitch', civ.cmdReadAnalogLevel(0x09));
+
+            // Initial reads — bool toggles + multi-state preamp.
+            for (var cmdName2 in BOOL_SUB) {
+                if (cmdName2 === 'setCompressor' && !this._hasCompressor) continue;
+                this._enqueue('read_' + cmdName2, civ.cmdReadBoolFunc(BOOL_SUB[cmdName2]));
+            }
+            this._enqueue('readPreamp',     civ.cmdReadBoolFunc(0x02));
+            this._enqueue('readAttenuator', civ.cmdReadAttenuator());
+            if (this._antCmd && this._antennas.length) {
+                this._enqueue('readAntenna', civ.cmdReadAntenna(this._antCmd));
+            }
+            this._enqueue('readSplit',      civ.cmdReadSplit());
+            if (this._hasDuplex) this._enqueue('readDuplexOffset', civ.cmdReadDuplexOffset());
+            if (this._hasTuner) this._enqueue('readTuner', civ.cmdReadTuner());
+            if (this._hasBreakIn) this._enqueue('readBreakIn', civ.cmdReadBreakIn());
+            this._enqueueToneReads();
+            this._enqueue('readScopeSpan',  civ.cmdReadScopeSpan());
+            // Mod inputs: read the user's current settings first (the
+            // replies become the restore-on-disconnect baseline), then
+            // switch both registers to USB for the whole session — the
+            // browser streams all TX audio (voice, digi, packet) over the
+            // USB audio interface, so any other source means silent TX
+            // (issue #79). The originals are put back in close().
+            if (this._rigCanTransmit()) {
+                this._enqueue('readDataOffMod', civ.cmdReadModInput(this._modIn.off));
+                this._enqueue('readDataMod',    civ.cmdReadModInput(this._modIn.data1));
+                this._setModInput('setDataOffMod', this._modIn.off, this._modIn.usbReg);
+                this._setModInput('setDataMod', this._modIn.data1, this._modIn.usbReg);
+            }
+            this._enqueue('readFilterWidth', civ.cmdReadFilterWidth());
+            this._enqueue('readFilterShape', civ.cmdReadBoolFunc(0x56));
+
+            this._enqueueScopeSetup();
+
+            this._startPolling();
+            this._applyFirstRunDefaults();
+        }
+
+        // First-run gain defaults — push sensible levels so a freshly-bought
+        // (or freshly-reset) rig doesn't come up with RF gain at 0% and look
+        // like a dead receiver. Applied exactly once per browser; user
+        // adjustments after that are never overridden.
+        //
+        // Deferred via setTimeout so the initial 0x14 NN level reads above
+        // come back first — otherwise their replies would land after our SETs
+        // and overwrite the defaults back to the rig's old values.
+        _applyFirstRunDefaults() {
+            if (lsGetInt('directInitialDefaultsApplied') === 1) return;
+            var self = this;
+            setTimeout(function () {
+                if (!self._open) return;
+                if (lsGetInt('directInitialDefaultsApplied') === 1) return;
+                var defaults = [
+                    ['setAfGain',  Math.round(255 * 0.20)],  // 20%
+                    ['setRfGain',  255],                     // 100%
+                    ['setMicGain', Math.round(255 * 0.75)],  // 75%
+                    ['setSquelch', 0],                       // 0%
+                ];
+                for (var i = 0; i < defaults.length; i++) {
+                    self.sendCommand({ cmd: defaults[i][0], value: defaults[i][1] });
+                }
+                lsSetInt('directInitialDefaultsApplied', 1);
+            }, 800);
+        }
+
+        // ----------------------------------------------------------------
+        // Internals (queue, read loop, parsing, polling)
+        // ----------------------------------------------------------------
+
+        _enqueue(key, payload) {
+            this._payloads[key] = payload;
+            if (this._queue.indexOf(key) === -1) this._queue.push(key);
+            this._drain();
+        }
+
+        // Pull both VFOs / receivers so the SPA's side display ("---.---.---")
+        // gets populated on initial connect. The plain 0x03 read above only
+        // returns the currently-selected VFO; this covers the OTHER one. On
+        // single-VFO rigs we skip — there's nothing to read.
+        _enqueueDualVfoReads() {
+            if (this._dualVfoMode === 'cmd29') {
+                this._enqueue('readMainFreq', civ.cmdReadMainFreq());
+                this._enqueue('readSubFreq',  civ.cmdReadSubFreq());
+            } else if (this._dualVfoMode === 'selectedUnselected') {
+                this._enqueue('readSelectedFreq',   civ.cmdReadSelectedFreq());
+                this._enqueue('readUnselectedFreq', civ.cmdReadUnselectedFreq());
+            }
+        }
+
+        // Like _enqueue, but the bytes are written verbatim instead of being
+        // wrapped by buildFrame. Used for the power-on wake-up frame (which
+        // needs a long FE preamble that must precede the FE FE addr ctrl ...
+        // start-of-frame).
+        _enqueueRaw(key, frameBytes) {
+            this._payloads[key] = { __raw: frameBytes };
+            if (this._queue.indexOf(key) === -1) this._queue.push(key);
+            this._drain();
+        }
+
+        async _drain() {
+            if (this._draining || !this._open) return;
+            this._draining = true;
+            try {
+                while (this._queue.length > 0 && this._open && this.writer) {
+                    var key = this._queue.shift();
+                    var payload = this._payloads[key];
+                    delete this._payloads[key];
+                    if (!payload) continue;
+                    var frame = payload.__raw
+                        ? payload.__raw
+                        : civ.buildFrame(this.civAddr, this.controllerAddr, payload);
+                    await this.writer.write(frame);
+                    await new Promise(function (r) { setTimeout(r, 5); });
+                }
+            } catch (err) {
+                console.error('SerialRigTransport drain error:', err);
+                this._notifyClose(err);
+            } finally {
+                this._draining = false;
+            }
+        }
+
+        // Queue a MOD INPUT register write, refusing network (WLAN/LAN)
+        // values: the browser has no network audio path to the rig, so a
+        // network mod input always means silent TX. Standalone must never
+        // select one no matter what the caps table says (issue #79).
+        _setModInput(key, prefix, reg) {
+            if (prefix == null || reg == null) return;
+            if (this._modIn.netRegs && this._modIn.netRegs.indexOf(reg) !== -1) {
+                console.warn('SerialRigTransport: refusing to set mod input to network source 0x'
+                    + reg.toString(16) + ' (' + key + ')');
+                return;
+            }
+            this._enqueue(key, civ.cmdSetModInput(prefix, reg));
+        }
+
+        // Put both mod-input registers back to the values the rig had
+        // before we touched them (captured by the connect-time reads).
+        // Only runs on disconnect: close() clears the command queue, so
+        // the restore frames go straight to the port (best-effort,
+        // deadline-guarded). Never restores a network (WLAN/LAN) value.
+        async _restoreModInputsDirect() {
+            if (!this.writer || !this._modIn) return;
+            var regs = [
+                [this._modIn.off,   this._savedDataOffMod],
+                [this._modIn.data1, this._savedDataMod],
+            ];
+            for (var i = 0; i < regs.length; i++) {
+                var prefix = regs[i][0], v = regs[i][1];
+                if (prefix == null || v === null) continue;
+                if (this._modIn.netRegs && this._modIn.netRegs.indexOf(v) !== -1) continue;
+                try {
+                    var frame = civ.buildFrame(this.civAddr, this.controllerAddr,
+                        civ.cmdSetModInput(prefix, v));
+                    await withDeadline(this.writer.write(frame), 1000, 'Mod-input restore write');
+                    await new Promise(function (r) { setTimeout(r, 20); });
+                } catch (e) { /* best effort — the link may already be gone */ }
+            }
+            this._savedDataOffMod = null;
+            this._savedDataMod = null;
+        }
+
+        async _readLoop() {
+            var port = this.port;
+            if (!port || !port.readable) return;
+            while (this._open && port.readable) {
+                var reader = port.readable.getReader();
+                this.reader = reader;
+                try {
+                    while (true) {
+                        var res = await reader.read();
+                        if (res.done) break;
+                        if (res.value && res.value.length) this.parser.feed(res.value);
+                    }
+                } finally {
+                    try { reader.releaseLock(); } catch (e) { /* ignore */ }
+                    this.reader = null;
+                }
+                if (!this._open) break;
+                await new Promise(function (r) { setTimeout(r, 50); });
+            }
+        }
+
+        _onFrame(frame) {
+            var payload = frame.payload;
+            if (!payload || payload.length === 0) return;
+
+            // After a power-on attempt, wait for 3 consecutive valid CI-V
+            // replies before declaring the rig back up — early-boot noise
+            // and stray frames before the scope subsystem is ready can fool
+            // a single-frame trigger. Once confirmed, tell the UI and
+            // re-enable scope output (the rig forgets it across a power
+            // cycle, so without this the waterfall stays frozen).
+            if (this._awaitingPowerOnRemaining > 0) {
+                this._awaitingPowerOnRemaining--;
+                if (this._awaitingPowerOnRemaining === 0) {
+                    this._emit('update', { powerState: true });
+                    this._enqueueScopeSetup();
+                }
+            }
+
+            // Spectrum scope (0x27 0x00) — assembled across multiple frames,
+            // emitted to the SPA as a binary 0x01 message when complete.
+            if (payload.length >= 2 && payload[0] === 0x27 && payload[1] === 0x00) {
+                this._handleScopeFrame(payload);
+                return;
+            }
+
+            // Scope center-span (0x27 0x15) — single frame, used to surface
+            // the rig's current span to the SPA's SPAN button.
+            if (payload.length >= 6 && payload[0] === 0x27 && payload[1] === 0x15) {
+                var spanHz = civ.parseScopeSpanReply(payload);
+                if (spanHz !== null) {
+                    var idx = -1;
+                    for (var k = 0; k < DEFAULT_SPANS.length; k++) {
+                        if (DEFAULT_SPANS[k].hz === spanHz) { idx = k; break; }
+                    }
+                    if (idx >= 0 && this.state.spanIndex !== idx) {
+                        this.state.spanIndex = idx;
+                        this._emit('update', { spanIndex: idx });
+                    }
+                }
+                return;
+            }
+
+            // Cmd29 freq reply (Main/Sub rigs — IC-7610 / IC-785x / IC-7760).
+            // Must be tried BEFORE the plain 0x03 / 0x25 parsers because the
+            // 0x29 prefix wraps a payload that would otherwise look like one
+            // of those.
+            var c29 = civ.parseCmd29FreqReply(payload);
+            if (c29 !== null && c29.hz > 0) {
+                this._lastFreqStamp = Date.now();
+                this._applyVfoFreq(c29.receiver === 1 ? 'B' : 'A', c29.hz, false);
+                return;
+            }
+
+            // Blank memory channel: the rig answers the freq / mode reads
+            // with a lone 0xFF. Report null so the SPA draws dashes instead
+            // of keeping the previous channel's values on screen.
+            var blank = civ.parseBlankReply(payload);
+            if (blank !== null) {
+                if (blank === 'freq') {
+                    this._lastFreqStamp = Date.now();
+                    if (this.state.frequency !== null) {
+                        this.state.frequency = null;
+                        this._emit('update', { frequency: null });
+                    }
+                } else {
+                    this._lastModeStamp = Date.now();
+                    if (this.state.mode !== null) {
+                        this.state.mode = null;
+                        this._emit('update', { mode: null });
+                    }
+                }
+                return;
+            }
+
+            var inMem = this.state.selectedVfo === 'MEM';
+
+            // Selected/Unselected freq reply (A/B-VFO rigs — IC-7300 etc.).
+            // selected=true is the rig's currently-selected VFO; selected=false
+            // is the OTHER one. We pair this with our local selectedVfo
+            // tracking to map back to the A/B labels the SPA expects. In
+            // memory mode the selected side is the recalled channel — it must
+            // not land in either VFO's cache slot — and the "unselected" read
+            // answers with the channel too (IC-7300, measured), so it says
+            // nothing about the other VFO and is dropped.
+            var su = civ.parseSelectedUnselectedFreqReply(payload);
+            if (su !== null && su.hz > 0) {
+                this._lastFreqStamp = Date.now();
+                if (this._dualVfoMode === 'cmd29') {
+                    // Main/Sub rigs: the byte is the band, not "selected".
+                    // 0x00 is always Main ('A'), 0x01 always Sub ('B'). In
+                    // memory mode the operating band shows the recalled
+                    // channel and belongs to neither VFO slot.
+                    var band = su.selected ? 'A' : 'B';
+                    var operating = inMem ? this._lastRealVfo : (this.state.selectedVfo || 'A');
+                    if (inMem) {
+                        if (band === operating) this._applyMemFreq(su.hz);
+                        return;
+                    }
+                    this._applyVfoFreq(band, su.hz, band === operating);
+                    return;
+                }
+                if (inMem) {
+                    if (su.selected) this._applyMemFreq(su.hz);
+                    return;
+                }
+                var sel = this.state.selectedVfo || 'A';
+                var which = su.selected ? sel : (sel === 'A' ? 'B' : 'A');
+                this._applyVfoFreq(which, su.hz, su.selected);
+                return;
+            }
+
+            var freqHz = civ.parseFrequencyReply(payload);
+            if (freqHz !== null && freqHz > 0) {
+                this._lastFreqStamp = Date.now();
+                if (inMem) { this._applyMemFreq(freqHz); return; }
+                // Plain 0x03 / 0x00 reply: this is the rig's currently-active
+                // VFO. Map onto whichever side our local selectedVfo says is
+                // active so the side-VFO display lines up with the main one.
+                this._applyVfoFreq(this.state.selectedVfo || 'A', freqHz, true);
+                return;
+            }
+
+            var modeReply = civ.parseModeReply(payload);
+            if (modeReply !== null) {
+                this._lastModeStamp = Date.now();
+                var modeChanged = (modeReply.mode !== this.state.mode);
+                var filterChanged = (modeReply.filter !== null && modeReply.filter !== this.state.filter);
+                if (modeChanged) this.state.mode = modeReply.mode;
+                if (filterChanged) this.state.filter = modeReply.filter;
+                if (modeChanged || filterChanged) {
+                    var update = {};
+                    if (modeChanged) update.mode = modeReply.mode;
+                    if (filterChanged) update.filter = modeReply.filter;
+                    this._emit('update', update);
+                    // Width and shape are stored per mode and filter, so the
+                    // cached ones just went stale.
+                    this._enqueue('readFilterWidth', civ.cmdReadFilterWidth());
+                    this._enqueue('readFilterShape', civ.cmdReadBoolFunc(0x56));
+                }
+                return;
+            }
+
+            var pttState = civ.parsePTTReply(payload);
+            if (pttState !== null) {
+                if (pttState !== this.state.transmitting) {
+                    this.state.transmitting = pttState;
+                    this._emit('update', { transmitting: pttState });
+                }
+                return;
+            }
+
+            var sMeterRaw = civ.parseSMeterReply(payload);
+            if (sMeterRaw !== null) {
+                var sMeterDb = rawSMeterToDb(sMeterRaw, this.civAddr);
+                if (sMeterDb !== this.state.sMeter) {
+                    this.state.sMeter = sMeterDb;
+                    this._emit('meters', { sMeter: sMeterDb });
+                }
+                return;
+            }
+
+            // 0x14 NN — analog level reply (afGain / rfGain / squelch / …)
+            if (payload[0] === 0x14 && payload.length >= 4) {
+                var aReply = civ.parseAnalogLevelReply(payload);
+                if (aReply) {
+                    var aField = ANALOG_SUB_TO_FIELD[aReply.sub];
+                    var aVal = aReply.value;
+                    // CW pitch is 0..255 over 300..900 Hz; the SPA wants Hz
+                    // (same rounding as icomcommander.cpp funcCwPitch).
+                    if (aField === 'cwPitch') aVal = Math.round(((600 / 255) * aVal + 300) / 5) * 5;
+                    // Key speed: 0..255 over the rig file's WPM range (#141).
+                    if (aField === 'cwSpeed') { var ksr2 = this._keySpeedRange || { min: 6, max: 48 }; aVal = Math.round(aVal * (ksr2.max - ksr2.min) / 255 + ksr2.min); }
+                    if (aField && this.state[aField] !== aVal) {
+                        this.state[aField] = aVal;
+                        var u = {}; u[aField] = aVal;
+                        this._emit('update', u);
+                    }
+                    return;
+                }
+            }
+
+            // 0x15 NN — TX meters (power 0x11 / SWR 0x12 / ALC 0x13 /
+            // Comp 0x14 / Vd 0x15 / Id 0x16)
+            if (payload[0] === 0x15 && payload.length >= 4) {
+                var sub = payload[1];
+                var meterSpec = TX_METER_SUBCMDS[sub];
+                if (meterSpec) {
+                    var meterField = meterSpec.field;
+                    var raw = civ.parseTxMeterReply(payload, sub);
+                    if (raw !== null) {
+                        var calKind = meterSpec.cal;
+                        var calTbl = civ.getRigMeterTable(this.civAddr, calKind);
+                        var v = civ.calMeter(calKind, raw, calTbl);
+                        if (this.state[meterField] !== v) {
+                            this.state[meterField] = v;
+                            var m = {}; m[meterField] = v;
+                            this._emit('meters', m);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // 0x16 NN — repeater tone registers. Checked before the generic
+            // bool table below because they share the 0x16 command and the
+            // browser wants one mode name, not three flags.
+            if (payload[0] === 0x16 && this._handleToneBoolReply(payload)) return;
+
+            // 0x1B NN — tone / TSQL / DTCS frequency registers
+            if (payload[0] === 0x1B && this._handleToneFreqReply(payload)) return;
+
+            // 0x16 0x56 — filter shape (0 sharp / 1 soft) of the current filter.
+            if (payload[0] === 0x16 && payload[1] === 0x56 && payload.length >= 3) {
+                var shp = payload[2] & 0x0F;
+                if (shp !== this.state.filterShape) {
+                    this.state.filterShape = shp;
+                    this._emit('update', { filterShape: shp });
+                }
+                return;
+            }
+
+            // 0x16 NN — bool toggle reply (NB / NR / ANF / preamp)
+            if (payload[0] === 0x16 && payload.length >= 3) {
+                var bReply = civ.parseBoolFuncReply(payload);
+                if (bReply) {
+                    var bField = BOOL_SUB_TO_FIELD[bReply.sub];
+                    if (bField) {
+                        var bVal = (bReply.sub === 0x02 || bReply.sub === 0x47) ? bReply.value : !!bReply.value;
+                        if (this.state[bField] !== bVal) {
+                            this.state[bField] = bVal;
+                            var bu = {}; bu[bField] = bVal;
+                            this._emit('update', bu);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // 0x11 — attenuator reply
+            if (payload[0] === 0x11 && payload.length >= 2) {
+                var att = civ.parseAttenuatorReply(payload);
+                if (att !== null && this.state.attenuator !== att) {
+                    this.state.attenuator = att;
+                    this._emit('update', { attenuator: att });
+                }
+                return;
+            }
+
+            // 0x12 — antenna selector reply (only rigs with an antenna cmd;
+            // per-rig prefix may be [0x12] or [0x12, 0x00])
+            if (payload[0] === 0x12 && this._antCmd) {
+                var antReply = civ.parseAntennaReply(payload, this._antCmd);
+                if (antReply !== null) {
+                    var au = {};
+                    if (this.state.antenna !== antReply.antenna) {
+                        this.state.antenna = antReply.antenna;
+                        au.antenna = antReply.antenna;
+                    }
+                    if (antReply.rx !== null && this.state.rxAntenna !== antReply.rx) {
+                        this.state.rxAntenna = antReply.rx;
+                        au.rxAntenna = antReply.rx;
+                    }
+                    if (Object.keys(au).length) this._emit('update', au);
+                }
+                return;
+            }
+
+            // 0x0F — split status reply, which doubles as the duplex direction
+            if (payload[0] === 0x0F && payload.length >= 2) {
+                var sp = civ.parseSplitReply(payload);
+                if (sp !== null && this.state.split !== sp) {
+                    this.state.split = sp;
+                    this._emit('update', { split: sp });
+                }
+                var dpr = civ.parseDuplexReply(payload);
+                if (dpr !== null && this.state.duplex !== dpr) {
+                    this.state.duplex = dpr;
+                    this._emit('update', { duplex: dpr });
+                }
+                return;
+            }
+
+            // 0x0C — duplex offset reply
+            if (payload[0] === 0x0C && payload.length >= 4) {
+                var dof = civ.parseDuplexOffsetReply(payload);
+                if (dof !== null && this.state.duplexOffset !== dof) {
+                    this.state.duplexOffset = dof;
+                    this._emit('update', { duplexOffset: dof });
+                }
+                return;
+            }
+
+            // 0x1C 0x01 — tuner status reply
+            if (payload[0] === 0x1C && payload[1] === 0x01 && payload.length >= 3) {
+                var tn = civ.parseTunerReply(payload);
+                if (tn !== null && this.state.tuner !== tn) {
+                    this.state.tuner = tn;
+                    this._emit('update', { tuner: tn });
+                }
+                return;
+            }
+
+            // 0x1A 0x05 NN MM — mod-input register replies (Data-Off and
+            // DATA1; prefix bytes are rig-specific). Cache the rig's
+            // current values so we can restore them on mic-off / disconnect.
+            var modOffV = civ.parseModInputReply(payload, this._modIn.off);
+            if (modOffV !== null) {
+                // Don't overwrite our saved value with our own write-back
+                // (when rig echoes back USB after we set it), and never
+                // save a network (WLAN/LAN) value as the baseline — it is
+                // unusable in standalone (likely a leftover from the old
+                // rig-caps bug) and we must never write it back.
+                if (this._savedDataOffMod === null && modOffV !== this._modIn.usbReg
+                        && (!this._modIn.netRegs || this._modIn.netRegs.indexOf(modOffV) === -1)) {
+                    this._savedDataOffMod = modOffV;
+                }
+                return;
+            }
+            var modDataV = civ.parseModInputReply(payload, this._modIn.data1);
+            if (modDataV !== null) {
+                if (this._savedDataMod === null && modDataV !== this._modIn.usbReg
+                        && (!this._modIn.netRegs || this._modIn.netRegs.indexOf(modDataV) === -1)) {
+                    this._savedDataMod = modDataV;
+                }
+                return;
+            }
+
+            // 0x1A 0x01 — Band stacking register reply (setBand). Apply
+            // freq + mode + filter the way the rig's own BAND key does;
+            // data mode is deliberately left alone (wfweb owns it). The
+            // usual readback then confirms what the rig did.
+            if (payload.length >= 4 && payload[0] === 0x1A && payload[1] === 0x01) {
+                var capsEntry = RIG_CAPS[this.civAddr];
+                var bsr = civ.parseBandStackReply(payload, capsEntry && capsEntry.bands);
+                var pend = this._pendingBsrSave;
+                if (bsr && pend && pend.bsr === bsr.bsr && pend.reg === bsr.reg) {
+                    // The register being left: write it back with the VFO we had.
+                    this._pendingBsrSave = null;
+                    try {
+                        this._enqueue('writeBsr:' + bsr.bsr + ':' + bsr.reg,
+                            civ.cmdWriteBandStack(bsr.bsr, bsr.reg, pend.frequency, pend.mode,
+                                                  pend.filter, bsr.tail, bsr.nBytes));
+                    } catch (e) {
+                        console.warn('[CI-V] band stacking register not stored:', e.message);
+                    }
+                    return;
+                }
+                if (bsr && bsr.frequency > 0 && bsr.mode) {
+                    this.state.frequency = bsr.frequency;
+                    this.state.mode = bsr.mode;
+                    this.state.filter = bsr.filter;
+                    this._enqueue('setFreq', civ.cmdSetFrequency(bsr.frequency));
+                    this._enqueue('setMode', civ.cmdSetMode(bsr.mode, bsr.filter));
+                    this._emit('update', { frequency: bsr.frequency, vfoAFrequency: bsr.frequency,
+                                           mode: bsr.mode, filter: bsr.filter });
+                } else {
+                    console.warn('[CI-V] band stacking register reply not applied:',
+                        Array.from(payload).map(function(b){return b.toString(16).padStart(2,'0');}).join(' '));
+                }
+                return;
+            }
+
+            // 0x1A 0x00 — Memory contents reply (rig-specific layout).
+            // Routed via the active scan / pending-write so we know whose
+            // request this is for and forward it to the SPA as a
+            // 'memoryChannel' message.
+            if (payload.length >= 2 && payload[0] === 0x1A && payload[1] === 0x00) {
+                if (this._memHandleReply(payload)) return;
+                // Fall through if no memory handler claimed it (e.g. an
+                // unsolicited frame on an unsupported rig).
+            }
+
+            // 0x1A 0x03 — Filter Width reply (encoding depends on current mode).
+            if (payload.length >= 3 && payload[0] === 0x1A && payload[1] === 0x03) {
+                var hz = civ.parseFilterWidthReply(payload, this.state.mode || 'USB');
+                console.log('parseFilterWidth:',
+                    Array.from(payload).map(function(b){return b.toString(16).padStart(2,'0');}).join(' '),
+                    'mode=', this.state.mode, '→', hz, 'Hz');
+                if (hz !== null && hz !== this.state.filterWidth) {
+                    this.state.filterWidth = hz;
+                    this._emit('update', { filterWidth: hz });
+                }
+                return;
+            }
+
+            var ack = civ.parseAck(payload);
+            if (ack !== null) {
+                if (ack === false) console.warn('[CIV] rig NACK (0xFA)');
+                return;
+            }
+        }
+
+        _emit(type, fields) {
+            var msg = Object.assign({ type: type }, fields);
+            this.dispatchEvent(new CustomEvent('message', { detail: msg }));
+        }
+
+        // ---------- Memory channels (CI-V cmd 0x1A 0x00) -----------------
+        //
+        // The wire format for memory contents is rig-specific (see the
+        // memFormat field in civ/rig-caps.js). Server-side this lives in
+        // src/webserver.cpp / icomCommander::parseMemory; here we mirror
+        // it directly off the parsed CI-V replies.
+        //
+        // Read flow: SPA → 'getMemories' → _memScanStart() walks
+        // [start..end], enqueueing one read at a time and bumping the
+        // pointer when either a reply lands or the watchdog (500 ms,
+        // matching the server) fires for a non-existent slot. Each parsed
+        // entry is forwarded as a 'memoryChannel' message; when the walk
+        // finishes we emit 'memoryScanComplete' with the count.
+        //
+        // Write / clear flow: SPA → 'writeMemory' / 'clearMemory' →
+        // _memWrite / _memClear build the rig-specific frame from current
+        // VFO A state (or just the channel address for a clear) and push
+        // it through the normal CI-V queue.
+
+        // ---------- Repeater access tone ---------------------------------
+        //
+        // Mirrors the server build (src/webserver.cpp): one mode name on the
+        // wire, whichever dialect the rig speaks underneath.
+
+        _enqueueToneReads() {
+            var t = this._toneCmds;
+            if (t.sqlType) this._enqueue('readToneSqlType', civ.cmdReadToneSqlType(t.sqlType));
+            if (t.rptTone) this._enqueue('readRptTone', civ.cmdReadToneBool(t.rptTone));
+            if (t.rptTsql) this._enqueue('readRptTsql', civ.cmdReadToneBool(t.rptTsql));
+            if (t.rptDtcs) this._enqueue('readRptDtcs', civ.cmdReadToneBool(t.rptDtcs));
+            if (t.toneFreq) this._enqueue('readToneFreq', civ.cmdReadTone(t.toneFreq));
+            if (t.tsqlFreq) this._enqueue('readTsqlFreq', civ.cmdReadTone(t.tsqlFreq));
+            if (t.dtcsCode) this._enqueue('readDtcsCode', civ.cmdReadTone(t.dtcsCode));
+        }
+
+        // Coalesce tone-mode notifications (see _handleToneBoolReply).
+        _notifyToneModeSoon() {
+            var self = this;
+            clearTimeout(this._toneModeNotify);
+            this._toneModeNotify = setTimeout(function () {
+                self._emit('update', { toneMode: self.state.toneMode });
+            }, 60);
+        }
+
+        _setToneMode(name) {
+            var t = this._toneCmds;
+            // Anything we don't recognise turns the tone off — the safe
+            // direction: it can only stop us keying a repeater, never start.
+            var known = civ.toneModeUsesTone(name) || civ.toneModeUsesTsql(name)
+                     || civ.toneModeUsesDtcs(name);
+            var mode = known ? name : 'OFF';
+            this.state.toneMode = mode;
+            if (t.sqlType) {
+                this._enqueue('setToneSqlType', civ.cmdSetToneSqlType(t.sqlType, mode));
+            } else {
+                // Every flag is written every time: leaving the previous
+                // mode's flag set would silently combine the two.
+                if (t.rptTone) this._enqueue('setRptTone', civ.cmdSetToneBool(t.rptTone, civ.toneModeUsesTone(mode)));
+                if (t.rptTsql) this._enqueue('setRptTsql', civ.cmdSetToneBool(t.rptTsql, civ.toneModeUsesTsql(mode)));
+                if (t.rptDtcs) this._enqueue('setRptDtcs', civ.cmdSetToneBool(t.rptDtcs, civ.toneModeUsesDtcs(mode)));
+            }
+            this._emit('update', { toneMode: mode });
+        }
+
+        // One setter for all three 0x1B registers. `polarity` is only
+        // meaningful for DTCS: bit 1 inverts TX, bit 0 inverts RX.
+        _setToneValue(field, cmdBytes, value, polarity) {
+            if (!cmdBytes || !value) return;
+            var tinv = (polarity & 2) !== 0, rinv = (polarity & 1) !== 0;
+            this.state[field] = value;
+            var u = {}; u[field] = value;
+            if (field === 'dtcsCode') {
+                this.state.dtcsPolarity = polarity & 3;
+                u.dtcsPolarity = polarity & 3;
+            }
+            this._enqueue('set_' + field, civ.cmdSetTone(cmdBytes, value, tinv, rinv));
+            this._emit('update', u);
+        }
+
+        _memFormat() {
+            return civ.getRigMemFormat(this.civAddr);
+        }
+
+        // ---------- wfweb's own memory channels (issue #114) --------------
+        //
+        // A rig with no MemFormat can't be asked what is in a channel, so
+        // there is nothing to list. Instead of refusing, the browser keeps its
+        // own channels in localStorage and serves the same five commands from
+        // there — the panel can't tell the difference. The server does exactly
+        // this in MemoryStore; here the "file" is per-origin browser storage,
+        // keyed by CI-V address so two radios don't share one list.
+        _memIsLocal() {
+            return !this._memFormat();
+        }
+
+        _memLocalKey() {
+            // Hex, so the key reads like the CI-V address everywhere else
+            // does ("...5e" for an IC-718, not its decimal 94).
+            return 'wfweb.memories.' + Number(this.civAddr).toString(16);
+        }
+
+        _memLocalAll() {
+            var o = lsGetJson(this._memLocalKey());
+            return (o && typeof o === 'object') ? o : {};
+        }
+
+        // Same record shape the rig path emits, so the SPA renders either.
+        _memLocalToJson(ch, e) {
+            return {
+                group: 0, channel: ch | 0,
+                frequency: e.freq | 0,
+                mode: civ.codeToMode[e.mode] || ('?' + e.mode),
+                modeReg: e.mode | 0,
+                filter: e.filter | 0 || 1,
+                name: e.name || '',
+                local: true, del: false,
+            };
+        }
+
+        _memLocalScan() {
+            var all = this._memLocalAll();
+            var chans = Object.keys(all).map(Number).sort(function (a, b) { return a - b; });
+            for (var i = 0; i < chans.length; i++) {
+                this._emit('memoryChannel',
+                    { memory: this._memLocalToJson(chans[i], all[chans[i]]) });
+            }
+            this._emit('memoryScanComplete', { count: chans.length, local: true });
+        }
+
+        _memLocalWrite(ch, name) {
+            var freq = this.state.frequency || this.state.vfoAFrequency || 0;
+            if (!(freq > 0)) {
+                this._emit('memoryError', { error: 'No frequency to store yet' });
+                return;
+            }
+            var modeCode = civ.modeToCode[this.state.mode || 'USB'];
+            if (typeof modeCode !== 'number') modeCode = 0x01; // USB
+            var all = this._memLocalAll();
+            all[ch] = {
+                freq: freq, mode: modeCode,
+                filter: (this.state.filter | 0) > 0 ? (this.state.filter | 0) : 1,
+                name: String(name || '').trim().slice(0, 32),
+            };
+            if (!lsSetJson(this._memLocalKey(), all)) {
+                this._emit('memoryError', { error: 'Browser storage is full or blocked' });
+                return;
+            }
+            this._emit('memoryChannel', { memory: this._memLocalToJson(ch, all[ch]) });
+        }
+
+        _memLocalRename(ch, name) {
+            var all = this._memLocalAll();
+            if (!all[ch]) {
+                this._emit('memoryError', { error: 'No such memory channel' });
+                return;
+            }
+            all[ch].name = String(name || '').trim().slice(0, 32);
+            lsSetJson(this._memLocalKey(), all);
+            this._emit('memoryChannel', { memory: this._memLocalToJson(ch, all[ch]) });
+        }
+
+        _memLocalClear(ch) {
+            var all = this._memLocalAll();
+            delete all[ch];
+            lsSetJson(this._memLocalKey(), all);
+            this._emit('memoryChannel', { memory: { channel: ch, group: 0, del: true, local: true } });
+        }
+
+        // Tune the VFO, and nothing else. Deliberately no 0x08: on a rig like
+        // the IC-718 that would select the *radio's* channel N, which has
+        // nothing to do with the entry stored here under that number.
+        _memLocalRecall(ch) {
+            var e = this._memLocalAll()[ch];
+            if (!e) {
+                this._emit('memoryError', { error: 'No such memory channel' });
+                return;
+            }
+            if (e.freq > 0) this._enqueue('setFreq', civ.cmdSetFrequency(e.freq));
+            var name = civ.codeToMode[e.mode];
+            if (name) this._enqueue('setMode', civ.cmdSetMode(name, e.filter || 1));
+        }
+
+        _memScanStart(obj) {
+            var fmt = this._memFormat();
+            // No MemFormat: serve wfweb's own channels instead (issue #114).
+            if (!fmt) { this._memLocalScan(); return; }
+            // Cancel any previous scan that's still in flight.
+            this._memScanCancel();
+            var mc = this._memCaps || { memStart: 1, memMax: 0 };
+            // Zero-based rigs (IC-705/905) have a real channel 0, so 0 is a
+            // legal start; clamp to what the rig's 0x08 select accepts.
+            var start = (obj && typeof obj.start === 'number') ? (obj.start | 0) : mc.memStart;
+            var end   = (obj && typeof obj.end === 'number')   ? (obj.end | 0)   : 99;
+            var group = (obj && obj.group) ? (obj.group | 0) : 0;
+            if (start < mc.memStart) start = mc.memStart;
+            if (mc.memMax && end > mc.memMax) end = mc.memMax;
+            this._memScan = {
+                active: true, start: start, end: end, group: group,
+                current: start, count: 0, fmt: fmt, timer: null,
+            };
+            this._memScanRequest();
+        }
+
+        _memScanRequest() {
+            var s = this._memScan;
+            if (!s || !s.active) return;
+            if (s.current > s.end) {
+                this._memScanFinish();
+                return;
+            }
+            this._enqueue('readMemory:' + s.current,
+                civ.cmdReadMemoryContents(s.current, s.group, s.fmt));
+            // Watchdog — non-existent channels on some rigs return a
+            // truncated reply that may not match our parse exactly, so
+            // advance after 500 ms even if nothing came back. Matches
+            // webserver::scanNextMemory.
+            var self = this;
+            s.timer = setTimeout(function () {
+                if (self._memScan === s && s.active) {
+                    s.current++;
+                    self._memScanRequest();
+                }
+            }, 500);
+        }
+
+        _memScanFinish() {
+            var s = this._memScan;
+            if (!s) return;
+            if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+            s.active = false;
+            this._emit('memoryScanComplete', { count: s.count });
+        }
+
+        _memScanCancel() {
+            var s = this._memScan;
+            if (!s) return;
+            if (s.timer) clearTimeout(s.timer);
+            this._memScan = null;
+        }
+
+        // Channel number the rig will accept for a write / clear / recall.
+        _memChannelOk(ch) {
+            var mc = this._memCaps || { memStart: 1, memMax: 0 };
+            return ch >= mc.memStart && (!mc.memMax || ch <= mc.memMax);
+        }
+
+        _memWrite(obj) {
+            var fmt = this._memFormat();
+            if (!obj || obj.channel === undefined) return;
+            var ch = obj.channel | 0;
+            if (!this._memChannelOk(ch)) return;
+            if (!fmt) { this._memLocalWrite(ch, obj.name); return; }
+            var group = (obj.group | 0) || 0;
+            // Snapshot current VFO A — the SPA's MEM-write button stores
+            // whatever is on VFO A right now. Mirrors webserver.cpp:
+            // freq/mode/filter pulled from cache, copied to the VFO B
+            // slots so the rig's split fields aren't undefined.
+            var modeCode = civ.modeToCode[this.state.mode || 'USB'];
+            if (typeof modeCode !== 'number') modeCode = 0x01; // USB
+            var filt = (this.state.filter | 0) > 0 ? (this.state.filter | 0) : 1;
+            var freq = this.state.frequency || this.state.vfoAFrequency || 0;
+            // Never send the rig a 0 Hz channel — it NGs the write (FA).
+            if (!(freq > 0)) {
+                console.warn('[CIV] writeMemory: no known frequency, refusing');
+                this._emit('error', { message: 'Memory write failed: no known frequency' });
+                return;
+            }
+            var mem = {
+                channel: ch, group: group, del: false,
+                scan: 0, skip: 0, split: 0,
+                frequency: freq, mode: modeCode, filter: filt,
+                datamode: 0,
+                frequencyB: freq, modeB: modeCode, filterB: filt,
+                datamodeB: 0,
+                name: (obj.name || ''),
+            };
+            // Repeater tone and shift, captured from the live rig state so a
+            // saved channel reopens the same machine. tonemode and duplex
+            // share one byte in the 'j'/'J' MemFormat specs, so writing the
+            // tone without the shift would silently clear the shift.
+            mem.tonemode = civ.toneModeToReg(this.state.toneMode);
+            mem.tone = this.state.toneFreq ? civ.toneNameFromReg(this.state.toneFreq) : '';
+            mem.tsql = this.state.tsqlFreq ? civ.toneNameFromReg(this.state.tsqlFreq) : '';
+            mem.dtcs = this.state.dtcsCode || 0;
+            mem.dtcsp = this.state.dtcsPolarity || 0;
+            mem.duplex = DUPLEX_MEM_NIBBLE[this.state.duplex] || 0;
+            mem.duplexOffset = this.state.duplexOffset || 0;
+            // No split support here: the VFO B half of the channel mirrors A.
+            mem.tonemodeB = mem.tonemode;
+            mem.toneB = mem.tone;
+            mem.tsqlB = mem.tsql;
+            mem.dtcsB = mem.dtcs;
+            mem.dtcspB = mem.dtcsp;
+            mem.duplexB = mem.duplex;
+            mem.duplexOffsetB = mem.duplexOffset;
+            this._enqueue('writeMemory:' + ch,
+                civ.cmdWriteMemoryContents(mem, fmt));
+        }
+
+        _memClear(obj) {
+            var fmt = this._memFormat();
+            if (!obj || obj.channel === undefined) return;
+            var ch = obj.channel | 0;
+            if (!this._memChannelOk(ch)) return;
+            if (!fmt) { this._memLocalClear(ch); return; }
+            var group = (obj.group | 0) || 0;
+            delete this._memCache[group * 65536 + ch];
+            this._enqueue('clearMemory:' + ch,
+                civ.cmdClearMemoryContents(ch, group, fmt));
+            // The rig won't push a memory-channel update on its own after
+            // a clear, so synthesise one so the SPA's list updates.
+            this._emit('memoryChannel',
+                { memory: { channel: ch, group: group, del: true } });
+        }
+
+        // Recall a channel ON the rig (#92) so tone / tone squelch / duplex
+        // offset come from the channel — not just freq + mode. Mirrors
+        // webServer::recallMemoryOnRig(): group select where the rig has the
+        // command, the band-nudge dance where it doesn't, then the channel
+        // select and the V/M switch. The rig never reports the channel, so
+        // the number is remembered here and re-sent in every status.
+        _memRecall(obj) {
+            var mc = this._memCaps;
+            var fmt = this._memFormat();
+            if (!obj || obj.channel === undefined) return;
+            if (!fmt) { this._memLocalRecall(obj.channel | 0); return; }
+            if (!mc) return;
+            var ch = obj.channel | 0;
+            var group = (obj.group | 0) || 0;
+            if (!this._memChannelOk(ch) || group < 0) return;
+            // Trust the memFormat's 'a' spec, not memGroups — the IC-7610
+            // declares one group but carries no group field.
+            if (civ.memGroupSpec(fmt)) {
+                if (mc.hasGroupCmd) {
+                    this._enqueue('memoryGroup', civ.cmdSelectMemoryGroup(group, fmt));
+                } else {
+                    // IC-9700/9100: no group select command — the group is
+                    // implied by the band. Drop out of memory mode (bare 07)
+                    // if we're in it, then tune into the group's band so the
+                    // channel select lands in the right bank. The cached
+                    // channel frequency is inside that band by definition.
+                    if (this.state.selectedVfo === 'MEM' && mc.hasVfoModeSelect) {
+                        this._enqueue('vfoMode', civ.cmdVfoMode(mc.vfoModeCmd29));
+                    }
+                    var cached = this._memCache[group * 65536 + ch];
+                    var bandHz = (cached && cached.frequency > 0)
+                        ? cached.frequency : this._memGroupBandStart(group);
+                    if (bandHz > 0) this._enqueue('setFrequency', civ.cmdSetFrequency(bandHz));
+                    else console.warn('[CIV] recallMemory: no band for memory group ' + group);
+                }
+            }
+            this._enqueue('memoryChannel:' + ch, civ.cmdSelectMemoryChannel(ch));
+            // Selecting a channel does not flip the rig into memory mode by
+            // itself (Icom stays on VFO A/B) — the bare 08 does.
+            if (mc.hasMemoryMode) this._enqueue('memoryMode', civ.cmdMemoryMode());
+            this.state.memChannel = ch;
+            this.state.memGroup = group;
+            this._setSelectedVfo(mc.hasMemoryMode ? 'MEM' : this.state.selectedVfo);
+            this._enqueueMemReadback();
+        }
+
+        // First band the rig-caps table maps to this memory group (rigs whose
+        // groups are per-band, IC-9700) — the same edge the server nudges to.
+        _memGroupBandStart(group) {
+            var entry = RIG_CAPS[this.civAddr];
+            var bands = (entry && entry.bands) || [];
+            for (var i = 0; i < bands.length; i++) {
+                if (bands[i].memGroup === group && bands[i].groupStart > 0) return bands[i].groupStart;
+            }
+            return 0;
+        }
+
+        // Track the selected VFO ('A' | 'B' | 'MEM') and tell the SPA. The
+        // channel rides along so the MEM indicator reads "MEM n".
+        _setSelectedVfo(v) {
+            if (v !== 'MEM') this._lastRealVfo = v;
+            this.state.selectedVfo = v;
+            var u = { selectedVfo: v };
+            if (v === 'MEM' && this.state.memChannel !== null) u.memChannel = this.state.memChannel;
+            this._emit('update', u);
+        }
+
+        // After a recall / V-M switch the rig does not announce the new
+        // operating state — pull freq / mode / shift / tone so the SPA follows.
+        _enqueueMemReadback() {
+            this._enqueue('readFreq', civ.cmdReadFrequency());
+            this._enqueue('readMode', civ.cmdReadMode());
+            this._enqueueDualVfoReads();
+            if (this._hasDuplex) {
+                this._enqueue('readSplit', civ.cmdReadSplit());
+                this._enqueue('readDuplexOffset', civ.cmdReadDuplexOffset());
+            }
+            this._enqueueToneReads();
+        }
+
+        // In memory mode the operating frequency is the recalled channel's —
+        // it belongs to neither VFO cache slot.
+        _applyMemFreq(hz) {
+            if (this.state.frequency === hz) return;
+            this.state.frequency = hz;
+            this._emit('update', { frequency: hz });
+        }
+
+        // Rename: rewrite the channel from the cached contents with only the
+        // name changed, so tone / shift / DV fields survive (webserver.cpp
+        // does the same from its memoryType cache).
+        _memRename(obj) {
+            var fmt = this._memFormat();
+            if (!obj || obj.channel === undefined) return;
+            var ch = obj.channel | 0;
+            var group = (obj.group | 0) || 0;
+            if (!fmt) { this._memLocalRename(ch, obj.name); return; }
+            var mem = this._memCache[group * 65536 + ch];
+            if (!mem || mem.del || mem.empty) {
+                console.warn('[CIV] renameMemory: channel ' + ch + ' group ' + group + ' not cached');
+                return;
+            }
+            mem.name = String(obj.name || '');
+            mem.del = false;
+            this._enqueue('writeMemory:' + ch, civ.cmdWriteMemoryContents(mem, fmt));
+            // The rig won't echo the write — tell the SPA directly.
+            this._emit('memoryChannel', { memory: this._memToJson(mem) });
+        }
+
+        // Same keys the server build's memoryToJson() emits, so the SPA
+        // renders a channel identically in both forks.
+        _memToJson(mem) {
+            return {
+                channel: mem.channel, group: mem.group || 0,
+                frequency: mem.frequency || 0,
+                mode: civ.codeToMode[mem.mode] || '', filter: mem.filter || 1,
+                name: mem.name || '',
+                del: !!mem.del, empty: !!mem.empty,
+                tonemode: mem.tonemode || 0,
+                toneModeName: civ.toneModeFromReg(mem.tonemode || 0),
+                tone: mem.tone || '', tsql: mem.tsql || '',
+                dtcs: mem.dtcs || 0, dtcsPolarity: mem.dtcsp || 0,
+                duplex: mem.duplex || 0, duplexOffset: mem.duplexOffset || 0,
+            };
+        }
+
+        _memHandleReply(payload) {
+            var fmt = this._memFormat();
+            if (!fmt) return false;
+            var mem = civ.parseMemoryContentsReply(payload, fmt);
+            if (!mem) return false;
+            // Keep the parsed contents: rename rewrites from them, and the
+            // IC-9700 recall path band-nudges to the cached frequency.
+            var key = (mem.group || 0) * 65536 + (mem.channel | 0);
+            if (mem.del || mem.empty) delete this._memCache[key];
+            else this._memCache[key] = mem;
+            var out = this._memToJson(mem);
+            // Cancel the scan watchdog and bump the pointer if this reply
+            // belongs to an active scan (most likely case during a scan).
+            var s = this._memScan;
+            if (s && s.active) {
+                if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+                if (!out.del && !out.empty && out.frequency > 0) s.count++;
+                s.current++;
+                this._emit('memoryChannel', { memory: out });
+                this._memScanRequest();
+            } else {
+                // Outside a scan (e.g. echo of our own writeMemory or an
+                // unsolicited frame) — just push it to the SPA.
+                this._emit('memoryChannel', { memory: out });
+            }
+            return true;
+        }
+
+        // 0x16 replies for the tone registers. The single-register dialect
+        // reports the mode directly; the boolean dialect needs all three
+        // flags folded back together, so they are cached as they arrive.
+        _handleToneBoolReply(payload) {
+            var t = this._toneCmds;
+            var mode = null;
+            if (t.sqlType) {
+                mode = civ.parseToneSqlTypeReply(payload, t.sqlType);
+            } else {
+                var flags = [['rptTone', '_rptTone'], ['rptTsql', '_rptTsql'], ['rptDtcs', '_rptDtcs']];
+                var matched = false;
+                for (var i = 0; i < flags.length; i++) {
+                    if (!t[flags[i][0]]) continue;
+                    var v = civ.parseToneBoolReply(payload, t[flags[i][0]]);
+                    if (v === null) continue;
+                    this[flags[i][1]] = v;
+                    matched = true;
+                    break;
+                }
+                if (!matched) return false;
+                mode = civ.toneModeFromBools(!!this._rptTone, !!this._rptTsql, !!this._rptDtcs);
+            }
+            if (mode === null) return false;
+            if (this.state.toneMode !== mode) {
+                this.state.toneMode = mode;
+                // The three flags answer as three separate replies, so the
+                // folded value is briefly a mode nobody selected. Tell the SPA
+                // once the burst has landed.
+                this._notifyToneModeSoon();
+            }
+            return true;
+        }
+
+        // 0x1B replies. All three registers share one payload shape, so the
+        // rig's own command bytes pick which field the value belongs to.
+        _handleToneFreqReply(payload) {
+            var t = this._toneCmds;
+            var regs = [['toneFreq', 'toneFreq'], ['tsqlFreq', 'tsqlFreq'], ['dtcsCode', 'dtcsCode']];
+            for (var i = 0; i < regs.length; i++) {
+                var cmdBytes = t[regs[i][0]];
+                if (!cmdBytes) continue;
+                var r = civ.parseToneReply(payload, cmdBytes);
+                if (r === null) continue;
+                var field = regs[i][1];
+                var u = {};
+                if (this.state[field] !== r.value) {
+                    this.state[field] = r.value;
+                    u[field] = r.value;
+                }
+                if (field === 'dtcsCode') {
+                    var pol = (r.tinv ? 2 : 0) | (r.rinv ? 1 : 0);
+                    if (this.state.dtcsPolarity !== pol) {
+                        this.state.dtcsPolarity = pol;
+                        u.dtcsPolarity = pol;
+                    }
+                }
+                if (Object.keys(u).length) this._emit('update', u);
+                return true;
+            }
+            return false;
+        }
+
+        // Layout of a 0x27 0x00 frame after CivParser strips FE FE / FD:
+        //   payload[0..1]   = 0x27 0x00 (cmd + sub)
+        //   payload[2]      = receiver index (0 for single-receiver rigs)
+        //   payload[3]      = sequence number       (BCD-encoded byte)
+        //   payload[4]      = sequence max (= total #frames in this scope dump)
+        // For seq 1:
+        //   payload[5]      = scope mode (0=center, 1=fixed, 2=scroll-C, 3=scroll-F)
+        //   payload[6..10]  = start freq, 5 BCD-LE bytes (Hz)
+        //   payload[11..15] = end freq,   5 BCD-LE bytes (Hz)
+        //   payload[16]     = out-of-range flag
+        // For seq 2..(seqMax-1): 50 pixels at payload[5..]
+        // For seq seqMax:        final ~25 pixels at payload[5..]
+        _handleScopeFrame(payload) {
+            if (payload.length < 5) return;
+            var seq = bcdByteToInt(payload[3]);
+            var seqMax = bcdByteToInt(payload[4]);
+
+            if (seq === 1) {
+                if (payload.length < 17) return;
+                var mode = payload[5];
+                var startFreq = civ.decodeBcdLE(payload.slice(6, 11));
+                var endFreq   = civ.decodeBcdLE(payload.slice(11, 16));
+                var oor = payload[16];
+                if (mode === 0) {
+                    // Center mode: rig sends center + half-span. Convert to
+                    // (start, end) so the SPA's edge labels are correct.
+                    var halfSpan = endFreq;
+                    startFreq = startFreq - halfSpan;
+                    endFreq   = startFreq + 2 * halfSpan;
+                }
+                this._scope = {
+                    seqMax: seqMax, mode: mode,
+                    startFreq: startFreq, endFreq: endFreq,
+                    pixels: [], capturing: !oor,
+                };
+                if (oor) this._emitSpectrum(true);
+                return;
+            }
+
+            if (!this._scope.capturing) return;
+            // Pixel chunk: payload[5..end]
+            for (var i = 5; i < payload.length; i++) this._scope.pixels.push(payload[i]);
+            if (seq === this._scope.seqMax) {
+                this._emitSpectrum(false);
+                this._scope.capturing = false;
+            }
+        }
+
+        // Same header the C++ server builds (webserver.cpp, funcScopeWaveData):
+        //   [0x01][scopeMode][outOfRange][pad][startMHz f32][endMHz f32][pixels]
+        // scopeMode: 0 Center, 1 Fixed, 2 Scroll-C, 3 Scroll-F (rig 0x27 0x14).
+        // Out of range (Fixed mode, VFO outside the window) carries no pixels
+        // from the rig; emit a zero-filled sweep of the usual length so the
+        // SPA paints blank rows instead of freezing on the last sweep.
+        _emitSpectrum(empty) {
+            var pixels = empty ? [] : this._scope.pixels;
+            var n = empty ? (this._lastPixelCount || 475) : pixels.length;
+            if (!empty) this._lastPixelCount = n;
+            var startMhz = this._scope.startFreq / 1e6;
+            var endMhz   = this._scope.endFreq / 1e6;
+            var buf = new ArrayBuffer(12 + n);
+            var view = new DataView(buf);
+            view.setUint8(0, 0x01);
+            view.setUint8(1, this._scope.mode & 0xFF);
+            view.setUint8(2, empty ? 1 : 0);
+            view.setUint8(3, 0);
+            view.setFloat32(4, startMhz, true);
+            view.setFloat32(8, endMhz,   true);
+            if (!empty) {
+                var bytes = new Uint8Array(buf, 12);
+                for (var i = 0; i < pixels.length; i++) bytes[i] = pixels[i];
+            }
+            this.dispatchEvent(new CustomEvent('binary', { detail: buf }));
+        }
+
+        // Whether the connected rig accepts TX commands. Receivers (R-series
+        // — IC-R7100/R8500/R8600) have hasTransmit=false in rig-caps; the
+        // SPA hides the TX UI but a stale rigInfo or buggy caller could
+        // still try, so we gate at the transport too.
+        _rigCanTransmit() {
+            var entry = RIG_CAPS[this.civAddr];
+            if (!entry || !entry.caps) return true;  // unknown rig: assume TX
+            return entry.caps.hasTransmit !== false;
+        }
+
+        // Scope bring-up, sent on connect and again after a power-on (the rig
+        // forgets scope output across a power cycle). Single-byte payloads
+        // match the C++ wfweb's behaviour for single-receiver rigs.
+        _enqueueScopeSetup() {
+            this._enqueue('scopeOn',   new Uint8Array([0x27, 0x10, 0x01]));
+            this._enqueue('scopeData', new Uint8Array([0x27, 0x11, 0x01]));
+            if (!this._hasSpectrum) return;
+            // The scope mode (Center / Fixed / Scroll) is the SPA's to set: it
+            // draws whichever the rig reports (the mode rides in every sweep)
+            // and re-commands its last pick on connect via setScopeMode
+            // (issue #113). Forcing Center here used to be the fix for #75.
+            // Force Carrier Point Center: with Filter Center (0) the spectrum
+            // centres on the passband instead of the VFO, so a signal aligned
+            // to the visual passband is mistuned in RX audio (issue #75).
+            // 1 = Carrier Point Center. Unlike the per-window scope commands
+            // this setting is global and takes NO scope byte — the rig NGs
+            // the prefixed form (verified on a real IC-7300, issue #75).
+            this._enqueue('scopeCenter', new Uint8Array([0x27, 0x1C, 0x01]));
+        }
+
+        _emitRigInfo() {
+            // Pull per-rig caps from the auto-generated rig-caps registry.
+            // Falls back to "modern HF rig with scope and TX" when the rig
+            // isn't in the registry (preserves prior behaviour for unknown
+            // CI-V addresses on the bus).
+            var entry = RIG_CAPS[this.civAddr];
+            var caps = (entry && entry.caps) || {
+                hasTransmit: true, hasSpectrum: true, hasLAN: false,
+                numReceivers: 1, numVFOs: 2,
+            };
+            // Most modern Icoms expose OFF/PRE1/PRE2; the SPA's P.AMP/ATT
+            // cycle button needs the full list to walk past PRE1.
+            var preamps = (entry && entry.preamps && entry.preamps.length)
+                ? entry.preamps
+                : [{num:0,name:'OFF'},{num:1,name:'PRE1'},{num:2,name:'PRE2'}];
+            // Attenuator steps vary widely (IC-7300: 0/20 dB; IC-7610: 0..45
+            // in 3 dB steps). The P.AMP/ATT cycle button needs the real list.
+            var attenuators = (entry && entry.attenuators && entry.attenuators.length)
+                ? entry.attenuators
+                : [{num:0,name:'0 dB'},{num:20,name:'-20 dB'}];
+            this._emit('rigInfo', {
+                version: ((typeof window !== 'undefined' && window.__WFWEB_SEMVER__) || 'dev') + '-direct',
+                model: rigDisplayName(this.civAddr),
+                manufacturer: 'Icom',
+                connected: true,
+                modes: DEFAULT_MODES,
+                filters: DEFAULT_FILTERS,
+                spans: DEFAULT_SPANS,
+                scopeModes: (entry && entry.scopeModes) || [],
+                scopeFixedEdges: !!(entry && entry.scopeEdgeRanges && entry.scopeEdgeRanges.length),
+                preamps: preamps,
+                attenuators: attenuators,
+                // Band table for the BAND picker — an unknown rig gets none
+                // and the SPA falls back to its HF-only layout.
+                bands: (entry && entry.bands) || [],
+                antennas: this._antennas,
+                hasRxAnt: this._hasRxAnt,
+                hasFilterSettings: true,
+                hasMainSub: caps.numReceivers > 1,
+                hasDuplex: !!caps.hasDuplex,
+                hasTuner: !!caps.hasTuner,
+                hasBreakIn: !!caps.hasBreakIn,
+                hasCompressor: !!caps.hasCompressor,
+                hasCompLevel: !!caps.hasCompLevel,
+                // Switchable second meter bar: one descriptor per reading this
+                // rig can actually produce, carrying the rig's own calibration
+                // table so the SPA can draw the matching face.
+                txMeters: txMeterDescriptors(entry),
+                // The Power table, so the meter can tell this rig's 100 % from watts.
+                poCal: (entry && entry.meters && entry.meters.power) || [],
+                // Repeater access tone. canSet* is separate from hasCTCSS
+                // because a rig can engage a tone without exposing the 0x1B
+                // frequency register (IC-905), and tone scan additionally
+                // needs the squelch readout to watch.
+                hasCTCSS: !!caps.hasCTCSS,
+                hasDTCS: !!caps.hasDTCS,
+                hasToneSqlType: !!caps.hasToneSqlType,
+                canSetToneFreq: !!(entry && entry.cmds && entry.cmds.toneFreq),
+                canSetTsqlFreq: !!(entry && entry.cmds && entry.cmds.tsqlFreq),
+                ctcssTones: caps.hasCTCSS ? CTCSS_TONES : [],
+                dtcsCodes: caps.hasDTCS ? DTCS_CODES : [],
+                hasSpectrum: caps.hasSpectrum,
+                // Keyer speed range from the rig file (IC-7300: 6-48 WPM),
+                // for the CW bar's speed box (#141).
+                cwSpeedRange: (caps.keySpeedMax > caps.keySpeedMin) ? { min: caps.keySpeedMin, max: caps.keySpeedMax } : undefined,
+                // Memory channels (#92) — same three fields the server's caps carry.
+                // MEM is a rig concept: hidden when the channels are wfweb's,
+                // where a 0x08 select would jump to an unrelated rig channel.
+                hasMemoryMode: !!(this._memCaps && this._memCaps.hasMemoryMode)
+                               && !this._memIsLocal(),
+                memoriesLocal: this._memIsLocal(),
+                memGroups: this._memCaps ? this._memCaps.memGroups : 0,
+                memStart:  this._memCaps ? this._memCaps.memStart : 1,
+                spectAmpMax: 160,     // Icom amplitude scale (matches C++ wfweb)
+                audioAvailable: true,    // Phase 2: rig USB audio via getUserMedia
+                audioSampleRate: 48000,
+                txAudioAvailable: caps.hasTransmit,
+                hasPowerControl: false,
+                hasTransmit: caps.hasTransmit,
+                hasLAN: caps.hasLAN,
+                numReceivers: caps.numReceivers,
+                numVFOs: caps.numVFOs,
+            });
+        }
+
+        // Map an incoming freq onto a specific VFO and emit the right combo
+        // of fields to the SPA. `which` ∈ {'A','B'}; isSelected=true means
+        // this VFO is the one currently driving the rig's main display, so
+        // we should also bump `frequency`. Mirrors the server-side flow in
+        // src/webserver.cpp::receiveCache().
+        _applyVfoFreq(which, hz, isSelected) {
+            var freqField = (which === 'B') ? 'vfoBFrequency' : 'vfoAFrequency';
+            var u = {};
+            var changed = false;
+            if (this.state[freqField] !== hz) {
+                this.state[freqField] = hz;
+                u[freqField] = hz;
+                changed = true;
+            }
+            if (isSelected && this.state.frequency !== hz) {
+                this.state.frequency = hz;
+                u.frequency = hz;
+                changed = true;
+            }
+            if (changed) this._emit('update', u);
+        }
+
+        _emitFullStatus() {
+            var s = {
+                frequency: this.state.frequency,
+                vfoAFrequency: this.state.vfoAFrequency || this.state.frequency,
+                vfoBFrequency: this.state.vfoBFrequency,
+                selectedVfo:   this.state.selectedVfo || 'A',
+                mode: this.state.mode,
+                filter: this.state.filter,
+                sMeter: this.state.sMeter,
+                transmitting: this.state.transmitting,
+            };
+            if (this.state.selectedVfo === 'MEM' && this.state.memChannel !== null) {
+                s.memChannel = this.state.memChannel;
+            }
+            // Pass through any cached values so the UI populates fully.
+            var passthrough = ['afGain', 'rfGain', 'rfPower', 'squelch',
+                'micGain', 'monitorGain', 'pbtInner', 'pbtOuter', 'cwSpeed', 'cwPitch',
+                'autoNotch', 'nb', 'nr', 'preamp', 'attenuator', 'breakIn',
+                'compressor', 'compLevel',
+                'antenna', 'rxAntenna',
+                'split', 'tuner', 'spanIndex', 'filterWidth', 'filterShape',
+                'duplex', 'duplexOffset'];
+            for (var i = 0; i < passthrough.length; i++) {
+                var k = passthrough[i];
+                if (this.state[k] !== undefined && this.state[k] !== null) s[k] = this.state[k];
+            }
+            this._emit('status', s);
+        }
+
+        _startPolling() {
+            // Idempotent — _startPolling can be called both from connect and
+            // from the power-on path; without this guard each call would leak
+            // the previous interval handles.
+            if (this._sMeterTimer || this._safetyPollTimer) return;
+            // RX: S-meter every 200ms while not transmitting.
+            // TX: power, SWR, ALC every 200ms while transmitting.
+            this._sMeterTimer = setInterval(() => {
+                if (!this._open) return;
+                if (this.state.transmitting) {
+                    this._enqueue('readPowerMeter', civ.cmdReadPowerMeter());
+                    this._enqueue('readSwrMeter',   civ.cmdReadSwrMeter());
+                    this._enqueue('readAlcMeter',   civ.cmdReadAlcMeter());
+                    // Whichever of Comp/Vd/Id the switchable bar is showing.
+                    // SWR and ALC are already above, so they need nothing extra.
+                    var extra = TX_METER_KINDS[this._txMeterKind];
+                    if (extra && civ[extra.read])
+                        this._enqueue('read_' + this._txMeterKind, civ[extra.read]());
+                    // CW (and any rig-initiated TX) keys without a setPTT
+                    // command, so we don't get a self-clearing edge. Poll PTT
+                    // here to detect auto-unkey and flip back to S-meter.
+                    this._enqueue('readPTT', civ.cmdReadPTT());
+                } else {
+                    this._enqueue('readSMeter', civ.cmdReadSMeter());
+                }
+            }, 200);
+            this._safetyPollTimer = setInterval(() => {
+                if (!this._open) return;
+                var now = Date.now();
+                if (now - this._lastFreqStamp > 2000) this._enqueue('readFreq', civ.cmdReadFrequency());
+                if (now - this._lastModeStamp > 2000) this._enqueue('readMode', civ.cmdReadMode());
+                // The rig stores a separate duplex offset per band, so a band
+                // change silently replaces it. Re-read on the slow tick.
+                if (this._hasDuplex && (this._dupPollTick = (this._dupPollTick || 0) + 1) % 5 === 0) {
+                    this._enqueue('readSplit', civ.cmdReadSplit());
+                    this._enqueue('readDuplexOffset', civ.cmdReadDuplexOffset());
+                }
+                // Tone is per-band too, and can be changed from the front
+                // panel — re-read on the same slow tick.
+                if ((this._tonePollTick = (this._tonePollTick || 0) + 1) % 5 === 0) {
+                    this._enqueueToneReads();
+                    // BK-IN is a front-panel key too: keep the CW bar's button honest.
+                    if (this._hasBreakIn) this._enqueue('readBreakIn', civ.cmdReadBreakIn());
+                    // So is COMP; skipped while transmitting, when wfweb may hold it.
+                    if (this._hasCompressor && !this.state.transmitting)
+                        this._enqueue('read_setCompressor', civ.cmdReadBoolFunc(0x44));
+                }
+            }, 1000);
+            // Slow refresh of the unselected/Sub VFO so dial motion on the
+            // *other* VFO eventually shows up in the side display. The rig
+            // doesn't push unsolicited 0x25 0x01 frames on its
+            // own — without this, the side stays stale forever.
+            if (this._dualVfoMode !== 'single') {
+                this._otherVfoPollTimer = setInterval(() => {
+                    if (!this._open || this.state.transmitting) return;
+                    this._enqueueDualVfoReads();
+                }, 3000);
+            }
+        }
+
+        _stopPolling() {
+            if (this._sMeterTimer) { clearInterval(this._sMeterTimer); this._sMeterTimer = null; }
+            if (this._safetyPollTimer) { clearInterval(this._safetyPollTimer); this._safetyPollTimer = null; }
+            if (this._otherVfoPollTimer) { clearInterval(this._otherVfoPollTimer); this._otherVfoPollTimer = null; }
+        }
+
+        _notifyClose(reason) {
+            if (!this._open) return;
+            this._open = false;
+            this._stopPolling();
+            this._stopRxAudio().catch(function () {});
+            this._stopTxAudio().catch(function () {});
+            this.dispatchEvent(new CustomEvent('close', { detail: { reason: reason } }));
+        }
+
+        // ----------------------------------------------------------------
+        // RX audio (Phase 2): rig USB audio → AudioWorklet → 0x02 frames
+        // ----------------------------------------------------------------
+
+        async _startRxAudio() {
+            if (this._rxAudio.enabled) return;
+            this._rxAudio.enabled = true;
+
+            var stream = await this._openRxStream();
+            this._rxAudio.stream = stream;
+
+            // AudioContext at 48kHz to match what we tell the SPA in rigInfo.
+            // The browser resamples the device's native rate as needed.
+            var ctx = new AudioContext({ sampleRate: 48000 });
+            this._rxAudio.ctx = ctx;
+
+            // Inline AudioWorklet processor — copies Float32 input to main
+            // thread. The SPA does the rest of the work (Int16 conversion is
+            // done here, then handed off to handleAudioData via 0x02 frame).
+            var workletCode =
+                'class RxCapture extends AudioWorkletProcessor {' +
+                '  process(inputs) {' +
+                '    var i = inputs[0];' +
+                '    if (i && i[0]) this.port.postMessage(i[0].slice());' +
+                '    return true;' +
+                '  }' +
+                '}' +
+                'registerProcessor("wfweb-rx-capture", RxCapture);';
+            var url = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+            await ctx.audioWorklet.addModule(url);
+            URL.revokeObjectURL(url);
+
+            var src = ctx.createMediaStreamSource(stream);
+            var node = new AudioWorkletNode(ctx, 'wfweb-rx-capture');
+            src.connect(node);
+            // Intentionally no connect to ctx.destination — this context
+            // is capture-only; the SPA's playback path owns the speakers.
+
+            this._rxAudio.source = src;
+            this._rxAudio.node = node;
+
+            // Tell the SPA audio is now enabled so handleAudioData() starts
+            // accepting our synthesized 0x02 frames. Without this, audioEnabled
+            // stays false and every incoming frame is dropped at the top of
+            // handleAudioData. dispatchEvent runs the SPA listener
+            // synchronously, so audioEnabled is true before we set up
+            // port.onmessage and the first sample chunk flows.
+            this._emit('audioStatus', { enabled: true, sampleRate: 48000 });
+
+            var self = this;
+            node.port.onmessage = function (e) {
+                if (!self._rxAudio.enabled) return;
+                var f32 = e.data;
+                var int16 = new Int16Array(f32.length);
+                for (var i = 0; i < f32.length; i++) {
+                    var s = f32[i];
+                    if (s > 1) s = 1; else if (s < -1) s = -1;
+                    int16[i] = (s * 32767) | 0;
+                }
+                // When RADE is active the speakers receive synthesized speech
+                // — not the rig's modem squawk. Suppress the raw-rig 0x02 emit
+                // and rely on the rxSpeech listener to push synthesized audio
+                // back into the SPA's playback path.
+                if (!(self._rade.enabled && self._rade.modem)) {
+                    // Binary 0x02 frame format: [0x02][0x00][seq u16LE][rsv u16LE][PCM Int16 LE]
+                    var buf = new ArrayBuffer(6 + int16.byteLength);
+                    var view = new DataView(buf);
+                    view.setUint8(0, 0x02);
+                    view.setUint8(1, 0x00);
+                    view.setUint16(2, (self._rxAudio.seq++) & 0xFFFF, true);
+                    view.setUint16(4, 0, true);
+                    new Int16Array(buf, 6).set(int16);
+                    self.dispatchEvent(new CustomEvent('binary', { detail: buf }));
+                }
+
+                // Tee a copy into the packet modem if it's running. Same
+                // 48 kHz Int16 samples; modem.processSamples copies into
+                // the WASM heap before invoking the demod.
+                if (self._packet && self._packet.enabled && self._packet.modem) {
+                    try { self._packet.modem.processSamples(int16); }
+                    catch (err) { console.warn('packet RX feed:', err); }
+                }
+
+                // Tee into RADE demod if it's running. RX speech samples
+                // come back via the rade 'rxSpeech' listener installed in
+                // _radeEnsureModem (re-emitted as 0x02 frames).
+                if (self._rade.enabled && self._rade.modem) {
+                    try { self._rade.modem.processRx(int16); }
+                    catch (err) { console.warn('rade RX feed:', err); }
+                }
+            };
+        }
+
+        async _openRxStream() {
+            var constraints = {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+            };
+
+            // Step 1 — find the rig's audio input by label match.
+            // enumerateDevices() returns labels only after the user has
+            // already granted audio permission to this origin. If labels
+            // are missing we acquire permission once with the default mic
+            // (immediately stopped) so the next enumerate has labels.
+            var devices = await navigator.mediaDevices.enumerateDevices();
+            var hasLabels = devices.some(function (d) {
+                return d.kind === 'audioinput' && d.label;
+            });
+            if (!hasLabels) {
+                var primer = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+                try { primer.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* ignore */ }
+                devices = await navigator.mediaDevices.enumerateDevices();
+            }
+
+            var rigDev = null;
+            for (var i = 0; i < devices.length; i++) {
+                var d = devices[i];
+                if (d.kind === 'audioinput' && RIG_AUDIO_PATTERN.test(d.label)) {
+                    rigDev = d;
+                    break;
+                }
+            }
+
+            // Step 2 — validate / refresh the saved deviceId. If it no
+            // longer points at a rig-labelled device, drop it. The early
+            // bug here was: a stale id pointing at the laptop mic caused
+            // permanent loopback (mic → 0x02 frames → speakers).
+            var savedId = null;
+            try { savedId = localStorage.getItem('directRxAudioId'); } catch (e) { /* ignore */ }
+            if (savedId) {
+                var match = devices.find(function (x) {
+                    return x.kind === 'audioinput' && x.deviceId === savedId;
+                });
+                if (!match || !RIG_AUDIO_PATTERN.test(match.label || '')) {
+                    try { localStorage.removeItem('directRxAudioId'); } catch (e) { /* ignore */ }
+                    savedId = null;
+                }
+            }
+
+            if (!rigDev && !savedId) {
+                throw new Error('No rig audio input device found. Plug in the rig USB cable, grant audio permission, and reload.');
+            }
+
+            var deviceId = rigDev ? rigDev.deviceId : savedId;
+            var c = Object.assign({ deviceId: { exact: deviceId } }, constraints);
+            var stream = await navigator.mediaDevices.getUserMedia({ audio: c });
+            try { localStorage.setItem('directRxAudioId', deviceId); } catch (e) { /* ignore */ }
+            if (rigDev) {
+                console.log('SerialRigTransport: using RX audio device:', rigDev.label);
+            }
+            return stream;
+        }
+
+        async _stopRxAudio() {
+            if (!this._rxAudio.enabled && !this._rxAudio.ctx) return;
+            this._rxAudio.enabled = false;
+            this._emit('audioStatus', { enabled: false });
+            if (this._rxAudio.node) {
+                try { this._rxAudio.node.port.onmessage = null; } catch (e) { /* ignore */ }
+                try { this._rxAudio.node.disconnect(); } catch (e) { /* ignore */ }
+                this._rxAudio.node = null;
+            }
+            if (this._rxAudio.source) {
+                try { this._rxAudio.source.disconnect(); } catch (e) { /* ignore */ }
+                this._rxAudio.source = null;
+            }
+            if (this._rxAudio.stream) {
+                try { this._rxAudio.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* ignore */ }
+                this._rxAudio.stream = null;
+            }
+            if (this._rxAudio.ctx) {
+                try { await this._rxAudio.ctx.close(); } catch (e) { /* ignore */ }
+                this._rxAudio.ctx = null;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Packet (WASM Direwolf) — RX feed + APRS UI-frame TX
+        // ----------------------------------------------------------------
+
+        async _packetEnsureModem() {
+            if (this._packet.modem) return this._packet.modem;
+            if (!this._packet.modulePromise) {
+                this._packet.modulePromise = import('/wasm/direwolf-modem.js');
+            }
+            var mod = await this._packet.modulePromise;
+            var modem = await mod.DirewolfModem.create();
+            modem.init(this._packet.mode, 48000);
+            // Cache the parser/builders so we don't re-look them up on
+            // each RX frame.
+            this._packet.parseAx25 = mod.parseAx25Frame;
+            this._packet.aprsBuildPos = mod.aprsBuildUncompressedPosition;
+            this._packet.aprsBuildLine = mod.aprsBuildMonitorLine;
+
+            // APRS layer: parses positions out of UI frames, maintains a
+            // station db, runs the periodic-beacon timer. We hang it off
+            // the modem so the aprsBeaconConfig handler can reach it.
+            var aprs = new mod.AprsProcessor();
+            this._packet.aprsProc = aprs;
+            modem._aprsProc = aprs;
+
+            var self = this;
+            modem.onFrame = function (chan, alevel, bytes) {
+                var json = self._packet.parseAx25(bytes, chan, alevel);
+                if (!json) return;
+                json.type = 'packetRxFrame';
+                self._emit('message', json);
+                // Feed UI frames into APRS (it ignores non-UI / non-position).
+                aprs.onRxFrame(json);
+            };
+            // Local TX frames — fires for every encoded frame (APRS UI
+            // one-shots and connected-mode I/S/U). Surface them in the
+            // monitor pane the same way the C++ server's txFrameDecoded
+            // path does (packetRxFrame with tx:true → orange row).
+            modem.onTxFrame = function (chan, bytes) {
+                var json = self._packet.parseAx25(bytes, chan, 0);
+                if (!json) return;
+                json.type = 'packetRxFrame';
+                json.tx = true;
+                self._emit('message', json);
+            };
+            // APRS layer dispatches a 'station' event for each updated
+            // station and 'txBeacon' when the periodic timer fires.
+            aprs.addEventListener('station', function (ev) {
+                self._emit('message', ev.detail);
+            });
+            aprs.addEventListener('txBeacon', function (ev) {
+                // Re-use the same TX path as the one-shot beacon button.
+                // The detail carries SRC + DST + path + info; _packetTxBeacon
+                // wants {src, lat, lon, symTable, symCode, comment, path}
+                // so we feed the cached config straight back through it
+                // — the AprsProcessor already built the info string.
+                self._packetTxBeaconRaw(ev.detail);
+            });
+            // Push an initial empty snapshot so packet.js's heard-list
+            // renders even before the first RX.
+            self._emit('message', aprs.snapshot());
+
+            // AX.25 connected-mode link layer. Wraps the WASM
+            // ax25_link.c + dlq.c surface and runs a JS-driven
+            // dispatcher tick (~50 ms). Events surface as termSession /
+            // termData / termAck / termClose JSON messages.
+            var link = new mod.Ax25Link(modem);
+            link.start();
+            this._packet.link = link;
+            link.addEventListener('linkEstablished', function (ev) {
+                self._termOnLinkEstablished(ev.detail);
+            });
+            link.addEventListener('linkTerminated', function (ev) {
+                self._termOnLinkTerminated(ev.detail);
+            });
+            link.addEventListener('rxData', function (ev) {
+                self._termOnRxData(ev.detail);
+            });
+            link.addEventListener('dataAcked', function (ev) {
+                self._termOnDataAcked(ev.detail);
+            });
+            // Audio coming back from the link's TX path. Each event
+            // carries one TX burst (one or more I-frames coalesced).
+            // We queue them and drain serially through the same
+            // PTT-key-ship-unkey flow APRS one-shot uses.
+            link.addEventListener('transmitFrameAudio', function (ev) {
+                self._terminal.txQueue.push(ev.detail.audio);
+                self._termDrainTxQueue().catch(function (err) {
+                    console.error('term TX drain:', err);
+                });
+            });
+
+            this._packet.modem = modem;
+            return modem;
+        }
+
+        _packetSetEnabled(on) {
+            this._packet.enabled = !!on;
+            if (on) {
+                // Lazy-load on first enable so the WASM cost is opt-in.
+                // Modem load is fine to do without a user gesture (it's
+                // just a fetch + WASM compile), but the TX AudioContext
+                // is NOT — we used to pre-init it here too, but packet.js
+                // restores the saved PACKET-ON state from localStorage on
+                // page load and that fires this handler outside any user
+                // gesture, so the AudioContext creation rejected and the
+                // cached rejected promise poisoned every later TX. Defer
+                // audio init to the first TX click (which IS a gesture).
+                this._packetEnsureModem().catch(function (err) {
+                    console.error('packet: modem load failed:', err);
+                });
+            } else if (this._packet.aprsProc) {
+                // Stop the periodic beacon timer when packet is disabled —
+                // otherwise it keeps firing and triggering TX failures.
+                this._packet.aprsProc.setBeaconConfig({ enabled: false });
+            }
+            this._emit('message', {
+                type: 'packetStatus',
+                enabled: this._packet.enabled,
+                mode: this._packet.mode,
+            });
+        }
+
+        _packetSetMode(baud) {
+            if (baud !== 300 && baud !== 1200 && baud !== 9600) return;
+            this._packet.mode = baud;
+            if (this._packet.modem) this._packet.modem.init(baud, 48000);
+            // Frack/paclen scale with baud — see AX25LinkProcessor::
+            // setLinkParamsForBaud.  Keeps T1 retries sane on slow HF.
+            if (this._packet.link) this._packet.link.setBaud(baud);
+            this._emit('message', {
+                type: 'packetStatus',
+                enabled: this._packet.enabled,
+                mode: this._packet.mode,
+            });
+        }
+
+        _packetSendChunk(audio, off, n, seq) {
+            // Build a single 0x03 binary audio frame from a slice of the
+            // encoded burst and ship it to sendAudioFrame() (where it gets
+            // converted to Float32 and posted to the rig-USB-out worklet).
+            var slice = audio.subarray(off, off + n);
+            var buf = new ArrayBuffer(6 + slice.byteLength);
+            var view = new DataView(buf);
+            view.setUint8(0, 0x03);
+            view.setUint8(1, 0x01);   // modem-audio tag — see sendAudioFrame
+            view.setUint16(2, seq & 0xFFFF, true);
+            view.setUint16(4, 0, true);
+            new Int16Array(buf, 6).set(slice);
+            if (typeof this.sendAudioFrame === 'function') {
+                this.sendAudioFrame(buf);
+            }
+
+            // Also tee the same audio back to the SPA as a 0x04 frame so
+            // the packet panel can show the TX burst on its waterfall —
+            // matches what the C++ wfweb webserver does (via TX-echo
+            // 0x04 frames). rateDiv = sample rate / 1000.
+            var echoBuf = new ArrayBuffer(6 + slice.byteLength);
+            var echoView = new DataView(echoBuf);
+            echoView.setUint8(0, 0x04);
+            echoView.setUint8(1, 0x00);
+            echoView.setUint16(2, seq & 0xFFFF, true);
+            echoView.setUint16(4, 48, true);   // 48 samples/ms = 48 kHz
+            new Int16Array(echoBuf, 6).set(slice);
+            this.dispatchEvent(new CustomEvent('binary', { detail: echoBuf }));
+        }
+
+        // Wrapper for periodic-beacon TX: AprsProcessor has already built
+        // the info string and chosen the destination, so we skip the
+        // lat/lon path of _packetTxBeacon and feed it through directly.
+        _packetTxBeaconRaw(detail) {
+            this._packetTxBeacon({
+                src: detail.src,
+                dst: detail.dst,
+                path: detail.path,
+                _info: detail.info,
+            });
+        }
+
+        async _packetTxBeacon(obj) {
+            // SPA payload: { src, lat, lon, symTable, symCode, comment, path }.
+            // Format → APRS uncompressed position → TNC monitor line → WASM
+            // modem → audio. Audio is dispatched as 0x03 frames the same
+            // way the SPA's mic capture worklet would, so the existing
+            // sendAudioFrame() path forwards them to the rig USB out.
+            //
+            // The periodic-beacon path passes a pre-built info string in
+            // obj._info (the AprsProcessor formatted it already); we skip
+            // lat/lon validation in that case.
+            var self = this;
+            var fail = function (reason) {
+                self._emit('message', { type: 'packetTxFailed', reason: reason });
+            };
+            // Re-entry guard: a second click while a TX is in flight would
+            // race the PTT-on/-off enqueues against the in-flight queue and
+            // leave the rig keyed (or the button disabled). Drop the second.
+            if (this._packet.txInFlight) { fail('TX already in progress'); return; }
+            if (!obj.src) { fail('missing source callsign'); return; }
+            if (!obj._info) {
+                if (typeof obj.lat !== 'number' || typeof obj.lon !== 'number') {
+                    fail('missing or invalid lat/lon'); return;
+                }
+            }
+            this._packet.txInFlight = true;
+            // Hard watchdog: independent of the try/finally below, force
+            // an unkey + UI recovery after 30 s no matter what. Catches
+            // the case where one of the awaits in the try block hangs
+            // silently — finally never runs, so without this safety the
+            // button stays disabled and the rig stays keyed forever.
+            var watchdogFired = false;
+            var watchdog = setTimeout(function () {
+                if (self._packet.txInFlight) {
+                    watchdogFired = true;
+                    console.warn('packet TX: watchdog forcing unkey + recovery');
+                    self.sendCommand({ cmd: 'setPTT', value: false });
+                    self._emit('message', { type: 'packetTxFailed', reason: 'TX watchdog (30s)' });
+                    self._packet.txInFlight = false;
+                }
+            }, 30000);
+            try {
+                var modem = await this._packetEnsureModem();
+                var info = obj._info || this._packet.aprsBuildPos(
+                    obj.lat, obj.lon, obj.symTable, obj.symCode, obj.comment);
+                var dst = obj.dst || 'APRS';
+                var monitor = this._packet.aprsBuildLine(obj.src, info, obj.path, dst);
+                var audio = modem.txFrame(monitor);
+                if (!audio) { fail('modem rejected frame'); return; }
+
+                this._emit('message', { type: 'packetTxStarted' });
+                // The TX-frame trampoline (modem.onTxFrame, hooked above)
+                // surfaces the encoded frame in the monitor pane on its
+                // own — same path connected-mode TX uses, so APRS one-shots
+                // and link-layer frames render identically.
+
+                // Switch the rig to USB MOD INPUT so it actually modulates
+                // the audio we're streaming over the USB cable. Same fix the
+                // voice path applies on enableMic — without it the rig keys
+                // but transmits empty carrier (the front-panel MIC source
+                // sees nothing). Set both DATA-OFF (FM/USB voice) and DATA1
+                // (USB-D / LSB-D data mode) so it works across all packet
+                // bauds. Restored on disconnect (close) — the voice path's
+                // own enableMic flow re-sets these for SSB voice.
+                this._setModInput('setDataOffMod', this._modIn.off, this._modIn.usbReg);
+                this._setModInput('setDataMod', this._modIn.data1, this._modIn.usbReg);
+
+                // Make sure the TX audio context is initialised BEFORE we
+                // key the rig and start pumping samples. This SHOULD already
+                // be done from the pre-init in _packetSetEnabled, but cover
+                // the case where the user clicked TX-Beacon before the
+                // pre-init completed (within ~500 ms of PACKET ON).
+                if (!this._txAudio.ctx) {
+                    try {
+                        await this._ensureTxAudioCtx();
+                    } catch (e) {
+                        console.warn('packet TX: audio ctx init failed:', e);
+                    }
+                }
+
+                // Pre-buffer some audio chunks BEFORE keying PTT — same
+                // pattern FT8's onFirstChunk uses (waits ~100 ms of audio
+                // in the worklet ring buffer before firing setPTT). On a
+                // cold start, posting to a freshly-created worklet and
+                // immediately keying PTT can leave the rig keyed with the
+                // first chunks not yet drained.
+                var seq = 0;
+                var CHUNK = 960;
+                var PREBUFFER_CHUNKS = 5;  // ~100 ms @ 48 kHz
+                var off = 0;
+                for (var pre = 0; pre < PREBUFFER_CHUNKS && off < audio.length; pre++) {
+                    var n = Math.min(CHUNK, audio.length - off);
+                    this._packetSendChunk(audio, off, n, seq++);
+                    off += n;
+                }
+
+                // Now key the rig. Route through sendCommand so
+                // state.transmitting flips and the SPA's PTT indicator
+                // lights up — same path FT8 / voice use.
+                this.sendCommand({ cmd: 'setPTT', value: true, digital: true });
+
+                // Push the rest of the audio.
+                while (off < audio.length) {
+                    var rest = Math.min(CHUNK, audio.length - off);
+                    this._packetSendChunk(audio, off, rest, seq++);
+                    off += rest;
+                }
+                // Wait for the audio to play out, plus a tail so the
+                // postamble flags fully unkey. await + try/finally below
+                // guarantees PTT-off + packetTxComplete fire even if any
+                // step earlier threw — the previous setTimeout-based path
+                // could leave the button stuck if a second click clobbered
+                // the in-flight enqueue.
+                var durationMs = (audio.length / 48000) * 1000 + 150;
+                await new Promise(function (r) { setTimeout(r, durationMs); });
+            } catch (err) {
+                console.error('packet TX:', err);
+                fail(err && err.message ? err.message : String(err));
+            } finally {
+                clearTimeout(watchdog);
+                // Skip cleanup if the watchdog already did it — we'd
+                // otherwise emit packetTxComplete after packetTxFailed and
+                // re-toggle the UI.
+                if (!watchdogFired) {
+                    this.sendCommand({ cmd: 'setPTT', value: false });
+                    this._emit('message', { type: 'packetTxComplete' });
+                    this._packet.txInFlight = false;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // AX.25 connected-mode terminal (term*)
+        // ----------------------------------------------------------------
+
+        _termSessionToJson(s) {
+            return {
+                sid:      s.sid,
+                ownCall:  s.ownCall,
+                peerCall: s.peerCall,
+                digis:    s.digis ? s.digis.slice() : [],
+                chan:     s.chan,
+                state:    s.state,
+                incoming: !!s.incoming,
+                opened:   s.opened || 0,
+            };
+        }
+
+        _termList() {
+            var sessions = [];
+            this._terminal.sessions.forEach((s) => sessions.push(this._termSessionToJson(s)));
+            this._emit('message', { type: 'termList', sessions: sessions });
+        }
+
+        _termHistory(obj) {
+            var s = this._terminal.sessions.get(obj.sid);
+            if (!s) return;
+            this._emit('message', {
+                type: 'termHistory', sid: s.sid,
+                entries: (s.scrollback || []).slice(),
+            });
+        }
+
+        _termRegister(obj) {
+            // The SPA registers its station callsign so inbound SABMs
+            // addressed to it get a UA back. We assign one client id per
+            // registration; the same id is reused if the registration
+            // already exists, so re-registering on reconnect is cheap.
+            var self = this;
+            var ownCall = (obj.ownCall || '').toUpperCase();
+            var chan    = (obj.chan | 0);
+            if (!ownCall) return;
+            this._packetEnsureModem().then(function () {
+                var key = ownCall + '@' + chan;
+                var reg = self._terminal.regsByCall.get(key);
+                if (!reg) {
+                    reg = { ownCall, chan, client: self._terminal.nextClient++ };
+                    self._terminal.regsByCall.set(key, reg);
+                }
+                self._packet.link.registerCall(chan, reg.client, ownCall);
+            }).catch(function (err) {
+                console.error('termRegister:', err);
+            });
+        }
+
+        _termConnect(obj) {
+            // Outgoing connect. Allocates a new sid + client; the link
+            // layer's linkEstablished event will flip the session to
+            // 'connected' once SABM/UA completes.
+            var self = this;
+            var ownCall  = (obj.ownCall  || '').toUpperCase();
+            var peerCall = (obj.peerCall || '').toUpperCase();
+            var chan     = (obj.chan | 0);
+            var digis    = (obj.digis || []).map(function (d) { return d.toUpperCase(); });
+            if (!ownCall || !peerCall) return;
+            this._packetEnsureModem().then(function () {
+                var sid = 's' + (self._terminal.nextSid++);
+                var client = self._terminal.nextClient++;
+                var sess = {
+                    sid, client, ownCall, peerCall, digis, chan,
+                    state: 'connecting', incoming: false,
+                    opened: Date.now(),
+                    scrollback: [],
+                };
+                self._terminal.sessions.set(sid, sess);
+                self._terminal.byClient.set(client, sess);
+                // Register so we'll accept the UA reply addressed to us.
+                self._packet.link.registerCall(chan, client, ownCall);
+                self._emit('message', Object.assign({ type: 'termSession' },
+                    self._termSessionToJson(sess)));
+                self._packet.link.connectRequest({
+                    chan, client, ownCall, peerCall, digis,
+                });
+            }).catch(function (err) {
+                console.error('termConnect:', err);
+            });
+        }
+
+        _termDisconnect(obj) {
+            var s = this._terminal.sessions.get(obj.sid);
+            if (!s || !this._packet.link) return;
+            this._packet.link.disconnectRequest({
+                chan: s.chan, client: s.client,
+                ownCall: s.ownCall, peerCall: s.peerCall, digis: s.digis,
+            });
+            // Don't drop the session yet — wait for linkTerminated so the
+            // disconnect handshake's TX bytes can drain.
+        }
+
+        _termSend(obj) {
+            var s = this._terminal.sessions.get(obj.sid);
+            if (!s || !this._packet.link) return;
+            if (s.state !== 'connected') return;
+            // Append to scrollback as pending TX so the SPA shows it
+            // queued; the dataAcked event will flip it to delivered.
+            var entry = { ts: Date.now(), dir: 'tx', data: obj.data, pending: true };
+            s.scrollback.push(entry);
+            this._emit('message', Object.assign({ type: 'termData', sid: s.sid }, entry));
+            this._packet.link.sendData({
+                chan: s.chan, client: s.client,
+                ownCall: s.ownCall, peerCall: s.peerCall, digis: s.digis,
+                pid: 0xF0, data: obj.data,
+            });
+        }
+
+        // --- link event handlers ---
+
+        _termOnLinkEstablished(d) {
+            var s = this._terminal.byClient.get(d.client);
+            if (!s) {
+                // Inbound SABM — find/create the session by registered
+                // ownCall + remote peer.
+                var ownCall = (d.own || '').toUpperCase();
+                var peerCall = (d.remote || '').toUpperCase();
+                s = this._termFindOrCreateInboundSession({
+                    chan: d.chan, client: d.client, ownCall, peerCall,
+                });
+            }
+            s.state = 'connected';
+            s.incoming = !!d.incoming;
+            this._emit('message', Object.assign({ type: 'termSession' },
+                this._termSessionToJson(s)));
+        }
+
+        _termFindOrCreateInboundSession({ chan, client, ownCall, peerCall }) {
+            var sid = 's' + (this._terminal.nextSid++);
+            var sess = {
+                sid, client, ownCall, peerCall, digis: [], chan,
+                state: 'connecting', incoming: true,
+                opened: Date.now(),
+                scrollback: [],
+            };
+            this._terminal.sessions.set(sid, sess);
+            this._terminal.byClient.set(client, sess);
+            return sess;
+        }
+
+        _termOnLinkTerminated(d) {
+            var s = this._terminal.byClient.get(d.client);
+            if (!s) return;
+            this._terminal.sessions.delete(s.sid);
+            this._terminal.byClient.delete(s.client);
+            // Tell the link layer to release any cdata still queued.
+            if (this._packet.link) this._packet.link.clientCleanup(s.client);
+            this._emit('message', { type: 'termClose', sid: s.sid });
+        }
+
+        _termOnRxData(d) {
+            var s = this._terminal.byClient.get(d.client);
+            if (!s) return;
+            // ax25_link hands us bytes (Uint8Array). Most BBS / TNC
+            // traffic is plain ASCII; render as UTF-8 so accented
+            // chars survive.
+            var text;
+            try {
+                text = new TextDecoder('utf-8', { fatal: false }).decode(d.data);
+            } catch (_) {
+                text = String.fromCharCode.apply(null, d.data);
+            }
+            var entry = { ts: Date.now(), dir: 'rx', data: text };
+            s.scrollback.push(entry);
+            this._emit('message', Object.assign({ type: 'termData', sid: s.sid }, entry));
+        }
+
+        _termOnDataAcked(d) {
+            var s = this._terminal.byClient.get(d.client);
+            if (!s) return;
+            this._emit('message', {
+                type: 'termAck', sid: s.sid, count: d.count | 0,
+            });
+        }
+
+        // --- TX queue drain ---
+
+        async _termDrainTxQueue() {
+            // Single-flight: if a drain is already running, the new audio
+            // will be picked up when the current burst completes.
+            if (this._terminal.txDraining) return;
+            // Don't try to TX while a one-shot APRS beacon is mid-flight
+            // (or vice-versa) — both share PTT and tx_buf; serialise.
+            if (this._packet.txInFlight) {
+                // Re-poll shortly; APRS beacons are short.
+                setTimeout(() => this._termDrainTxQueue().catch(function () {}), 200);
+                return;
+            }
+            this._terminal.txDraining = true;
+            try {
+                while (this._terminal.txQueue.length) {
+                    var audio = this._terminal.txQueue.shift();
+                    if (!audio || !audio.length) continue;
+                    await this._packetTxAudio(audio);
+                }
+            } finally {
+                this._terminal.txDraining = false;
+            }
+        }
+
+        // Ship a pre-encoded audio burst to the rig: switch MOD INPUT,
+        // pre-buffer chunks, key PTT, drain, unkey, wait. Re-uses the
+        // existing _packetSendChunk and the rig's MOD INPUT setup the
+        // APRS one-shot path uses, just with audio handed in instead of
+        // built from a monitor string.
+        async _packetTxAudio(audio) {
+            var self = this;
+            this._packet.txInFlight = true;
+            var watchdogFired = false;
+            var watchdog = setTimeout(function () {
+                if (self._packet.txInFlight) {
+                    watchdogFired = true;
+                    console.warn('term TX: watchdog forcing unkey');
+                    self.sendCommand({ cmd: 'setPTT', value: false });
+                    self._packet.txInFlight = false;
+                }
+            }, 30000);
+            try {
+                // Tee the local TX as 0x04 frames so the packet panel
+                // waterfall shows what we sent. (No frame-level RX shim
+                // for connected-mode I-frames — those'd need ax25_pack
+                // out of the link's tx_buf, which we don't have here.)
+                this._setModInput('setDataOffMod', this._modIn.off, this._modIn.usbReg);
+                this._setModInput('setDataMod', this._modIn.data1, this._modIn.usbReg);
+
+                if (!this._txAudio.ctx) {
+                    try { await this._ensureTxAudioCtx(); }
+                    catch (e) { console.warn('term TX: audio ctx init failed:', e); }
+                }
+
+                var seq = 0;
+                var CHUNK = 960;
+                var PREBUFFER_CHUNKS = 5;
+                var off = 0;
+                for (var pre = 0; pre < PREBUFFER_CHUNKS && off < audio.length; pre++) {
+                    var n = Math.min(CHUNK, audio.length - off);
+                    this._packetSendChunk(audio, off, n, seq++);
+                    off += n;
+                }
+                this.sendCommand({ cmd: 'setPTT', value: true, digital: true });
+                while (off < audio.length) {
+                    var rest = Math.min(CHUNK, audio.length - off);
+                    this._packetSendChunk(audio, off, rest, seq++);
+                    off += rest;
+                }
+                var durationMs = (audio.length / 48000) * 1000 + 150;
+                await new Promise(function (r) { setTimeout(r, durationMs); });
+            } finally {
+                clearTimeout(watchdog);
+                if (!watchdogFired) {
+                    this.sendCommand({ cmd: 'setPTT', value: false });
+                    this._packet.txInFlight = false;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // RADE V1 — browser-only voice via LPCNet/FARGAN/RADE WASM.
+        //
+        // The modem stays loaded across PTT cycles; only TX activity flips
+        // on/off via _rade.txActive, which sendAudioFrame and _radePttOff
+        // observe. RX speech is rendered as 0x02 frames so the SPA's
+        // existing audio playback path picks it up — same channel the rig
+        // audio uses, swapped in transparently while RADE mode is on.
+        // ----------------------------------------------------------------
+
+        async _radeEnsureModem() {
+            if (this._rade.modem) return this._rade.modem;
+            if (!this._rade.modulePromise) {
+                this._rade.modulePromise = import('/wasm/rade-modem.js');
+            }
+            var mod = await this._rade.modulePromise;
+            var modem = await mod.RadeModem.create();
+            // 48 kHz to match every other audio path on the page.
+            modem.init(48000);
+            if (this._rade.callsign) modem.setTxCallsign(this._rade.callsign);
+
+            var self = this;
+            // RX synthesized speech → re-emit as 0x02 frames. The SPA
+            // already knows how to play these.
+            modem.addEventListener('rxSpeech', function (ev) {
+                var samples = ev.detail.samples;
+                if (!samples || !samples.length) return;
+                var buf = new ArrayBuffer(6 + samples.byteLength);
+                var view = new DataView(buf);
+                view.setUint8(0, 0x02);
+                view.setUint8(1, 0x00);
+                view.setUint16(2, (self._rade.rxSpeechSeq++) & 0xFFFF, true);
+                view.setUint16(4, 0, true);
+                new Int16Array(buf, 6).set(samples);
+                self.dispatchEvent(new CustomEvent('binary', { detail: buf }));
+            });
+            // TX modem audio → pipe directly into the playback worklet.
+            // Bypass sendAudioFrame to avoid the RADE intercept above
+            // (would loop forever).
+            modem.addEventListener('txReady', function (ev) {
+                var samples = ev.detail.samples;
+                if (!samples || !samples.length) return;
+                if (!self._txAudio.ctx) {
+                    self._ensureTxAudioCtx().catch(function () {});
+                    return;
+                }
+                if (!self._txAudio.node) return;
+                var f32 = new Float32Array(samples.length);
+                for (var i = 0; i < samples.length; i++) f32[i] = samples[i] / 32768;
+                try { self._txAudio.node.port.postMessage(f32); } catch (e) { /* node closed */ }
+            });
+            // Stats + decoded callsign → forward as messages so the SPA UI
+            // can update without knowing about the RadeModem object.
+            modem.addEventListener('statsUpdate', function (ev) {
+                self._emit('message', {
+                    type: 'radeStats',
+                    snr:  ev.detail.snr,
+                    sync: ev.detail.sync,
+                    freqOffset: ev.detail.freqOffset,
+                });
+            });
+            modem.addEventListener('rxCallsign', function (ev) {
+                self._emit('message', { type: 'radeCallsign', callsign: ev.detail.callsign });
+            });
+
+            this._rade.modem = modem;
+            return modem;
+        }
+
+        async _radeEnable() {
+            await this._radeEnsureModem();
+            // Flip the rig MOD INPUT to USB — same recipe as enableMic for
+            // SSB voice, since RADE rides on USB-DATA-OFF (no rig pre-emph).
+            if (this._rigCanTransmit() && this._modIn) {
+                this._setModInput('setDataOffMod', this._modIn.off, this._modIn.usbReg);
+            }
+            this._rade.enabled = true;
+            this._emit('message', { type: 'radeStatus', enabled: true });
+        }
+
+        _radeDisable() {
+            if (!this._rade.enabled) return;
+            this._rade.enabled = false;
+            this._rade.txActive = false;
+            this._rade.eooSent  = false;
+            this._emit('message', { type: 'radeStatus', enabled: false });
+        }
+
+        // PTT-off path while RADE is live: ship the EOO frame (carries the
+        // encoded callsign — receiver decodes after sync drops), wait long
+        // enough for the buffered audio to play out, then unkey.
+        _radePttOff() {
+            if (!this._rade.modem) {
+                this.state.transmitting = false;
+                this._enqueue('setPTT', civ.cmdSetPTT(false));
+                this._emit('update', { transmitting: false });
+                this._rade.txActive = false;
+                this._releaseCompressor();
+                return;
+            }
+            this._rade.txActive = false;
+            // EOO is generated synchronously and pushed into the playback
+            // worklet via the same path as txReady samples.
+            try {
+                if (!this._rade.eooSent) {
+                    var eoo = this._rade.modem.generateEooAudio();
+                    this._rade.eooSent = true;
+                    if (eoo && eoo.length && this._txAudio.node) {
+                        var f32 = new Float32Array(eoo.length);
+                        for (var i = 0; i < eoo.length; i++) f32[i] = eoo[i] / 32768;
+                        try { this._txAudio.node.port.postMessage(f32); } catch (e) { /* ignore */ }
+                    }
+                }
+            } catch (err) { console.warn('rade EOO:', err); }
+            // Delay unkey so the EOO + tail audio leaves the rig before
+            // PTT drops. ~300 ms matches RadeProcessor.
+            var self = this;
+            setTimeout(function () {
+                self.state.transmitting = false;
+                self._enqueue('setPTT', civ.cmdSetPTT(false));
+                self._emit('update', { transmitting: false });
+                self._releaseCompressor();
+            }, 300);
+        }
+
+        // wfweb's digital modes transmit in plain USB / LSB, where the rig
+        // keeps the operator's voice processing, so a COMP left on for voice
+        // stays in the path: it distorts RADE's OFDM and shifts the level of
+        // an FT8 tone. Older Icoms force it OFF in the SSB data modes; the
+        // IC-7300 generation does not say so. Off for the over, back on
+        // after it (#147).
+        // SSB only, and never on a guess: an unread state is left alone.
+        _holdCompressor() {
+            if (this._compHeld || !this._hasCompressor) return;
+            if (this.state.mode !== 'USB' && this.state.mode !== 'LSB') return;
+            if (this.state.compressor === undefined || this.state.compressor === null) return;
+            this._compHeld = true;
+            this._compRestoreOn = !!this.state.compressor;
+            if (this._compRestoreOn) {
+                this.state.compressor = false;
+                this._enqueue('setCompressor', civ.cmdSetBoolFunc(0x44, false));
+                this._emit('update', { compressor: false });
+            }
+        }
+
+        // Called after the unkey is queued, so COMP returns on receive.
+        _releaseCompressor() {
+            if (!this._compHeld) return;
+            this._compHeld = false;
+            if (this._compRestoreOn) {
+                this.state.compressor = true;
+                this._enqueue('setCompressor', civ.cmdSetBoolFunc(0x44, true));
+                this._emit('update', { compressor: true });
+            }
+            this._compRestoreOn = false;
+        }
+
+        // close(): the queue is about to be dropped, so write it directly.
+        async _restoreCompressorDirect() {
+            var on = this._compHeld && this._compRestoreOn;
+            this._compHeld = false;
+            this._compRestoreOn = false;
+            if (!on || !this.writer) return;
+            try {
+                var frame = civ.buildFrame(this.civAddr, this.controllerAddr,
+                    civ.cmdSetBoolFunc(0x44, true));
+                await withDeadline(this.writer.write(frame), 1000, 'Compressor restore write');
+            } catch (e) { /* best effort — the link may already be gone */ }
+        }
+    }
+
+    SerialRigTransport.handles = function (cmd) { return !!HANDLED_CMDS[cmd]; };
+    SerialRigTransport.rigDisplayName = rigDisplayName;
+
+    global.SerialRigTransport = SerialRigTransport;
+})(window);

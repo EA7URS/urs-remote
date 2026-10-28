@@ -1,0 +1,102 @@
+// Minimal QVector shim — std::vector wrapper.
+#pragma once
+#include "QtGlobal"
+#include <algorithm>
+#include <initializer_list>
+#include <vector>
+
+template <typename T>
+class QVector {
+public:
+    QVector() = default;
+    QVector(std::initializer_list<T> il) : v_(il) {}
+    explicit QVector(int n)         : v_(static_cast<size_t>(n)) {}
+    QVector(int n, const T& val)    : v_(static_cast<size_t>(n), val) {}
+
+    int size()    const { return static_cast<int>(v_.size()); }
+    int length()  const { return size(); }
+    int count()   const { return size(); }
+    bool isEmpty() const { return v_.empty(); }
+    bool empty()   const { return v_.empty(); }
+    void reserve(int n) { v_.reserve(static_cast<size_t>(n)); }
+    void resize(int n)  { v_.resize(static_cast<size_t>(n)); }
+    void clear()        { v_.clear(); }
+
+    // append/push_back take by value: std::vector<bool> uses proxy
+    // references that won't bind to const T&, and the codec uses
+    // QVector<bool> heavily (LDPC bits).
+    void append(T val) { v_.push_back(std::move(val)); }
+    void append(const QVector& o) { for (auto x : o.v_) v_.push_back(x); }
+    void push_back(T val) { v_.push_back(std::move(val)); }
+    void prepend(T val) { v_.insert(v_.begin(), std::move(val)); }
+
+    // decltype(auto) so vector<T>'s native reference type is preserved:
+    // T& for normal types, the bit-reference proxy for vector<bool>.
+    // Both are assignable, so callers can do `v.first().second |= …`
+    // (used in Varicode for QPair element mutation).
+    decltype(auto) operator[](int i)       { return v_[static_cast<size_t>(i)]; }
+    decltype(auto) operator[](int i) const { return v_[static_cast<size_t>(i)]; }
+    decltype(auto) at(int i)               { return v_[static_cast<size_t>(i)]; }
+    decltype(auto) at(int i)         const { return v_[static_cast<size_t>(i)]; }
+    decltype(auto) first()                 { return v_.front(); }
+    decltype(auto) first()           const { return v_.front(); }
+    decltype(auto) last()                  { return v_.back(); }
+    decltype(auto) last()            const { return v_.back(); }
+
+    T*       data()       { return v_.data(); }
+    const T* data() const { return v_.data(); }
+    const T* constData() const { return v_.data(); }
+
+    void removeFirst() { if (!v_.empty()) v_.erase(v_.begin()); }
+    void removeLast()  { if (!v_.empty()) v_.pop_back(); }
+    void removeAt(int i) {
+        if (i >= 0 && i < size()) v_.erase(v_.begin() + i);
+    }
+
+    QVector mid(int pos, int n = -1) const {
+        QVector out;
+        if (pos < 0 || pos >= size()) return out;
+        int end = (n < 0) ? size() : std::min(size(), pos + n);
+        for (int i = pos; i < end; ++i) out.append(v_[static_cast<size_t>(i)]);
+        return out;
+    }
+
+    bool contains(const T& val) const {
+        return std::find(v_.begin(), v_.end(), val) != v_.end();
+    }
+
+    int indexOf(const T& val, int from = 0) const {
+        for (int i = from; i < size(); ++i)
+            if (v_[static_cast<size_t>(i)] == val) return i;
+        return -1;
+    }
+    int lastIndexOf(const T& val) const {
+        for (int i = size() - 1; i >= 0; --i)
+            if (v_[static_cast<size_t>(i)] == val) return i;
+        return -1;
+    }
+
+    QVector& operator+=(const QVector& o) { append(o); return *this; }
+    QVector& operator+=(const T& val) { append(val); return *this; }
+    friend QVector operator+(QVector a, const QVector& b) { a += b; return a; }
+
+    // Qt's QVector supports stream-style append via operator<<.
+    QVector& operator<<(T val)              { append(std::move(val)); return *this; }
+    QVector& operator<<(const QVector& o)   { append(o); return *this; }
+
+    auto begin()       { return v_.begin(); }
+    auto end()         { return v_.end(); }
+    auto begin() const { return v_.begin(); }
+    auto end()   const { return v_.end(); }
+    auto cbegin() const { return v_.cbegin(); }
+    auto cend()   const { return v_.cend(); }
+    auto constBegin() const { return v_.cbegin(); }
+    auto constEnd()   const { return v_.cend(); }
+    using ConstIterator = typename std::vector<T>::const_iterator;
+    using Iterator      = typename std::vector<T>::iterator;
+    using const_iterator = ConstIterator;
+    using iterator       = Iterator;
+
+private:
+    std::vector<T> v_;
+};

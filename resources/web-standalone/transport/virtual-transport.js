@@ -1,0 +1,794 @@
+// Virtual rig transport. No real hardware — the rig's bus is a same-origin
+// BroadcastChannel (AirBus). Every browser tab on /?virtual=1 spins up one
+// of these and they all hear each other's TX as RX.
+//
+// Phase 1: in-memory CI-V state, raw audio across the bus, no modems.
+// Phase 2: synthetic S-meter from incoming bus peak.
+// Phase 3: RADE V1 modem wired in — TX-intercept on sendAudioFrame, RX-tee
+//          on _onAirRx. Direwolf/packet hooks land here next.
+
+(function (global) {
+    'use strict';
+
+    if (!global.RigTransport || !global.AirBus) {
+        console.error('virtual-transport.js: missing prerequisite modules');
+        return;
+    }
+
+    var DEFAULT_MODES   = ['LSB', 'USB', 'AM', 'CW', 'RTTY', 'FM', 'CW-R', 'RTTY-R'];
+    var DEFAULT_FILTERS = [
+        { num: 1, name: 'FIL1' }, { num: 2, name: 'FIL2' }, { num: 3, name: 'FIL3' },
+    ];
+    var DEFAULT_SPANS = [
+        { num: 0, name: '±2.5k', hz: 2500   }, { num: 1, name: '±5k',   hz: 5000   },
+        { num: 2, name: '±10k',  hz: 10000  }, { num: 3, name: '±25k',  hz: 25000  },
+        { num: 4, name: '±50k',  hz: 50000  }, { num: 5, name: '±100k', hz: 100000 },
+        { num: 6, name: '±250k', hz: 250000 },
+    ];
+    var DEFAULT_PREAMPS = [
+        { num: 0, name: 'OFF' }, { num: 1, name: 'PRE1' }, { num: 2, name: 'PRE2' },
+    ];
+
+    // Commands that simply echo their value back as an 'update' field of the
+    // same name. Keeps the table short — exotic commands fall through to a
+    // no-op (the SPA never blocks on a missing reply for these).
+    var ECHO_FIELDS = {
+        setAfGain:        'afGain',
+        setRfGain:        'rfGain',
+        setRfPower:       'rfPower',
+        setSquelch:       'squelch',
+        setMicGain:       'micGain',
+        setMonitorGain:   'monitorGain',
+        setPBTInner:      'pbtInner',
+        setPBTOuter:      'pbtOuter',
+        setCWSpeed:       'cwSpeed',
+        setAutoNotch:     'autoNotch',
+        setNoiseBlanker:  'nb',
+        setNoiseReduction:'nr',
+        setMonitor:       'monitor',
+        setPreamp:        'preamp',
+        setAttenuator:    'attenuator',
+        setBreakIn:       'breakIn',
+        setCompressor:    'compressor',
+        setCompLevel:     'compLevel',
+        setSplit:         'split',
+        setDuplex:        'duplex',
+        setDuplexOffset:  'duplexOffset',
+        setToneMode:      'toneMode',
+        setToneFreq:      'toneFreq',
+        setTsqlFreq:      'tsqlFreq',
+        setTuner:         'tuner',
+        setSpan:          'spanIndex',
+    };
+
+    // Convert a peak Int16 amplitude to the SPA's S-meter scale: dB relative
+    // to S9 (0 = S9, -54 = S0). drawSMeter() expects this units.
+    function peakToDb(peak) {
+        if (peak <= 0) return -54;
+        var db = 20 * Math.log10(peak / 32767);
+        if (db < -54) return -54;
+        if (db > 60)  return 60;
+        return db;
+    }
+
+    // Meter descriptors for the virtual rig, shaped like the ones the serial
+    // transport builds: the IC-705's calibration tables, which is also where
+    // the virtual band table comes from.
+    function virtualTxMeters() {
+        var entry = global.IcomRigCaps && global.IcomRigCaps[0xA4];
+        if (!entry || !entry.meters) return [];
+        var kinds = [['swr','swr'], ['alc','alc'], ['comp','comp'],
+                     ['vd','voltage'], ['id','current']];
+        var out = [];
+        for (var i = 0; i < kinds.length; i++) {
+            var cal = entry.meters[kinds[i][1]];
+            if (!cal || !cal.length) continue;
+            var red;
+            for (var j = 0; j < cal.length; j++) if (cal[j][2]) red = cal[j][1];
+            var d = { kind: kinds[i][0], cal: cal };
+            if (red !== undefined) d.red = red;
+            out.push(d);
+        }
+        return out;
+    }
+
+    class VirtualRigTransport extends global.RigTransport {
+        constructor(opts) {
+            super();
+            opts = opts || {};
+            this.rigId = (opts.rigId | 0) || 1;
+            this._open = false;
+            this._bus = null;
+            this._rxSeq = 0;
+
+            this.state = {
+                frequency: 14074000,
+                // Initial VFO B to a different freq so the side display shows
+                // something distinct from the main display on first load.
+                vfoAFrequency: 14074000,
+                vfoBFrequency: 7074000,
+                selectedVfo: 'A',
+                // Memory channels (#92): a small bank so the MEM panel, recall
+                // and rename can be exercised without a rig. selectedVfo
+                // becomes 'MEM' on recall; memChannel is the recalled channel.
+                memChannel: null,
+                memories: {
+                    1: { channel: 1, group: 0, name: 'FT8 20m', frequency: 14074000, mode: 'USB', filter: 1 },
+                    2: { channel: 2, group: 0, name: '',        frequency: 7074000,  mode: 'USB', filter: 1 },
+                    3: { channel: 3, group: 0, name: 'W1AW',    frequency: 3581500,  mode: 'CW',  filter: 2 },
+                },
+                mode: 'USB',
+                filter: 1,
+                // Per-filter bandwidths (Hz). Real Icoms remember a separate
+                // width for each filter slot; without this the slider would
+                // refuse to move when the user switches filters.
+                filterWidths: { 1: 3000, 2: 2400, 3: 1800 },
+                // Per-filter shape (0 sharp / 1 soft), the FILTER window's
+                // SHARP/SOFT segment.
+                filterShapes: { 1: 0, 2: 0, 3: 0 },
+                transmitting: false,
+                // Two virtual antennas + an RX-antenna input so the FUNC page
+                // ANT / RX ANT buttons (#76) can be exercised without a
+                // multi-antenna rig on the bench.
+                antenna: 0,
+                rxAntenna: false,
+                // Preamp / attenuator both off at start (num 0). The P.AMP/ATT
+                // cycle button walks the caps lists from here.
+                preamp: 0,
+                attenuator: 0,
+                // CW break-in, SEMI like the C++ virtual rig (civemulator).
+                breakIn: 1,
+                // Speech compressor ON at level 5, as a voice operator leaves
+                // it, so the bench shows the digital-TX hold (#147).
+                compressor: true,
+                compLevel: 128,
+                // -54 dB = S0. The drawSMeter() scale treats 0 as S9, so a
+                // default of 0 would paint a permanent full-scale signal.
+                sMeter: -54,
+                // Repeater access tone — echoed back like the DUP fields so
+                // the TONE panel can be exercised off-air.
+                toneMode: 'OFF', toneFreq: 885, tsqlFreq: 885,
+                dtcsCode: 23, dtcsPolarity: 0,
+            };
+            this._audioEnabled = false;
+
+            // S-meter peak detector. _onAirRx tracks max |sample| in the
+            // current 200 ms window; a timer drains the peak, emits a meters
+            // message, and resets. No audio in the window → S0 baseline.
+            // Same shape for the TX-side power/ALC peak.
+            this._sMeterPeak = 0;
+            this._txMeterPeak = 0;
+            this._sMeterTimer = null;
+
+            // RADE V1 voice modem state. Lazy-loaded — the WASM payload is
+            // ~10 MB and we only pull it down when the user picks RADE mode.
+            // While `txActive` is on, mic samples arriving via sendAudioFrame
+            // are diverted into modem.processTx instead of going raw to the
+            // bus; the modem's 'txReady' listener pushes the encoded modem
+            // audio to the bus instead.
+            this._rade = {
+                enabled: false, modem: null, modulePromise: null,
+                txActive: false, eooSent: false,
+                rxSpeechSeq: 0, callsign: null,
+            };
+        }
+
+        async connect() {
+            if (this._open) return;
+            this._bus = new global.AirBus(this.rigId);
+            var self = this;
+            this._bus.addEventListener('rx', function (e) { self._onAirRx(e.detail); });
+            this._open = true;
+            this._sMeterTimer = setInterval(function () { self._tickSMeter(); }, 200);
+            this.dispatchEvent(new Event('open'));
+            this._emitRigInfo();
+        }
+
+        async tryAutoReconnect() { await this.connect(); return true; }
+
+        async close() {
+            if (!this._open) return;
+            this._open = false;
+            if (this._sMeterTimer) { clearInterval(this._sMeterTimer); this._sMeterTimer = null; }
+            if (this._bus) { this._bus.close(); this._bus = null; }
+            this.dispatchEvent(new CustomEvent('close', { detail: { reason: 'user-close' } }));
+        }
+
+        isOpen() { return this._open; }
+
+        sendCommand(obj) {
+            if (!this._open || !obj || !obj.cmd) return;
+
+            if (obj.cmd === 'setDtcsCode') {
+                // Two fields in one command, so it can't ride ECHO_FIELDS.
+                this.state.dtcsCode = obj.value | 0;
+                this.state.dtcsPolarity = obj.polarity | 0;
+                this._emit('update', {
+                    dtcsCode: this.state.dtcsCode,
+                    dtcsPolarity: this.state.dtcsPolarity,
+                });
+                return;
+            }
+            if (ECHO_FIELDS.hasOwnProperty(obj.cmd)) {
+                // Mirror SerialRigTransport: the operator's COMP wins over a hold.
+                if (obj.cmd === 'setCompressor' && this._compHeld) this._compRestoreOn = false;
+                var field = ECHO_FIELDS[obj.cmd];
+                var val = (obj.cmd === 'setCWSpeed') ? obj.wpm : obj.value;
+                if (val === undefined) return;
+                this.state[field] = val;
+                var upd = {}; upd[field] = val;
+                this._emit('update', upd);
+                return;
+            }
+
+            switch (obj.cmd) {
+                case 'getStatus':
+                    this._emitFullStatus();
+                    return;
+                case 'setFrequency':
+                    if (typeof obj.value !== 'number' || obj.value <= 0) return;
+                    this.state.frequency = obj.value;
+                    var sf = (this.state.selectedVfo === 'B') ? 'vfoBFrequency' : 'vfoAFrequency';
+                    this.state[sf] = obj.value;
+                    var sfu = { frequency: obj.value };
+                    sfu[sf] = obj.value;
+                    this._emit('update', sfu);
+                    return;
+                case 'setMode':
+                    if (typeof obj.value !== 'string') return;
+                    this.state.mode = obj.value;
+                    if (obj.filter >= 1 && obj.filter <= 3) {
+                        this.state.filter = obj.filter;
+                        this._emit('update', { mode: obj.value, filter: obj.filter });
+                    } else {
+                        this._emit('update', { mode: obj.value });
+                    }
+                    return;
+                case 'setAntenna':
+                    // Two fields (antenna + rx), so not an ECHO_FIELDS entry.
+                    this.state.antenna = (typeof obj.antenna === 'number') ? obj.antenna : 0;
+                    this.state.rxAntenna = !!obj.rx;
+                    this._emit('update', {
+                        antenna: this.state.antenna,
+                        rxAntenna: this.state.rxAntenna,
+                    });
+                    return;
+                case 'setFilter':
+                    if (typeof obj.value !== 'number') return;
+                    this.state.filter = obj.value;
+                    this._emit('update', {
+                        filter: obj.value,
+                        filterWidth: this.state.filterWidths[obj.value] || 3000,
+                        filterShape: this.state.filterShapes[obj.value] || 0,
+                    });
+                    return;
+                case 'setFilterWidth':
+                    if (typeof obj.value !== 'number' || obj.value <= 0) return;
+                    this.state.filterWidths[this.state.filter] = obj.value;
+                    this._emit('update', { filterWidth: obj.value });
+                    return;
+                case 'setFilterShape':
+                    if (typeof obj.value !== 'number') return;
+                    this.state.filterShapes[this.state.filter] = obj.value ? 1 : 0;
+                    this._emit('update', { filterShape: obj.value ? 1 : 0 });
+                    return;
+                case 'setPTT':
+                    var ptt = !!obj.value;
+                    // Mirror SerialRigTransport: COMP out for a digital over (#147).
+                    if (ptt && (obj.digital || (this._rade.enabled && this._rade.modem)))
+                        this._holdCompressor();
+                    if (this._rade.enabled && this._rade.modem) {
+                        // Mirror SerialRigTransport: on PTT-off ship the EOO
+                        // (carries the encoded callsign — receiver decodes it
+                        // after sync drops) before clearing transmitting.
+                        if (ptt) {
+                            this._rade.txActive = true;
+                            this._rade.eooSent  = false;
+                            this.state.transmitting = true;
+                            this._emit('update', { transmitting: true });
+                        } else {
+                            this._radePttOff();
+                        }
+                        return;
+                    }
+                    this.state.transmitting = ptt;
+                    this._emit('update', { transmitting: ptt });
+                    if (!ptt) this._releaseCompressor();
+                    return;
+                case 'selectVFO':
+                    if (obj.value === 'MEM') {
+                        // V/M on the rig's current channel (default ch 1).
+                        var mch = this.state.memChannel || 1;
+                        this._memRecall(mch);
+                        return;
+                    }
+                    var newVfo = (obj.value === 'B') ? 'B' : 'A';
+                    this.state.selectedVfo = newVfo;
+                    var nvf = (newVfo === 'B') ? this.state.vfoBFrequency : this.state.vfoAFrequency;
+                    this.state.frequency = nvf;
+                    this._emit('update', { selectedVfo: newVfo, frequency: nvf });
+                    return;
+                // ---- Memory channels (#92) ----
+                case 'getMemories': {
+                    var self = this;
+                    var g = obj.group | 0;
+                    var chans = Object.keys(this.state.memories).map(Number).sort(function (a, b) { return a - b; });
+                    var n = 0;
+                    chans.forEach(function (c) {
+                        var m = self.state.memories[c];
+                        if (c < (obj.start | 0) || c > ((obj.end === undefined) ? 99 : obj.end | 0)) return;
+                        n++;
+                        setTimeout(function () { self._emit('memoryChannel', { memory: self._memToJson(m) }); }, 20 * n);
+                    });
+                    setTimeout(function () { self._emit('memoryScanComplete', { count: n }); }, 20 * n + 50);
+                    return;
+                }
+                case 'writeMemory': {
+                    var wch = obj.channel | 0;
+                    if (wch < 1) return;
+                    var freq = this.state.frequency;
+                    if (!(freq > 0)) { this._emit('error', { message: 'Memory write failed: no known frequency' }); return; }
+                    this.state.memories[wch] = {
+                        channel: wch, group: 0, name: String(obj.name || ''),
+                        frequency: freq, mode: this.state.mode, filter: this.state.filter,
+                    };
+                    return;
+                }
+                case 'clearMemory':
+                    delete this.state.memories[obj.channel | 0];
+                    this._emit('memoryChannel', { memory: { channel: obj.channel | 0, group: 0, del: true } });
+                    return;
+                case 'recallMemory':
+                    this._memRecall(obj.channel | 0);
+                    return;
+                case 'renameMemory': {
+                    var rm = this.state.memories[obj.channel | 0];
+                    if (!rm) return;
+                    rm.name = String(obj.name || '');
+                    this._emit('memoryChannel', { memory: this._memToJson(rm) });
+                    return;
+                }
+                case 'enableAudio':
+                    // Mirror SerialRigTransport: the SPA's startAudio() flips
+                    // audioEnabled to true only after the transport echoes
+                    // audioStatus back. Without this, handleAudioData drops
+                    // every incoming 0x02 frame and PTT redirects to the
+                    // "enable audio" menu instead of transmitting.
+                    this._audioEnabled = !!obj.value;
+                    this._emit('audioStatus', {
+                        enabled: this._audioEnabled,
+                        sampleRate: 48000,
+                    });
+                    return;
+                case 'enableMic':
+                    // Mic capture lives entirely on the SPA side (it grabs
+                    // the local laptop mic via getUserMedia and ships 0x03
+                    // frames to sendAudioFrame). Nothing to do here.
+                    return;
+                case 'setRadeMode':
+                    if (obj.value) {
+                        var self = this;
+                        this._radeEnable().catch(function (err) {
+                            console.error('VirtualRigTransport: rade enable failed:', err);
+                            self._emit('message', { type: 'radeStatus', enabled: false, error: String(err) });
+                        });
+                    } else {
+                        this._radeDisable();
+                    }
+                    return;
+                case 'setRadeCallsign':
+                    this._rade.callsign = String(obj.value || '').toUpperCase().trim();
+                    if (this._rade.modem && this._rade.callsign) {
+                        try { this._rade.modem.setTxCallsign(this._rade.callsign); }
+                        catch (e) { console.warn('rade setTxCallsign:', e); }
+                    }
+                    return;
+                // Phase-3 stubs. Accepting them keeps the UI controls live;
+                // the modems hook in here later.
+                case 'swapVFO':
+                    // Defer the bus update so the browser's eager local swap
+                    // (in index.html's swapVFO()) lands first; otherwise our
+                    // synchronous emit + the browser's post-send swap would
+                    // double-swap and net to nothing. queueMicrotask matches
+                    // the async cadence of the WebSocket transport.
+                    var selfS = this;
+                    var aS = this.state.vfoAFrequency, bS = this.state.vfoBFrequency;
+                    this.state.vfoAFrequency = bS;
+                    this.state.vfoBFrequency = aS;
+                    this.state.frequency = (this.state.selectedVfo === 'B') ? aS : bS;
+                    queueMicrotask(function () {
+                        selfS._emit('update', {
+                            vfoAFrequency: selfS.state.vfoAFrequency,
+                            vfoBFrequency: selfS.state.vfoBFrequency,
+                            frequency:     selfS.state.frequency,
+                        });
+                    });
+                    return;
+                case 'equalizeVFO':
+                    if (this.state.selectedVfo === 'B') {
+                        this.state.vfoAFrequency = this.state.vfoBFrequency;
+                    } else {
+                        this.state.vfoBFrequency = this.state.vfoAFrequency;
+                    }
+                    var selfE = this;
+                    queueMicrotask(function () {
+                        selfE._emit('update', {
+                            vfoAFrequency: selfE.state.vfoAFrequency,
+                            vfoBFrequency: selfE.state.vfoBFrequency,
+                        });
+                    });
+                    return;
+                case 'packetEnable': case 'packetSetMode':
+                case 'aprsTxBeacon': case 'aprsBeaconConfig': case 'aprsClearStations':
+                case 'termList': case 'termRegister': case 'termConnect':
+                case 'termDisconnect': case 'termSend': case 'termHistory':
+                case 'sendCW': case 'stopCW':
+                case 'setPower':
+                    return;
+                default:
+                    return;
+            }
+        }
+
+        sendAudioFrame(buffer) {
+            // Frame format: [0x03][0x00][seq u16LE][rsv u16LE][PCM Int16 LE]
+            if (!buffer || buffer.byteLength < 8) return;
+            var view = new DataView(buffer);
+            if (view.getUint8(0) !== 0x03) return;
+            if (!this._bus) return;
+
+            var src = new Int16Array(buffer, 6);
+
+            // Track TX peak for the Po/ALC meters. _tickSMeter drains it.
+            for (var pi = 0; pi < src.length; pi++) {
+                var pv = src[pi];
+                if (pv < 0) pv = -pv;
+                if (pv > this._txMeterPeak) this._txMeterPeak = pv;
+            }
+
+            // RADE TX intercept: divert mic samples into the modem encoder.
+            // The modem will fire txReady with encoded audio that we ship to
+            // the bus — never push raw mic onto the bus while RADE TX is
+            // active, otherwise the receiver sees voice + modem layered.
+            if (this._rade.enabled && this._rade.txActive && this._rade.modem) {
+                try { this._rade.modem.processTx(src); }
+                catch (e) { console.warn('rade processTx:', e); }
+                return;
+            }
+
+            // Single-writer rule — same semantics as SerialRigTransport:
+            // drop untagged (mic) frames while tagged modem audio flows.
+            if (view.getUint8(1) & 0x01) {
+                this._modemAudioMs = performance.now();
+            } else if (this._modemAudioMs &&
+                       performance.now() - this._modemAudioMs < 300) {
+                return;
+            }
+
+            // Copy out — the SPA reuses its source buffer across frames, so
+            // we can't transfer it. The AirBus then transfers our copy.
+            var copy = new Int16Array(src.length);
+            copy.set(src);
+            this._bus.tx(copy);
+        }
+
+        // ----------------------------------------------------------------
+        // Internals
+        // ----------------------------------------------------------------
+
+        _onAirRx(msg) {
+            var samples = msg.samples;
+            if (!samples || samples.length === 0) return;
+
+            // Track peak amplitude for the synthetic S-meter; _tickSMeter
+            // drains it every 200 ms.
+            for (var i = 0; i < samples.length; i++) {
+                var v = samples[i];
+                if (v < 0) v = -v;
+                if (v > this._sMeterPeak) this._sMeterPeak = v;
+            }
+
+            // RADE RX tee: hand the same 48 kHz Int16 samples to the modem.
+            // While RADE is on, suppress raw 0x02 emit — speakers play the
+            // synthesized speech that comes back via 'rxSpeech' instead.
+            if (this._rade.enabled && this._rade.modem) {
+                try { this._rade.modem.processRx(samples); }
+                catch (e) { console.warn('rade processRx:', e); }
+                return;
+            }
+
+            // Re-emit as a 0x02 frame so the SPA's existing audio path picks
+            // it up (handleBinaryMessage → handleAudioData → AudioWorklet).
+            var buf = new ArrayBuffer(6 + samples.byteLength);
+            var view = new DataView(buf);
+            view.setUint8(0, 0x02);
+            view.setUint8(1, 0x00);
+            view.setUint16(2, (this._rxSeq++) & 0xFFFF, true);
+            view.setUint16(4, 0, true);
+            new Int16Array(buf, 6).set(samples);
+            this.dispatchEvent(new CustomEvent('binary', { detail: buf }));
+        }
+
+        _tickSMeter() {
+            var rxPeak = this._sMeterPeak;
+            var txPeak = this._txMeterPeak;
+            this._sMeterPeak = 0;
+            this._txMeterPeak = 0;
+
+            if (this.state.transmitting) {
+                // Map full-scale Int16 → 100 W (drawTxMeters' Po scale tops
+                // at 100 W). ALC follows the same peak as a 0..1 fraction.
+                // SWR sits at 1.0 — there's no real load, but a 0/1.0 swing
+                // makes the meter look perma-broken.
+                var frac = txPeak / 32767;
+                if (frac > 1) frac = 1;
+                this._emit('meters', {
+                    powerMeter: frac * 100,
+                    swrMeter: 1.0,
+                    alcMeter: frac,
+                    // The switchable bottom meter borrows the IC-705's faces
+                    // (see _emitRigInfo), so give it plausible readings to
+                    // move: compression tracks the audio, supply sits at a
+                    // healthy 13.8 V and draws current with output power.
+                    compMeter: frac * 20,
+                    vdMeter: 13.8,
+                    idMeter: frac * 10,
+                });
+                return;
+            }
+
+            var dB = peakToDb(rxPeak);
+            if (dB === this.state.sMeter) return;
+            this.state.sMeter = dB;
+            this._emit('meters', { sMeter: dB });
+        }
+
+        _emit(type, fields) {
+            var msg = Object.assign({ type: type }, fields);
+            this.dispatchEvent(new CustomEvent('message', { detail: msg }));
+        }
+
+        _memToJson(m) {
+            return {
+                channel: m.channel, group: m.group || 0, name: m.name || '',
+                frequency: m.frequency, mode: m.mode, filter: m.filter || 1,
+                del: false, empty: false,
+                tonemode: 0, toneModeName: 'OFF', tone: '', tsql: '',
+                dtcs: 0, dtcsPolarity: 0, duplex: 0, duplexOffset: 0,
+            };
+        }
+
+        // Recall on the "rig": the channel's freq/mode become the operating
+        // state, neither VFO slot changes, and we report MEM + the channel —
+        // exactly what the serial transport does after a real recall.
+        _memRecall(ch) {
+            var m = this.state.memories[ch];
+            if (!m) return;
+            this.state.memChannel = ch;
+            this.state.selectedVfo = 'MEM';
+            this.state.frequency = m.frequency;
+            this.state.mode = m.mode;
+            this.state.filter = m.filter || 1;
+            this._emit('update', { selectedVfo: 'MEM', memChannel: ch,
+                                   frequency: m.frequency, mode: m.mode, filter: this.state.filter });
+        }
+
+        _emitRigInfo() {
+            this._emit('rigInfo', {
+                version: ((typeof window !== 'undefined' && window.__WFWEB_SEMVER__) || 'dev') + '-virtual',
+                model: 'Virtual Rig #' + this.rigId,
+                connected: true,
+                hasMemoryMode: true, memGroups: 0, memStart: 1,
+                modes: DEFAULT_MODES,
+                filters: DEFAULT_FILTERS,
+                spans: DEFAULT_SPANS,
+                preamps: DEFAULT_PREAMPS,
+                // The IC-705's band table (HF through 70 cm) so the BAND
+                // picker's VHF/UHF row can be exercised off-air.
+                // No band stacking registers off-air: bsr 0 keeps the page
+                // on its setFrequency path for the BAND keys.
+                bands: ((global.IcomRigCaps && global.IcomRigCaps[0xA4] && global.IcomRigCaps[0xA4].bands) || [])
+                    .map(function(b) { var c = Object.assign({}, b); c.bsr = 0; return c; }),
+                // Multi-step attenuator so the P.AMP/ATT cycle button can be
+                // exercised without a real IC-7610 (which has 16 steps).
+                attenuators: [
+                    { num: 0, name: '0 dB' }, { num: 6, name: '-6 dB' },
+                    { num: 12, name: '-12 dB' }, { num: 18, name: '-18 dB' },
+                ],
+                antennas: [{ num: 0, name: 'ANT 1' }, { num: 1, name: 'ANT 2' }],
+                hasRxAnt: true,
+                hasFilterSettings: true,
+                hasMainSub: false,
+                // Advertised so the DUP tile can be exercised off-air; the
+                // virtual rig just echoes whatever it is told.
+                hasDuplex: true,
+                // Same for the TUNE tile — the virtual rig echoes tuner
+                // state, so the bench can exercise it off-air.
+                hasTuner: true,
+                // The CW bar's BK-IN button, echoed like the rest.
+                hasBreakIn: true,
+                // FUNC COMP tile and GAIN COMP row, echoed like the rest.
+                hasCompressor: true,
+                hasCompLevel: true,
+                // Switchable bottom meter: borrow the IC-705's meter faces so
+                // the SWR / ALC / COMP / Vd / Id cycle can be exercised off-air.
+                txMeters: virtualTxMeters(),
+                // Repeater access tone, same treatment.
+                hasCTCSS: true,
+                hasDTCS: true,
+                hasToneSqlType: true,
+                canSetToneFreq: true,
+                canSetTsqlFreq: true,
+                ctcssTones: global.IcomCtcssTones || [],
+                dtcsCodes: global.IcomDtcsCodes || [],
+                hasSpectrum: false,
+                spectAmpMax: 160,
+                audioAvailable: true,
+                audioSampleRate: 48000,
+                txAudioAvailable: true,
+                hasPowerControl: false,
+                hasTransmit: true,
+                hasLAN: false,
+                numReceivers: 1,
+                numVFOs: 2,
+            });
+        }
+
+        _emitFullStatus() {
+            var s = {
+                frequency:     this.state.frequency,
+                vfoAFrequency: this.state.vfoAFrequency,
+                vfoBFrequency: this.state.vfoBFrequency,
+                selectedVfo:   this.state.selectedVfo,
+                memChannel:    this.state.selectedVfo === 'MEM' ? this.state.memChannel : undefined,
+                mode: this.state.mode,
+                filter: this.state.filter,
+                filterWidth: this.state.filterWidths[this.state.filter] || 3000,
+                filterShape: this.state.filterShapes[this.state.filter] || 0,
+                sMeter: this.state.sMeter,
+                transmitting: this.state.transmitting,
+                antenna: this.state.antenna,
+                rxAntenna: this.state.rxAntenna,
+                preamp: this.state.preamp,
+                attenuator: this.state.attenuator,
+                breakIn: this.state.breakIn,
+                compressor: this.state.compressor,
+                compLevel: this.state.compLevel,
+                duplex: this.state.duplex || 'OFF',
+                toneMode: this.state.toneMode || 'OFF',
+                toneFreq: this.state.toneFreq,
+                tsqlFreq: this.state.tsqlFreq,
+                dtcsCode: this.state.dtcsCode,
+                dtcsPolarity: this.state.dtcsPolarity || 0,
+            };
+            if (this.state.duplexOffset !== undefined) s.duplexOffset = this.state.duplexOffset;
+            this._emit('status', s);
+        }
+
+        // ----------------------------------------------------------------
+        // RADE V1 (mirrors SerialRigTransport's _radeEnsureModem path, but
+        // routes TX out to the AirBus instead of the rig's USB output, and
+        // pulls RX off the bus instead of getUserMedia).
+        // ----------------------------------------------------------------
+
+        async _radeEnsureModem() {
+            if (this._rade.modem) return this._rade.modem;
+            if (!this._rade.modulePromise) {
+                this._rade.modulePromise = import('/wasm/rade-modem.js');
+            }
+            var mod = await this._rade.modulePromise;
+            var modem = await mod.RadeModem.create();
+            modem.init(48000);
+            if (this._rade.callsign) modem.setTxCallsign(this._rade.callsign);
+
+            var self = this;
+
+            // Decoded speech samples → re-emit as 0x02 frames so the SPA
+            // plays them through the existing speaker pipeline.
+            modem.addEventListener('rxSpeech', function (ev) {
+                var samples = ev.detail.samples;
+                if (!samples || !samples.length) return;
+                var buf = new ArrayBuffer(6 + samples.byteLength);
+                var view = new DataView(buf);
+                view.setUint8(0, 0x02);
+                view.setUint8(1, 0x00);
+                view.setUint16(2, (self._rade.rxSpeechSeq++) & 0xFFFF, true);
+                view.setUint16(4, 0, true);
+                new Int16Array(buf, 6).set(samples);
+                self.dispatchEvent(new CustomEvent('binary', { detail: buf }));
+            });
+
+            // Encoded modem audio → ship to the bus. This is the only TX path
+            // for RADE in virtual mode; sendAudioFrame's RADE intercept makes
+            // sure raw mic doesn't also leak onto the bus.
+            modem.addEventListener('txReady', function (ev) {
+                var samples = ev.detail.samples;
+                if (!samples || !samples.length || !self._bus) return;
+                var copy = new Int16Array(samples.length);
+                copy.set(samples);
+                self._bus.tx(copy);
+            });
+
+            modem.addEventListener('statsUpdate', function (ev) {
+                self._emit('message', {
+                    type: 'radeStats',
+                    snr: ev.detail.snr,
+                    sync: ev.detail.sync,
+                    freqOffset: ev.detail.freqOffset,
+                });
+            });
+            modem.addEventListener('rxCallsign', function (ev) {
+                self._emit('message', { type: 'radeCallsign', callsign: ev.detail.callsign });
+            });
+
+            this._rade.modem = modem;
+            return modem;
+        }
+
+        async _radeEnable() {
+            await this._radeEnsureModem();
+            this._rade.enabled = true;
+            this._emit('message', { type: 'radeStatus', enabled: true });
+        }
+
+        _radeDisable() {
+            if (!this._rade.enabled) return;
+            this._rade.enabled = false;
+            this._rade.txActive = false;
+            this._rade.eooSent  = false;
+            this._emit('message', { type: 'radeStatus', enabled: false });
+        }
+
+        // PTT-off path while RADE is live: ship the EOO frame (carries the
+        // encoded callsign — receiver decodes after sync drops), wait long
+        // enough for the buffered audio to play out, then clear transmitting.
+        _radePttOff() {
+            this._rade.txActive = false;
+            try {
+                if (!this._rade.eooSent && this._rade.modem) {
+                    var eoo = this._rade.modem.generateEooAudio();
+                    this._rade.eooSent = true;
+                    if (eoo && eoo.length && this._bus) {
+                        var copy = new Int16Array(eoo.length);
+                        copy.set(eoo);
+                        this._bus.tx(copy);
+                    }
+                }
+            } catch (e) { console.warn('rade EOO:', e); }
+            // Match RadeProcessor's 300 ms unkey delay so the EOO clears the
+            // bus before the receiver loses sync entirely.
+            var self = this;
+            setTimeout(function () {
+                self.state.transmitting = false;
+                self._emit('update', { transmitting: false });
+                self._releaseCompressor();
+            }, 300);
+        }
+
+        // Same rule as SerialRigTransport._holdCompressor: SSB only, and an
+        // unread state is never guessed.
+        _holdCompressor() {
+            if (this._compHeld) return;
+            if (this.state.mode !== 'USB' && this.state.mode !== 'LSB') return;
+            if (this.state.compressor === undefined || this.state.compressor === null) return;
+            this._compHeld = true;
+            this._compRestoreOn = !!this.state.compressor;
+            if (this._compRestoreOn) {
+                this.state.compressor = false;
+                this._emit('update', { compressor: false });
+            }
+        }
+
+        _releaseCompressor() {
+            if (!this._compHeld) return;
+            this._compHeld = false;
+            if (this._compRestoreOn) {
+                this.state.compressor = true;
+                this._emit('update', { compressor: true });
+            }
+            this._compRestoreOn = false;
+        }
+    }
+
+    global.VirtualRigTransport = VirtualRigTransport;
+})(window);

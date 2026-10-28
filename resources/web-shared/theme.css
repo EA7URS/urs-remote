@@ -1,0 +1,395 @@
+/* ============================================================================
+   wfweb — shared design tokens + component kit
+   ----------------------------------------------------------------------------
+   Shared by BOTH builds (server `web/` and standalone `web-standalone/`) the
+   same way js8-panel.css is: linked from each index.html, aliased in web.qrc,
+   copied by tools/build-static.sh.
+
+   Two layers:
+     1. Design tokens (:root)  — colors, type scale, spacing. Use these instead
+                                  of hardcoded hex/px so panels stay coherent.
+     2. Component kit (.wf-*)  — one button/tab/field/progress shape for every
+                                  mode panel. Each panel keeps its identity by
+                                  setting --mode-accent (see .mode-* helpers);
+                                  the components inherit that tint via var().
+
+   Design intent: "one component kit, tinted per mode". Do NOT reintroduce
+   per-panel button/tab/input styling — set a --mode-accent and reuse .wf-*.
+   ========================================================================== */
+
+:root {
+    /* -- App chrome (neutral, mode-independent) ---------------------------- */
+    --bg:           #000;       /* deepest background (scope, sunken wells)   */
+    --bg-app:       #0a0a0a;    /* main #radio surface                        */
+    --bg-bar:       #111;       /* top bar / control strips                   */
+    --bg-raised:    #181818;    /* raised inactive chrome (idle tabs)         */
+    --border-col:   #282828;    /* hairline separators                        */
+    --border-w:     1px;
+
+    --text:         #e0e0e0;    /* primary text                               */
+    --text-dim:     #aaa;       /* secondary text                             */
+    --text-faint:   #666;       /* tertiary / disabled-ish text               */
+
+    /* -- Typography -------------------------------------------------------- */
+    --font-ui:   system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    --font-mono: 'Courier New', monospace;
+    --fs-xs:  10px;
+    --fs-sm:  12px;
+    --fs-md:  14px;
+    --fs-lg:  17px;
+    --fw-bold: 700;
+
+    /* -- Spacing / shape --------------------------------------------------- */
+    --space-1: 4px;
+    --space-2: 6px;
+    --space-3: 10px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --radius:  3px;
+
+    /* -- Semantic state (STATUS, not mode identity) ------------------------ *
+     * Use for connection/health signalling, never as a panel accent.        */
+    --state-ok:     #0f0;
+    --state-warn:   #ee0;
+    --state-busy:   #f80;
+    --state-error:  #f44;
+
+    /* -- Mode accent (default = green; panels override via .mode-*) -------- *
+     * --mode-accent     bright highlight (active border, focus ring, text)  *
+     * --mode-accent-dim mid tone        (idle border)                        *
+     * --mode-accent-bg  dark fill behind idle controls                       *
+     * --on-accent       text drawn on a filled (dim/bright) accent           *
+     * --field-text      input text color (light tint of the accent hue)      */
+    --mode-accent:     #0f0;
+    --mode-accent-dim: #0a0;
+    --mode-accent-bg:  #001a00;
+    --on-accent:       #000;
+    --field-text:      #cfc;
+    --panel-bg:        #00140c;
+
+    /* -- Pointer over scopes / waterfalls ---------------------------------- *
+     * Our own crosshair, white with a dark outline: `cursor: crosshair` is   *
+     * the OS pointer, a thin black cross on some themes (Raspberry Pi OS)    *
+     * that vanishes on the navy waterfall (#135). Hotspot is the centre.     */
+    --cursor-cross: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='23' height='23'%3E%3Cpath d='M11.5 1v8M11.5 14v8M1 11.5h8M14 11.5h8' stroke='black' stroke-opacity='.8' stroke-width='3'/%3E%3Cpath d='M11.5 1.5v7M11.5 14.5v7M1.5 11.5h7M14.5 11.5h7' stroke='white' stroke-width='1'/%3E%3C/svg%3E") 11 11, crosshair;
+}
+
+/* -- Per-mode accent palettes ------------------------------------------------
+   Set one of these on a panel's root container; every .wf-* inside inherits
+   the tint. Values mirror each panel's pre-refactor look so migration is a
+   visual no-op aside from shape unification.                                 */
+.mode-cw,
+.mode-packet {                          /* terminal green */
+    --mode-accent:     #0f0;
+    --mode-accent-dim: #0a0;
+    --mode-accent-bg:  #001a00;
+    --on-accent:       #000;
+    --field-text:      #cfc;
+    --panel-bg:        #00140c;          /* panel frame: faint green on near-black */
+}
+.mode-digi,
+.mode-midi {                            /* WSJT-X cyan/blue; MIDI matches the .mem-modal shell */
+    --mode-accent:     #08f;
+    --mode-accent-dim: #048;
+    --mode-accent-bg:  #001020;
+    --on-accent:       #fff;
+    --field-text:      #bdf;
+    --panel-bg:        #001018;
+}
+.mode-js8 {                             /* messenger amber */
+    --mode-accent:     #fc8;
+    --mode-accent-dim: #c80;
+    --mode-accent-bg:  #530;
+    --on-accent:       #000;
+    --field-text:      #fed;
+    --panel-bg:        #100c06;
+}
+.mode-freedv {                          /* FreeDV cyan */
+    --mode-accent:     #0ff;
+    --mode-accent-dim: #0aa;
+    --mode-accent-bg:  #011a1a;
+    --on-accent:       #000;
+    --field-text:      #cff;
+    --panel-bg:        #001414;
+}
+
+/* ============================================================================
+   Component kit
+   ========================================================================== */
+
+/* -- Button ----------------------------------------------------------------- */
+.wf-btn {
+    padding: var(--space-1) var(--space-3);
+    background: var(--mode-accent-bg);
+    border: var(--border-w) solid var(--mode-accent-dim);
+    color: var(--mode-accent);
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-bold);
+    line-height: 1.2;
+    border-radius: var(--radius);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.wf-btn.active {
+    background: var(--mode-accent-dim);
+    color: var(--on-accent);
+    border-color: var(--mode-accent);
+}
+/* Hover only where a pointer can hover: a touch screen keeps :hover after a
+   tap, which left TONE / Hold TX looking active after being switched off. */
+@media (hover: hover) {
+    .wf-btn:hover:not(:disabled) {
+        background: var(--mode-accent-dim);
+        color: var(--on-accent);
+        border-color: var(--mode-accent);
+    }
+}
+/* A state button (.toggle: on/off or one-of-several, e.g. CW TONE, BK-IN,
+   CHR/WRD/LN) reads its state from the fill, so hovering must not fill it:
+   just after a click the pointer is still on it, and OFF looked lit. */
+@media (hover: hover) {
+    .wf-btn.toggle:hover:not(:disabled):not(.active) {
+        background: var(--mode-accent-bg);
+        color: var(--mode-accent);
+        border-color: var(--mode-accent);
+    }
+}
+.wf-btn:active:not(:disabled) { transform: translateY(1px); }
+/* A control whose output arrives too late to be useful (CW TONE on a
+   Bluetooth output): amber instead of the mode tint, lit when on. */
+.wf-btn.lag { border-color: var(--state-warn); color: var(--state-warn); }
+.wf-btn.lag.active { background: var(--state-warn); color: #000; border-color: var(--state-warn); }
+.wf-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Button variants (modifiers on .wf-btn) */
+.wf-btn.lg {                            /* primary / large action (e.g. JS8 send) */
+    padding: 8px 16px;
+    font-size: var(--fs-md);
+    letter-spacing: 1px;
+    min-width: 60px;
+}
+.wf-btn.sq {                            /* square icon button (e.g. WPM steppers, ✕) */
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    font-size: var(--fs-lg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.wf-btn.danger {                        /* stop / abort */
+    background: #1a0000;
+    border-color: var(--state-error);
+    color: var(--state-error);
+}
+.wf-btn.danger.active,
+.wf-btn.danger:active:not(:disabled) {
+    background: var(--state-error);
+    color: #fff;
+    border-color: var(--state-error);
+}
+@media (hover: hover) {
+    .wf-btn.danger:hover:not(:disabled) {
+        background: var(--state-error);
+        color: #fff;
+        border-color: var(--state-error);
+    }
+}
+
+/* -- Tab -------------------------------------------------------------------- *
+ * Top-docked tab (rounded top corners, no bottom border). For stateful tabs   *
+ * (e.g. terminal connection state) layer status colors on top using the       *
+ * --state-* tokens.                                                           */
+.wf-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-3);
+    background: var(--mode-accent-bg);
+    border: var(--border-w) solid var(--mode-accent-dim);
+    border-bottom: none;
+    color: var(--mode-accent);
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-bold);
+    border-radius: var(--radius) var(--radius) 0 0;
+    cursor: pointer;
+    user-select: none;
+}
+@media (hover: hover) {
+    .wf-tab:hover:not(.active) {
+        background: var(--mode-accent-dim);
+        color: var(--on-accent);
+    }
+}
+.wf-tab.active {
+    background: var(--mode-accent-dim);
+    color: var(--on-accent);
+    border-color: var(--mode-accent);
+}
+.wf-tab .wf-tab-unread {
+    background: var(--state-error);
+    color: #fff;
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-bold);
+    padding: 0 5px;
+    border-radius: 7px;
+    min-width: 14px;
+    text-align: center;
+}
+.wf-tab.active .wf-tab-unread { display: none; }
+
+/* -- Text field ------------------------------------------------------------- */
+.wf-field {
+    background: var(--mode-accent-bg);
+    border: var(--border-w) solid var(--mode-accent-dim);
+    color: var(--field-text);
+    font-family: var(--font-mono);
+    font-size: var(--fs-md);
+    padding: 5px 8px;
+    border-radius: var(--radius);
+    outline: none;
+}
+.wf-field:focus { border-color: var(--mode-accent); }
+.wf-field:disabled { opacity: 0.5; }
+
+/* -- Progress bar ----------------------------------------------------------- */
+.wf-progress {
+    height: 10px;
+    background: var(--bg);
+    border: var(--border-w) solid var(--mode-accent-dim);
+    border-radius: var(--radius);
+    overflow: hidden;
+    min-width: 60px;
+}
+.wf-progress-bar {
+    height: 100%;
+    background: var(--mode-accent);
+    transition: width 0.2s ease;
+}
+
+/* -- Panel header + mode badge --------------------------------------------- *
+ * Every mode panel (CW / DIGI / packet / JS8) opens with a header strip whose
+ * top-left is a filled accent "mode badge". One shape for all; only the accent
+ * hue differs. Keeps the panels reading as one app.                          */
+.wf-panel-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border-bottom: var(--border-w) solid var(--mode-accent-dim);
+    flex-shrink: 0;
+}
+.wf-badge {
+    background: var(--mode-accent-dim);
+    color: var(--on-accent);
+    padding: 2px 8px;
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: var(--fs-md);
+    font-weight: var(--fw-bold);
+    letter-spacing: 1px;
+    white-space: nowrap;
+}
+
+/* -- Panel frame ------------------------------------------------------------ *
+ * The shared "frame" of a mode panel: a near-black, faintly accent-tinted
+ * surface with an accent top rule. Positioning/padding stay per-panel (CW
+ * docks to the bottom; DIGI/JS8/packet fill the scope area). Apply alongside
+ * a .mode-* class.                                                           */
+.wf-panel {
+    background: var(--panel-bg);
+    border-top: 2px solid var(--mode-accent-dim);
+    color: var(--field-text);
+    font-family: var(--font-mono);
+}
+
+/* -- MIDI window ------------------------------------------------------------ *
+ * Body of the MIDI controller window (midi.js WfMidiPanel), inside the       *
+ * page's .mem-modal shell. Tinted by .mode-midi.                             */
+.midi-panel { display: flex; flex-direction: column; gap: var(--space-2); min-height: 0; font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--field-text); }
+.midi-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.midi-label { color: var(--mode-accent); font-weight: var(--fw-bold); font-size: var(--fs-xs); letter-spacing: 1px; }
+.midi-status { color: var(--text-dim); }
+.midi-status.ok { color: var(--state-ok); }
+.midi-unsupported { color: var(--state-warn); line-height: 1.4; }
+.midi-panel select.wf-field { font-size: var(--fs-sm); padding: 2px 4px; }
+.midi-map { overflow-y: auto; flex: 1 1 auto; min-height: 80px; max-height: 40vh; border-top: var(--border-w) solid var(--mode-accent-dim); }
+.midi-map-row { display: grid; grid-template-columns: minmax(0, 1fr) 7em 6em auto auto; align-items: center; gap: var(--space-1) var(--space-2); padding: 2px 0; border-bottom: var(--border-w) solid var(--border-col); }
+.midi-action { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.midi-binding { color: var(--text-dim); white-space: nowrap; }
+.midi-monitor { color: var(--text-faint); font-size: var(--fs-xs); }
+.midi-hint { color: var(--text-faint); font-size: var(--fs-xs); }
+.paddle-label { min-width: 5.5em; }
+.paddle-key { min-width: 7em; color: var(--field-text); }
+.paddle-lamp { padding: 2px 8px; border: var(--border-w) solid var(--mode-accent-dim); border-radius: var(--radius); color: var(--text-faint); }
+.paddle-lamp.on { background: var(--mode-accent); border-color: var(--mode-accent); color: var(--on-accent); }
+@media (max-width: 420px) {
+    .midi-map-row { grid-template-columns: minmax(0, 1fr) 6em auto auto; }
+    .midi-map-row .midi-enc { display: none; }
+}
+
+/* -- Recorder --------------------------------------------------------------- *
+ * Top-bar REC button and the popover recorder.js anchors under it (recording
+ * type menu, or a failure note). Red is the universal "record" colour, so
+ * this uses the error state tone rather than a mode accent.                  */
+.rec-btn {
+    padding: 2px 8px;
+    background: #1a0000;
+    border: var(--border-w) solid #a00;
+    color: var(--state-error);
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-bold);
+    letter-spacing: 0.5px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.rec-btn.recording {
+    background: var(--state-error);
+    border-color: var(--state-error);
+    color: #fff;
+}
+.rec-btn:disabled { opacity: 0.5; cursor: default; }
+.rec-btn .rec-time,
+.rec-btn.recording .rec-idle { display: none; }
+.rec-btn.recording .rec-time { display: inline; }
+/* While recording the button is the stop control: a stop square, then the
+   elapsed time. */
+.rec-btn .rec-time::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 5px;
+    background: currentColor;
+}
+@media (orientation: portrait), (max-width: 600px) {
+    /* The phone top bar has no spare room, so while recording the elapsed
+       time takes the clock's place. */
+    body.rec-on #clock { display: none; }
+}
+@media (max-width: 340px) {
+    .rec-btn { display: none; }         /* no room at all on 320 px screens */
+}
+.rec-menu {
+    position: fixed;
+    z-index: 9000;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    background: var(--bg-bar);
+    border: var(--border-w) solid var(--border-col);
+    border-radius: var(--radius);
+}
+.rec-menu .wf-btn { padding: var(--space-2) var(--space-3); text-align: left; }
+.rec-note {
+    max-width: 240px;
+    overflow-wrap: anywhere;
+    color: var(--state-error);
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+}

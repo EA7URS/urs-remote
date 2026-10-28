@@ -1,0 +1,753 @@
+#ifndef WEBSERVER_H
+#define WEBSERVER_H
+
+#include <QObject>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QFile>
+#include <QMimeDatabase>
+#include <QtWebSockets/QWebSocketServer>
+#include <QtWebSockets/QWebSocket>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QTimer>
+#include <QSet>
+#include <QThread>
+#include <QSslSocket>
+#include <QSslKey>
+#include <QSslCertificate>
+#include <QUdpSocket>
+#include <QUrlQuery>
+#include <QSettings>
+#include <memory>
+#include <atomic>
+#include "logbook.h"
+
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+#include <QAudioDeviceInfo>
+#include <QAudioInput>
+#include <QAudioOutput>
+#else
+#include <QMediaDevices>
+#include <QAudioDevice>
+#include <QAudioSource>
+#include <QAudioSink>
+#endif
+
+#include "cachingqueue.h"
+#include "audioconverter.h"
+#include "freedvprocessor.h"
+#include "freedvreporter.h"
+#include "pskreporter.h"
+#include "radeprocessor.h"
+#include "direwolfprocessor.h"
+#include "ax25linkprocessor.h"
+#include "aprsprocessor.h"
+#include "memorystore.h"
+
+#ifdef Q_OS_MACOS
+class TlsProxyWorker;
+#endif
+
+// SSL-enabled TCP server for HTTPS
+class SslTcpServer : public QTcpServer {
+public:
+    QSslCertificate cert;
+    QSslKey key;
+    explicit SslTcpServer(QObject *parent = nullptr) : QTcpServer(parent) {}
+protected:
+    void incomingConnection(qintptr handle) override {
+        QSslSocket *socket = new QSslSocket(this);
+        if (socket->setSocketDescriptor(handle)) {
+            socket->setLocalCertificate(cert);
+            socket->setPrivateKey(key);
+            socket->startServerEncryption();
+            addPendingConnection(socket);
+        } else {
+            delete socket;
+        }
+    }
+};
+
+class webServer : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit webServer(QObject *parent = nullptr);
+    ~webServer();
+
+    // State for the terminal status page, which reads it from the main thread
+    // while this object lives on the web thread — hence the atomics.
+    enum ListenState { ListenPending, ListenOk, ListenFailed };
+    ListenState webListenState() const { return ListenState(webListen_.load()); }
+    ListenState restListenState() const { return ListenState(restListen_.load()); }
+    bool httpsActive() const { return httpsActive_.load(); }
+    int browserCount() const { return browserCount_.load(); }
+
+signals:
+    void closed();
+    void requestPowerOn();
+    void requestPowerOff();
+    void requestLanDisconnect();
+    void requestLanReconnect();
+    void setupConverter(QAudioFormat inFormat, codecType inCodec,
+                        QAudioFormat outFormat, codecType outCodec,
+                        quint8 opusComplexity, quint8 resampleQuality);
+    void sendToConverter(audioPacket audio);
+    void setupTxConverter(QAudioFormat inFormat, codecType inCodec,
+                          QAudioFormat outFormat, codecType outCodec,
+                          quint8 opusComplexity, quint8 resampleQuality);
+    void sendToTxConverter(audioPacket audio);
+    void haveTxAudioData(audioPacket audio);
+    void setupFreeDV(int mode, quint32 radioSampleRate);
+    void sendToFreeDVRx(audioPacket audio);
+    void sendToFreeDVTx(audioPacket audio);
+    void setupRade(quint32 radioSampleRate);
+    void sendToRadeRx(audioPacket audio);
+    void sendToRadeTx(audioPacket audio);
+    void setupPacket(quint32 radioSampleRate);
+    void sendToPacketRx(audioPacket audio);
+
+public slots:
+    void init(quint16 httpPort, quint16 wsPort);
+    void receiveRigCaps(rigCapabilities* caps);
+    void receiveRxAudio(audioPacket audio);
+    void setupAudio(quint8 codec, quint32 sampleRate);
+    void setupUsbAudio(quint32 sampleRate, QString preferredInputName = QString(),
+                       QString preferredOutputName = QString());
+    void setLanInfo(bool isLan, bool connected);
+    // Settings file used for persistent prefs written from the web layer.
+    // Empty = use QSettings defaults (QCoreApplication org/app name).
+    void setSettingsFile(const QString &path);
+    // --name tag: sent to the browser as rigInfo.name so the top bar and
+    // tab title show it instead of the rig model.
+    void setInstanceName(const QString &name);
+    // Logbook path and remote-logging (WSJT-X UDP) setup from settings +
+    // command-line overrides; runs once on the web thread at startup.
+    void configureLogbook(const QString &logbookOverride,
+                          const QString &remoteLogOverride,
+                          bool noRemoteLog, bool remoteLogDecodes);
+    // PTT requested via rigctld (Hamlib TCP). Routed through the same
+    // setPTT path the WebSocket clients use, so RADE EOO synthesis,
+    // packet TX gating and ALC meter polling stay coherent.
+    void onRigCtlPtt(bool on);
+private slots:
+    // HTTP
+    void onHttpConnection();
+    void onHttpReadyRead();
+    void onHttpDisconnected();
+
+    // WebSocket
+    void onWsNewConnection();
+    void onWsTextMessage(QString message);
+    void onWsBinaryMessage(QByteArray message);
+    void onWsDisconnected();
+
+    // Cache
+    void receiveCache(cacheItem item);
+
+    // Periodic status push
+    void sendPeriodicStatus();
+
+    // Audio converter output
+    void onRxConverted(audioPacket audio);
+    void onTxConverted(audioPacket audio);
+
+    // USB audio capture
+    void readUsbAudio();
+    void onAudioStateChanged(QAudio::State state);
+
+    // USB audio output (TX): drives precise PKT unkey via QAudioOutput's
+    // own state machine — fires when Qt's internal queue actually underruns.
+    void onUsbAudioOutputStateChanged(QAudio::State state);
+
+    // FreeDV codec2
+    void onFreeDVRxReady(audioPacket audio);
+    void onFreeDVTxReady(audioPacket audio);
+    void onFreeDVStats(float snr, bool sync);
+    void onFreeDVRxCallsign(const QString &callsign);
+    void onReporterStateChanged(int state);
+    void onPskReporterStateChanged(int state);
+    void drainFreeDVTxBuffer();
+    void usbTxPump();
+
+    // RADE V1
+    void onRadeRxReady(audioPacket audio);
+    void onRadeTxReady(audioPacket audio);
+    void onRadeStats(float snr, bool sync, float freqOffset);
+    void onRadeRxCallsign(const QString &callsign);
+
+    // Dire Wolf packet (AX.25 / APRS)
+    void onPacketRxDecoded(int chan, QJsonObject frame);
+    void onPacketTxDecoded(int chan, QJsonObject frame);
+    void onPacketTxReady(audioPacket audio);
+    void onPacketTxFailed(QString reason);
+    void drainPacketLanTxBuffer();
+    void drainPacketUsbTxBuffer();
+
+    // APRS station database / beacon scheduler
+    void onAprsStationUpdated(QJsonObject station);
+    void onAprsStationsCleared();
+    void onAprsBeaconRequested(QString src, QString dst,
+                               QStringList path, QString info);
+
+
+private:
+    void serveStaticFile(QTcpSocket *socket, const QString &path, const QByteArray &headerSection);
+    // Issue #69: the plain-HTTP REST port used to hand back the SPA for any
+    // non-/api/v1 GET, which left a browser stuck retrying a WebSocket that
+    // only exists on the HTTPS port.  Serve a human-readable signpost instead.
+    void serveRestInfoPage(QTcpSocket *socket, const QByteArray &headerSection);
+    void sendHttpResponse(QTcpSocket *socket, int statusCode, const QString &statusText,
+                          const QByteArray &contentType, const QByteArray &body,
+                          const QByteArray &extraHeaders = QByteArray());
+    void handleRestRequest(QTcpSocket *socket, const QString &method,
+                           const QString &path, const QUrlQuery &query,
+                           const QByteArray &body);
+    void sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json);
+    QJsonObject buildInfoJson() const;
+    void sendJsonToAll(const QJsonObject &obj);
+    void sendJsonTo(QWebSocket *client, const QJsonObject &obj);
+    void startReporterSnrTimer();
+    void stopReporterSnrTimer();
+    // Notify clients of the current state of either reporter.  The displayed
+    // state distinguishes "waiting" (checkbox on but the matching mode isn't
+    // active) from "connecting" (actually trying to reach the server).
+    void notifyFreedvReporterStatus();
+    void notifyPskReporterStatus();
+    void sendBinaryToAll(const QByteArray &data);
+    void sendBinaryToAudioClients(const QByteArray &data);
+    // Common TX-audio writer.  Takes mono int16 LE PCM, expands to stereo
+    // if the device requires it, optionally applies freedvTxGain (ALC-
+    // controlled), and writes to usbAudioOutputDevice.  Called from
+    // usbTxPump (mic / FT8 / voice — applyGain=false) and
+    // drainPacketUsbTxBuffer (PKT — applyGain=true).  Same writer for
+    // both, which is the structural unification of TX audio plumbing.
+    void txWritePcmFrame(const QByteArray &pcmMonoLE, bool applyGain);
+    // Browser-frame coalescing in front of txWritePcmFrame (see
+    // usbTxPending): bytes of mono PCM per device write, the pending-
+    // buffer reset for when the mic session ends or another TX path takes
+    // the device.
+    int usbTxPeriodBytes() const;
+    void usbTxReset();
+    void handleCommand(QWebSocket *client, const QJsonObject &cmd);
+    // One station callsign + grid for the whole server, persisted under
+    // [Station] in the settings file and pushed to every browser.  Replaces
+    // the old per-browser value that the last client to connect used to
+    // overwrite (a stale tab could silently swap the call on every QSO).
+    void applyStationCallsign(const QString &call, const QString &grid, bool persist);
+    // CW keyer macros: [CW] Macro1..Macro10 in the settings file, one set for
+    // every browser (#141).  applyCwMacros replaces the whole set, persists
+    // it and pushes it to every client.
+    void loadCwMacros();
+    void applyCwMacros(const QJsonObject &macros, const char *who);
+    QJsonObject cwMacrosJson() const;
+    std::unique_ptr<QSettings> openSettings() const;
+    // Station logbook (see logbook.h).  These wrap the Logbook mutations
+    // with the WebSocket delta events and the WSJT-X emission.
+    bool logbookAdd(QsoRecord &r);
+    bool logbookUpdate(const QString &id, const QsoRecord &r);
+    bool logbookRemove(const QString &id);
+    void logbookReset();
+    QJsonObject logbookSummary() const;
+    bool logbookClear(const char *who);
+    void wsjtxSendHeartbeat();
+    void wsjtxSendStatus();
+    void wsjtxSendQso(const QsoRecord &qso);
+    void wsjtxSendDecode(const QJsonObject &cmd);
+    void wsjtxSendClose();
+    void wsjtxSendDatagram(const QByteArray &packet);
+    bool configureWsjtxTarget(const QString &target);
+    void requestVfoUpdate();
+    void disableFreeDV();
+    bool isFreeDVCompatibleMode(rigMode_t mk) const;
+    void sendCurrentState(QWebSocket *client);
+    QString modeToString(modeInfo m);
+    // JSON for a cached rig value, or null when the rig had nothing to report
+    // (blank memory channel): Hz == 0 / a default modeInfo / filter 0xff.
+    static QJsonValue freqJson(const freqt &f);
+    QJsonValue modeJson(const modeInfo &m);
+    static QJsonValue filterJson(const modeInfo &m);
+    modeInfo stringToMode(const QString &mode);
+    QJsonObject buildStatusJson();
+    // Operating freq / mode with the fallbacks memory mode needs (#138).
+    cacheItem operatingFreqCache(const vfoCommandType &t);
+    cacheItem operatingModeCache(const vfoCommandType &t);
+    codecType codecByteToType(quint8 codec);
+    bool setupSsl();
+
+    QHash<QTcpSocket*, QByteArray> socketBuffers; // accumulate partial TCP reads
+
+    QTcpServer *httpServer = nullptr;
+    QTcpServer *restServer = nullptr;  // plain HTTP for microcontrollers/scripts (SSL mode only)
+    quint16 webHttpsPort = 0;          // configured HTTPS/web-UI port, for the REST signpost (#69)
+    QWebSocketServer *wsServer = nullptr;
+    QList<QWebSocket *> wsClients;
+    cachingQueue *queue = nullptr;
+    rigCapabilities *rigCaps = nullptr;
+    QTimer *statusTimer = nullptr;
+    QMimeDatabase mimeDb;
+    bool rigPoweredOn = true;
+    bool lanMode = false;
+    bool lanConnected = false;
+    // The rig declares the ATU command but keeps refusing its status read
+    // (IC-705 with no AH-705 attached): hide the tuner until it answers.
+    bool tunerRejected = false;
+
+    // Which meter the browser's second TX bar is showing. SWR and ALC are
+    // polled unconditionally, so only Comp/Vd/Id need a poll of their own —
+    // adding all three permanently would just starve the slower polls.
+    funcs txMeterFunc = funcNone;
+
+    // Locally tracked active VFO/receiver. Mirrors cachingQueue::rigState.vfo
+    // but is read/written entirely on webThread, so receiveCache() can route
+    // funcSelectedFreq/funcUnselectedFreq without re-locking the queue mutex
+    // (see issue #31 / commit 126f0f0c for the deadlock this avoids).
+    // Updated from: WebSocket selectVFO handler (predictively), incoming
+    // funcSelectVFO/funcVFOMainSelect/funcVFOSubSelect cache events, and
+    // reconciled from queue->getState() inside sendPeriodicStatus().
+    vfo_t activeVfoLocal = vfoA;
+    uchar activeReceiver = 0;
+    // Mirror of "the rig is in memory mode", kept next to activeVfoLocal for
+    // the same reason: receiveCache() must not call queue->getState(). In
+    // memory mode the frequency replies describe the recalled channel, not
+    // either VFO, so they must not land in the browser's VFO A/B slots (#108).
+    bool memModeLocal = false;
+
+    std::atomic<int> webListen_{ListenPending};
+    std::atomic<int> restListen_{ListenPending};
+    std::atomic<bool> httpsActive_{false};
+    std::atomic<int> browserCount_{0};
+
+    // SSL
+    bool sslEnabled = false;
+    QSslCertificate sslCert;
+    QSslKey sslKey;
+#ifdef Q_OS_MACOS
+    QString sslCertPath;
+    QString sslKeyPath;
+    // OpenSSL TLS proxy (bypasses Secure Transport CertificateRequest issue)
+    bool useOpenSslProxy = false;
+    TlsProxyWorker *tlsProxyWorker = nullptr;
+    QThread *tlsProxyThread = nullptr;
+    quint16 internalHttpPort = 0;
+#endif
+
+    // Audio streaming (LAN: converter-based, USB: direct capture)
+    audioConverter *rxConverter = nullptr;
+    QThread *rxConverterThread = nullptr;
+    quint8 rigCodec = 0;
+    quint32 rigSampleRate = 0;
+    bool audioConfigured = false;
+    QString audioErrorReason;
+    quint16 audioSeq = 0;
+    QSet<QWebSocket *> audioClients;
+
+    // TX audio converter (LAN path: PCM → rig codec)
+    audioConverter *txConverter = nullptr;
+    QThread *txConverterThread = nullptr;
+
+    // USB direct audio capture
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    QAudioInput *usbAudioInput = nullptr;
+#else
+    QAudioSource *usbAudioInput = nullptr;
+#endif
+    QIODevice *usbAudioDevice = nullptr;
+    QTimer *usbAudioPollTimer = nullptr;
+
+    // TX audio (USB output to rig)
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    QAudioOutput *usbAudioOutput = nullptr;
+#else
+    QAudioSink *usbAudioOutput = nullptr;
+#endif
+    QIODevice *usbAudioOutputDevice = nullptr;
+    bool txAudioConfigured = false;
+    int usbOutputChannels = 1;
+    // Pre-TX buffer: accumulate chunks before starting ALSA so it begins with
+    // a full buffer instead of racing the drain rate from the first byte.
+    QByteArray preTxBuffer;
+    bool preTxBuffering = false;
+    bool txAudioActive = false; // true once pre-buffer is flushed; stops device on IdleState
+    // Browser TX frames are far smaller than the device's period: the mic
+    // worklet posts one 128-sample quantum (2.7 ms) per WebSocket message,
+    // the FT8/JS8 pacer 512 samples.  Qt's WinMM backend gives every
+    // write() its own 40 ms wave block whatever its size and drops what it
+    // cannot place, so writing them one by one starved the device of all
+    // but ~13 ms in every 200 ms and chopped the speech (#136).  Frames
+    // queue here and usbTxPump writes them one full period at a time.
+    QByteArray usbTxPending;          // mono int16 LE awaiting a full period
+    QTimer *usbTxPumpTimer = nullptr; // keeps draining once the device was full
+    qint64 usbTxLastFrameMs = 0;      // wall clock of the last browser frame
+    bool usbTxOverflowLogged = false;
+
+    // Single-writer rule for browser TX audio: wall-clock of the last
+    // modem-tagged (header byte 1 & 0x01) frame.  Untagged mic frames are
+    // dropped while within 300 ms of this — see onWsBinaryMessage().
+    qint64 lastModemAudioMs = 0;
+
+    // SHA1 fingerprint (first 12 hex chars) of the embedded SPA assets.
+    // Sent in getStatus replies so an open tab can detect a server upgrade
+    // on WS reconnect and reload itself — see init() and index.html.
+    QString spaBuildId;
+
+    // DATA MOD OFF auto-switch to USB when web mic is active
+    rigInput savedDataOffMod;
+    bool dataOffModSaved = false;
+    // Speech compressor taken out for wfweb's own digital TX (#147): the
+    // over runs in plain USB/LSB, where the rig keeps the voice COMP on.
+    // compRestoreOn = turn it back on when the over ends.
+    bool compHeld = false;
+    bool compRestoreOn = false;
+    QWebSocket *micActiveClient = nullptr;
+    QWebSocket *pttClient = nullptr;   // browser that last keyed the rig; unkeyed if it vanishes (#144)
+
+    // Browser-mic diagnostics.  A browser whose default input is the rig's
+    // own USB codec streams the receiver audio back into the transmitter,
+    // which is silent on the air, and nothing in the log said so.  The
+    // browser now names the device it captures with enableMic; the server
+    // logs it, warns (log + micWarning to the client) when it is the rig's
+    // capture device, and logs the level of the mic frames it receives
+    // every 5 s and at session end so a silent source is visible too.
+    QString rigCaptureDeviceName;   // the input device setupUsbAudio() picked
+    QString micDeviceLabel;         // what the browser said it captures from
+    qint64 micStatBytes = 0;
+    int micStatPeak = 0;
+    qint64 micStatLastLogMs = 0;
+    void micStatsAccumulate(const QByteArray &pcm);
+    void micStatsLog(const char *why);
+
+    // Pick the DATA MOD OFF input matching our audio transport: "LAN"/"WLAN"
+    // by name when LAN-connected, otherwise USB by type (see issue #72 —
+    // the LAN input's numeric type is inconsistent across .rig files).
+    // Returns false if rigCaps lists no suitable input.
+    bool pickDataModInput(rigInput &out) const;
+    // Queue the DATA MOD OFF switch for a packet TX.  Every packet keying
+    // site must call this before PTT: unlike the mic path there is no
+    // enableMic step, so nothing else routes the modulator to the audio
+    // transport — without it the radio keys a dead carrier (silent FM).
+    void queuePacketModInput();
+    void holdCompressorForDigitalTx(const char *why);
+    void releaseCompressorHold();
+    bool packetModInputLogged = false;
+
+    // One-shot log guard for the LAN web-mic TX path (issue #72): logs once per
+    // mic session that browser frames are arriving and being coalesced.
+    bool micLanTxLogged = false;
+
+    // LAN web-mic TX coalescing (issue #72): the browser streams tiny
+    // 128-sample frames; the rig's UDP audio jitter buffer wants ~20 ms
+    // chunks (as wfview's mic and the packet modem send). Accumulate browser
+    // frames here and emit 20 ms slices. micLanTxChunkBytes is the 20 ms size
+    // at the rig sample rate, computed lazily on the first frame.
+    QByteArray micLanTxBuffer;
+    int micLanTxChunkBytes = 0;
+
+    // FreeDV processing
+    FreeDVProcessor *freedvProcessor = nullptr;
+    QThread *freedvThread = nullptr;
+    FreeDVReporter *freedvReporter = nullptr;
+    PskReporter *pskReporter = nullptr;
+    QString reporterCallsign;
+    QString reporterGrid;
+    QMap<int, QString> cwMacros_;       // slot (1..10) -> macro text
+    bool reporterEnabled = false;       // FreeDV Reporter toggle
+    bool pskReporterEnabled = false;    // pskreporter.info toggle (FT8/FT4)
+    bool digiActive = false;            // browser DIGI panel open (FT8/FT4)
+    QString digiMode = QStringLiteral("FT8");
+    bool freedvEnabled = false;
+    int freedvMode = 0;
+    QString freedvModeName = QStringLiteral("RADE");
+    float freedvSNR = 0.0f;
+    bool freedvSync = false;
+    QTimer *reporterSnrTimer = nullptr;    // periodic SNR updates to FreeDV Reporter
+    QString lastReportedCallsign;          // callsign to include in periodic reports
+    QByteArray freedvTxBuffer;
+    QTimer *freedvTxDrainTimer = nullptr;
+    bool freedvTxActive = false;  // true once ALSA restarted for FreeDV TX
+    float freedvTxGain = 0.25f;   // ALC-controlled gain applied to modem output
+    bool freedvMonitor = false;   // bypass FreeDV RX to hear raw SSB
+
+    // RADE V1 processing
+    RadeProcessor *radeProcessor = nullptr;
+    QThread *radeThread = nullptr;
+    float freedvFreqOffset = 0.0f;  // RADE frequency offset estimate
+    QString radeRxCallsign;          // last decoded callsign from EOO
+    bool radeEooDraining = false;    // true while draining EOO frame to ALSA
+    QTimer *radeCallsignClearTimer = nullptr;  // delayed UI clear after decode
+
+    // Dire Wolf packet (AX.25 / APRS)
+    DireWolfProcessor *dwProc = nullptr;
+    QThread *dwThread = nullptr;
+    AX25LinkProcessor *axProc = nullptr;
+    AprsProcessor *aprsProc = nullptr;
+    bool packetEnabled = false;
+    int  packetMode = 300;     // 300 / 1200 / 9600 — single active modem
+    // PKT TX in flight (any path).  Held from the first audio burst until
+    // the rig has been unkeyed.  Replaces packetTxDraining — broader name
+    // reflecting that PKT now has its own pipeline (no longer borrowing
+    // FreeDV's drain machinery).
+    bool packetTxBusy = false;
+
+    // PKT USB pacer: dwThread delivers a whole frame in one audioPacket;
+    // we feed it to ALSA in 10 ms slices via this timer.  Separate from
+    // FreeDV's so the two codecs don't fight over a shared buffer/flag.
+    QByteArray packetUsbTxBuffer;
+    QTimer *packetUsbTxDrainTimer = nullptr;
+    bool packetUsbTxActive = false;     // ALSA started for PKT TX
+    bool packetTxAwaitingIdle = false;  // app buffer drained; waiting for
+                                        // QAudioOutput → IdleState before
+                                        // unkeying (replaces the old 300 ms
+                                        // guess on USB).
+    QTimer *packetTxIdleWatchdog = nullptr;  // backstop: some Qt5/ALSA
+                                        // configurations (raw hw: devices
+                                        // opened via nearestFormat) never
+                                        // emit IdleState — fire the unkey
+                                        // anyway so PTT can't latch on.
+
+    // PKT LAN pacer: converter's Opus path requires fixed frame sizes, so
+    // the burst is fed in 20 ms slices at wall-clock rate.
+    QByteArray packetLanTxBuffer;
+    QTimer *packetLanTxTimer = nullptr;
+    int packetLanTxChunkBytes = 0;
+
+    // ---- AX.25 connected-mode terminal sessions ----
+    // Sessions live server-side and survive WebSocket disconnects so a
+    // browser refresh keeps the session active.  ax25_link's "client" id
+    // is fixed at 1 — the server is one logical app — and individual
+    // sessions are keyed by sid (server-issued) and uniquely identified
+    // to ax25_link by the (own, peer, chan) tuple.
+    // Minimal YAPP receive-side state.  One instance per session.  Feeds
+    // bytes of an incoming AX.25 data stream through a 4-state framer that
+    // splits YAPP control frames (SOH <len> <type> <data>) from ordinary
+    // terminal text; YAPP frames are dispatched by type and ordinary bytes
+    // fall through to the scrollback.
+    // YAPP packet kinds, one per leading control byte on the wire.
+    // ENQ(0x05)=SI  ACK(0x06)=RR or AF  SOH(0x01)=HD  STX(0x02)=DT
+    // ETX(0x03)=EF  CAN(0x18)=CN        Per IW3FQG YAPP spec.
+    enum class YappKind { SI, RR, RF, AF, AT, CA, HD, DT, EF, ET, CN };
+
+    struct YappRxState {
+        // AwaitSISig / AwaitACKSub / AwaitEFSig consume the second
+        // signature byte (0x01 / 0x01|0x03 / 0x01) that confirms the
+        // fixed-form packets.  AwaitLen + AwaitData collect the body
+        // of the length-prefixed packets (HD/DT/CN); pendingKind
+        // remembers which kind the leading control byte signalled.
+        enum Phase {
+            Idle,
+            AwaitSISig,
+            AwaitACKSub,
+            AwaitEFSig,
+            AwaitETSig,
+            AwaitLen,
+            AwaitData
+        } phase = Idle;
+        YappKind   pendingKind = YappKind::HD;
+        int        remaining = 0;
+        QByteArray buffer;
+
+        // Current file being received (HD seen, EF not yet)
+        QString    filename;
+        qint64     filesize = 0;
+        QByteArray fileBuf;
+        bool       active = false;
+        qint64     lastProgressMs = 0;
+    };
+
+    // Per-session transfer tracking — shared by TX and RX so the UI can
+    // show a single "transfer in progress" widget.  TX side updates are
+    // driven by yappSendFile as frames are queued; RX side by
+    // yappHandleFrame as DT blocks arrive.
+    struct XferState {
+        bool       active = false;
+        QString    dir;          // "tx" or "rx"
+        QString    name;
+        qint64     total = 0;
+        qint64     done = 0;
+        qint64     lastProgressMs = 0;
+        bool       abortPending = false;  // TX only
+        // SI/RR handshake state:
+        //   "awaiting_rr"      — TX: SI sent, waiting for peer RR
+        //   "awaiting_accept"  — RX: SI received, waiting for user accept
+        //   "active"           — data flowing (HD/DT/EF)
+        QString    phase;
+        QByteArray pendingData;  // TX: buffered file bytes until RR arrives
+        // TX-side pump: the YAPP frame list, queued one at a time
+        // through onPacketTxReady so at most one frame sits in
+        // ax25_link's I-frame queue.  Makes Abort take effect within
+        // one frame instead of waiting for a pre-queued backlog to
+        // drain on the air.
+        QList<QByteArray> pendingYappFrames;
+        int        framesPlanned = 0;
+        int        framesSent = 0;
+    };
+
+    struct TerminalSession {
+        QString sid;
+        int     chan = 0;
+        QString ownCall;
+        QString peerCall;
+        QStringList digis;
+        enum State { Disconnected, Connecting, Connected, Disconnecting };
+        State   state = Disconnected;
+        QList<QJsonObject> scrollback;        // capped via TERM_SCROLLBACK_MAX
+        qint64  createdMs = 0;
+        qint64  lastActivityMs = 0;
+        bool    incoming = false;
+        YappRxState yapp;
+        XferState   xfer;
+    };
+    QMap<QString, TerminalSession*> termSessions;
+    int termNextSidNum = 1;
+    static constexpr int TERM_FIXED_CLIENT = 1;
+    static constexpr int TERM_SCROLLBACK_MAX = 1000;
+    QSet<QString> termRegisteredOwnCalls;   // tracked so we don't double-register
+
+    // QSettings backing file — populated by servermain after getSettingsFilePath
+    // resolves the -s flag.  Empty means "use the default (QSettings org/app)".
+    QString packetSettingsFile_;
+    QString instanceName_;
+    Logbook logbook_;
+    bool logbookPersistent_ = true;   // false: container without a volume, file dies with it
+    QUdpSocket *wsjtxSocket_ = nullptr;
+    QHostAddress wsjtxAddress_;
+    quint16 wsjtxPort_ = 2237;
+    bool wsjtxEnabled_ = false;
+    bool wsjtxDecodes_ = false;
+    QTimer *wsjtxHeartbeatTimer_ = nullptr;
+    QString wsjtxId_ = QStringLiteral("wfweb");
+    QString wsjtxTarget_;
+    // Two browsers decoding the same audio would forward the same decode
+    // twice; remember what went out recently, keyed on time+df+text.
+    QHash<QString, qint64> wsjtxDecodesSent_;
+    void    packetLoadSettings();
+    void    packetSaveSettings();
+
+    QString termMakeSid();
+    QJsonObject termSessionToJson(const TerminalSession *s) const;
+    QJsonObject termScrollbackEntry(const QString &dir, const QByteArray &data);
+    // YAPP helpers
+    void       yappFeedIncoming(TerminalSession *s, const QByteArray &chunk,
+                                QByteArray &textOut);
+    void       yappHandleFrame(TerminalSession *s, YappKind kind, const QByteArray &data);
+    void       yappSendFile   (TerminalSession *s, const QString &name,
+                                const QByteArray &data);
+    void       yappStartDataPhase(TerminalSession *s);
+    void       yappPumpNextFrame(TerminalSession *s);
+    TerminalSession *yappFindActiveTxXfer();
+    void       yappSendRR     (TerminalSession *s);   // ACK 0x01
+    void       yappSendRF     (TerminalSession *s);   // ACK 0x02
+    void       yappSendAF     (TerminalSession *s);   // ACK 0x03
+    void       yappSendAT     (TerminalSession *s);   // ACK 0x04
+    void       yappSendAB     (TerminalSession *s);   // CN with no reason
+    void       yappAbortSend  (TerminalSession *s);
+    void       xferBroadcastStart(const TerminalSession *s);
+    void       xferBroadcastProgress(TerminalSession *s, bool force = false);
+    void       xferBroadcastEnd(const TerminalSession *s, bool aborted);
+    // Per-kind frame builders.  Each returns the exact bytes to queue
+    // into the AX.25 I-frame info field.
+    static QByteArray yappBuildSI();                              // ENQ 01
+    static QByteArray yappBuildRR();                              // ACK 01
+    static QByteArray yappBuildRF();                              // ACK 02
+    static QByteArray yappBuildAF();                              // ACK 03
+    static QByteArray yappBuildAT();                              // ACK 04
+    static QByteArray yappBuildHD(const QString &name, qint64 size);  // SOH len data
+    static QByteArray yappBuildDT(const QByteArray &chunk);        // STX len data
+    static QByteArray yappBuildEF();                              // ETX 01
+    static QByteArray yappBuildET();                              // EOT 01
+    static QByteArray yappBuildCN(const QString &reason = {});     // CAN len [reason]
+    void termAppendScrollback(TerminalSession *s, const QJsonObject &entry);
+    void termBroadcastSession(const TerminalSession *s);
+    void termBroadcastData(const QString &sid, const QJsonObject &entry);
+    TerminalSession *termFindByEndpoints(int chan, const QString &own, const QString &peer);
+    void termEnsureRegistered(int chan, const QString &ownCall);
+
+private slots:
+    // AX25LinkProcessor signal handlers (queued).
+    void onAxLinkEstablished(int client, int chan,
+                             const QString &peerCall, const QString &ownCall,
+                             bool incoming);
+    void onAxLinkTerminated (int client, int chan,
+                             const QString &peerCall, const QString &ownCall,
+                             int timeout);
+    void onAxRxData         (int client, int chan,
+                             const QString &peerCall, const QString &ownCall,
+                             int pid, const QByteArray &data);
+    void onAxDataAcked      (int client, int chan,
+                             const QString &ownCall, const QString &peerCall,
+                             int count);
+
+private:
+
+    // Memory channel scanning
+    QMap<quint32, memoryType> memories;  // key = (group << 16) | channel
+    QSet<quint32> memoryScanSeen;         // keys reported by the running scan
+    bool memoryScanActive = false;
+    int memoryScanCurrent = 0;
+    int memoryScanEnd = 0;
+    int memoryScanGroup = 0;
+    QTimer *memoryScanTimer = nullptr;
+    QJsonObject memoryToJson(const memoryType &mem);
+    QString modeRegToString(quint8 reg) const;
+    void scanNextMemory();
+    bool recallMemoryOnRig(int channel, int group, QString *error = nullptr);
+    bool memoryContentsSupported() const;
+    void sendMemoryError(QWebSocket *client, const QString &error);
+
+    // wfweb's own channels, for rigs that can't store one (issue #114).
+    // Used exactly when memoryContentsSupported() is false, so the two paths
+    // never both apply and the browser talks the same protocol to either.
+    MemoryStore memStore;
+    QJsonObject localMemoryToJson(const localMemory &m) const;
+    void sendLocalMemories(QWebSocket *client);
+    bool writeLocalMemory(int channel, const QString &name, QString *error);
+    bool recallLocalMemory(int channel, QString *error);
+    // Replay a stored frequency + mode onto the current VFO. Shared by the
+    // local-memory recall and by recallMemoryOnRig()'s no-select-command
+    // fallback, which does exactly the same thing from the rig's own cache.
+    void applyMemoryToVfo(qint64 hz, quint8 modeReg, quint8 filter, quint8 datamode);
+
+    // setBand write-back: the band stacking register being left and the VFO
+    // state to store in it. Filled by the setBand handler, consumed by the
+    // matching 1A 01 reply in receiveCache() (read-modify-write).
+    struct { int bsr = 0; int reg = 0; qint64 hz = 0; quint8 mode = 0; quint8 filter = 0; } pendingBsrSave;
+    // Set right before queueing the write-back: queue->add() echoes the
+    // value through receiveCache() synchronously, and that echo carries a
+    // real frequency, so it is otherwise indistinguishable from a reply.
+    bool bsrWriteEchoPending = false;
+
+    // Repeater access tone (TONE / TSQL / DTCS). Rigs speak one of two
+    // dialects — the single "Tone Squelch Type" register (IC-705/9700/905) or
+    // independent TONE/TSQL/DTCS booleans (IC-7300/7610/…) — and these two
+    // helpers hide the difference behind one rptAccessTxRx_t.
+    // Tone state is mirrored into these members by receiveCache() rather than
+    // read back out of the queue on demand. receiveCache() can run
+    // *synchronously inside* cachingQueue::receiveValue() — Qt picks a direct
+    // connection when the emit happens on the receiver's own thread, which is
+    // exactly what applyToneMode() does — and the queue mutex is held for the
+    // duration. Calling queue->getCache() from there deadlocks.
+    rptAccessTxRx_t toneModeCache = ratrNN;   // the 0x16 0x5D dialect
+    bool toneFlagTone = false;                // the 0x16 0x42/0x43/0x4B dialect
+    bool toneFlagTsql = false;
+    bool toneFlagDtcs = false;
+    rptAccessTxRx_t currentToneMode() const;
+    void applyToneMode(rptAccessTxRx_t mode);
+    // The boolean dialect needs three writes (and answers three reads) for one
+    // mode, so the folded value is briefly nonsense — TONE on its way to TSQL
+    // reads as TONE(T)/TSQL(R) in between. Clients are told once things settle.
+    int slowPollTick = 0;        // 5 s tick in sendPeriodicStatus (duplex offset, tuner status)
+    QTimer *toneModeNotifyTimer = nullptr;
+    void scheduleToneModeNotify();
+    void addToneCaps(QJsonObject &o) const;
+    void addBandCaps(QJsonObject &o) const;
+    void addTxMeterCaps(QJsonObject &o) const;
+    void addTxMeterReadings(QJsonObject &o) const;
+    void applyTxMeterPoll();
+    void addToneStatus(QJsonObject &o);
+    bool toneCommandsAvailable() const;
+};
+
+#endif // WEBSERVER_H

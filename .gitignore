@@ -1,0 +1,43 @@
+*.pro.user
+.vs
+.qmake.stash
+.qtc_clangd
+debug
+release
+wfweb-debug
+wfweb-release
+ui_*
+portaudio_x86.dll
+qcustomplot2.dll
+Makefile
+Makefile.Debug
+Makefile.Release
+*.o
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+IC7300-screenshots/
+*.log
+*.ipch
+test.log
+Makefile.server
+wfweb
+tools/virtualrig/virtualrig
+# qmake writes the Windows icon/version resource next to launcher.pro (RC_ICONS).
+launcher/*_resource.rc
+.testrig/
+/dist/
+# Emscripten Opus + RADE build cache (rebuilt by build-rade-wasm.sh).
+/build-wasm/
+.claude/settings.local.json
+*.ini
+.DS_Store
+__pycache__/
+
+# JS8 build cache: FFTW source + libfftw3f.a (rebuilt by tools/build-js8-fftw.sh)
+resources/js8-src/.fftw-cache/
+resources/js8-src/.emcache/
+.claude/worktrees/
+
+# Local agent working notes (never published)
+tasks/

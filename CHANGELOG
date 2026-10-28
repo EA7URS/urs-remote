@@ -1,0 +1,1390 @@
+wfweb CHANGELOG
+===============
+
+This changelog covers wfweb changes only. wfweb is a fork of wfview that adds
+a built-in web interface. See https://gitlab.com/eliggett/wfview for the
+upstream wfview history.
+
+
+v0.9.4 (2026-10-26)
+--------------------
+
+CW decoder:
+- New decoder: DeepCW, a neural model (e04/deepcw-engine) run in the
+  browser. It decodes a 12 s window with context on both sides, so the
+  newest few seconds show dim and correct themselves, then each word is
+  committed once. On synthesized CW it stays exact down to -10 dB,
+  where the old decoder fails. The model and its runtime (~27 MB) load
+  on the first DECODE press and are kept by the browser, also on a
+  server with a self-signed certificate.
+- The old ggmorse decoder stays as the fallback: on browsers without
+  WebAssembly SIMD (Safari < 16.4, Firefox < 114), when the model fails
+  to load, or when the machine is too slow for it. A GGMORSE tag shows
+  when it is in use.
+
+CW keying:
+- Paddle input: a paddle or straight key is sent as text through the
+  rig's keyer (Icom CI-V has no key-down command). The browser tone
+  follows the fist at once, the decoded characters go to the radio one
+  character behind. Iambic A / B and swap, a straight key with an
+  adaptive speed; a slip goes out as its nearest character, and
+  characters run together are split instead of dropped. The radio's own
+  late sidetone in the RX audio is muted while the paddle sends.
+- New PADDLE window at the end of the CW bar's CALL/QSO row: keyer
+  options, the adapter, and CHECK lamps for each contact. A USB keyboard
+  paddle adapter (VBand, Vail adapter in keyboard mode: left and right
+  Ctrl) works in every browser, phones included (opt-in, USB KEYS).
+- New BK-IN button in the CW bar: OFF / BKIN / F-BKIN, the radio's
+  break-in key, following the radio. The IC-7300 rig file now allows
+  full break-in.
+- The browser tone follows a change of audio output (e.g. AirPods to
+  speakers) instead of keeping the old device's delay until a browser
+  restart. TONE turns amber when the output is too slow to send a
+  paddle by ear (Bluetooth headphones).
+- A click on the scope tunes to 1 Hz in CW (100 Hz in other modes), and
+  the arrow keys tune while the CW input has the focus.
+- The CW decoder's tone spectrogram is back on phones; hovering a CW
+  toggle no longer makes it look switched on.
+
+MIDI controller:
+- Web MIDI controller support (Chromium browsers; Firefox with a site
+  permission; not Safari), with presets for
+  the CTR2-MIDI (normal and Extended BTN) and MIDI learn: the knob
+  tunes, buttons drive band, mode, CW speed, gains, span, PTT, BK-IN,
+  and the controller's paddle jack keys CW. FUNC > MIDI shows while a
+  controller is plugged in; the first time, it is reached from the CW
+  bar's PADDLE > MIDI... A controller unplugged mid-over unkeys.
+
+Speech compressor (#147):
+- FUNC has a COMP tile and GAIN a COMP level row (0-10 as on the
+  radio); a COMP n tile on the spectrum shows while it is on.
+- wfweb switches COMP off for its own digital transmissions (FT8/FT4,
+  JS8, TUNE, FreeDV / RADE, packet) and back on after, in both builds.
+  These go out in plain USB / LSB, where the compressor stayed in the
+  path and distorted RADE and the FT8 tones. Only in SSB, never
+  switched on if it was off, and a COMP press during the over wins.
+- Server build: the first PTT key after connecting could be lost; the
+  periodic status read of a command deleted a pending set of it.
+
+rigctld (#147):
+- Frequency and mode reads answer the dial instead of 0 or the last
+  value set, PKTUSB selects USB-D, frequencies are printed as integer
+  Hz the way Hamlib does, and `q` is acknowledged. Pat (Winlink) and
+  WSJT-X now work through wfweb's rigctld.
+- get_clock and wait_morse no longer crash the server.
+
+Touch screens (#144, thanks YO3GWM):
+- Key lock: a padlock in the scope's corner locks every control but
+  PTT, like an HT. Tap to lock, hold to unlock.
+- In voice modes, PTT is a full-width row under the soft keys, 96 px
+  tall and clear of Android's navigation edge; double width in
+  landscape. Hold PTT and slide up into the lock to latch TX (tap to
+  stop, 3-minute limit). CW keeps a plain KEY key; RTTY and the
+  FT8 / JS8 / packet panels get the four soft keys.
+- Server build: if the browser that keyed the rig disconnects, the rig
+  is unkeyed.
+
+Web UI:
+- A SQL n% tile on the spectrum while squelch is above 0. (#146)
+
+Packaging:
+- The macOS and Windows zip names carry the version, like the
+  packages.
+
+
+v0.9.3 (2026-10-17)
+--------------------
+
+Windows launcher:
+- The Windows zip ships wfweb-launcher.exe, a small window for starting
+  the server without a command line: pick the serial port or LAN rig,
+  audio device, CI-V address, web port and name tag, press Start, and
+  the browser opens once the server answers. It follows the server's
+  log, sits in the tray with start/stop, can start with Windows, and
+  stops the server cleanly. When the web port is already taken it names
+  the program holding it, and offers to stop it only when that is
+  another wfweb. The server itself is unchanged and stays CLI-only.
+
+Audio:
+- RX audio gets an adaptive jitter buffer. It used to have a fixed
+  40 ms pre-buffer and bumped on every network stall longer than that;
+  now an underrun fades out instead of clicking, and the buffer grows
+  to the stalls it measures and shrinks back once they stop, so a
+  jittery link settles on the smallest buffer that stops the bumps. It
+  also absorbs the rig's clock drift. FUNC > AUDIO opens the AUDIO / TX
+  panel, whose BUFFER tile shows the size (AUTO) or pins it to
+  50/100/200/400 ms. Stale audio queued before playback started is
+  dropped instead of played late.
+- New VOL control, in the GAIN panel and the AUDIO / TX panel: the
+  browser's own RX volume, for when the rig's AF GAIN does not reach
+  the USB audio (Icom USB AF level is a menu setting). Remembered per
+  browser; a "VOL n%" readout shows while it is below 100 %. Recordings
+  and the decoders are not affected by it. (#141)
+- One MIC button for TX audio, OFF by default, in both builds. It
+  cycles OFF, the last input used, each other input, then OFF, and
+  starts TX audio straight away so the browser's permission prompt
+  shows. A failed start says MIC BLOCKED / BUSY / NOT FOUND / FAILED
+  instead of a silent OFF, and a double tap no longer opens two mics.
+- Windows: browser TX audio over USB came out chopped and robotic. The
+  server now writes it to the sound device one period at a time.
+  (#136)
+- The browser mic never picks the rig's own USB Audio CODEC (often
+  Windows' default communications input), which made the transmission
+  go out silent. The server warns, and the page shows MIC = RADIO RX,
+  if it is chosen anyway. (#136)
+- iOS: the speaker no longer stays several times quieter after the mic
+  has been used, until Safari was killed.
+
+CW (#141, thanks va2bbw):
+- Macros longer than 30 characters are keyed. The Icom keyer rejects a
+  longer frame, so anything over 29 characters keyed nothing.
+- Typing ahead in CHR mode no longer overflows the radio's keyer: text
+  is handed over as the keyer is ready for it.
+- New TONE button (on by default): a sidetone made in the browser at the
+  radio's CW pitch and the VOL level, in step with the keyed text. It
+  works over LAN, where the radio's own sidetone never reaches the
+  browser. Turn it off to use the radio's sidetone over USB for true
+  full break-in with a paddle (IC-7300: ACC/USB AF Beep/Speech Output
+  ON).
+- The transcript highlight and the sidetone stay in step with the
+  radio. Word gaps were three dots too long, and the Icom keyer does
+  not key the textbook 1200 / WPM: wfweb now keys the dot lengths
+  measured off an IC-7300.
+- Backspace in CHR mode no longer leaves the next text silent until
+  STOP; characters the keyer cannot send are dropped instead of being
+  keyed as "?".
+- The speed range comes from the rig (6-48 WPM by default) instead of a
+  fixed 10-35, and the WPM box's spinner no longer hides the digits.
+- Server build: the CW macros are kept in the settings file and shared
+  by every browser (also GET/PUT /api/v1/cw/macros).
+
+Band / VFO:
+- The BAND keys recall the rig's band stacking register, like the
+  front-panel key: frequency, mode and filter follow the band (40 m
+  LSB, 20 m USB), a repeated press steps through the band's three
+  slots, and the slot you leave is updated first. Icom only; other rigs
+  keep the plain frequency jump.
+- Closing the FT8/FT4 or JS8 panel puts the rig back on the frequency,
+  mode and filter it had before the panel opened, unless you changed
+  band inside the panel.
+- F-INP takes the keyboard: digits and "." type, Backspace deletes,
+  Delete clears, Enter tunes, Escape closes. With nothing open, F or a
+  digit opens it (not while a CW, DIGI, JS8 or packet panel takes typed
+  text). (#142)
+
+FT8 / FT4 / JS8:
+- 60 m in the band selectors: FT8/FT4 on 5.357, JS8 on 5.363, offered
+  when the rig has the band. (#116)
+- The report of an R-report ("R-07") is logged as -07, as WSJT-X does.
+  (#140)
+
+Memory mode:
+- Server build: FIL1/2/3, mode and status follow the recalled channel
+  in memory mode. The filter buttons did nothing, and the status, REST
+  and WSJT-X status had no frequency or mode. (#138)
+
+Logbook:
+- QSOs logged while FreeDV / RADE is active get mode FREEDV, not the
+  rig's USB/LSB.
+
+Web UI:
+- The crosshair over the scopes and waterfalls is our own outlined
+  pointer; the system one vanished on the waterfall on Raspberry Pi OS.
+  (#135)
+- On a phone the small needle meter numbers the scale of the selected
+  reading instead of S only.
+
+Docs:
+- README: a Standalone vs Server feature matrix, and the settings-file
+  keys corrected to the ones the server actually reads.
+
+
+v0.9.2 (2026-10-04)
+--------------------
+
+Recording:
+- A REC button in the top bar records the session as audio (MP3) or as
+  video (MP4 where the browser can write it, WebM otherwise). It runs
+  entirely in the browser, in both builds: the server stores nothing,
+  and the finished file arrives as a download.
+- Audio is what you hear, with your own transmit audio (mic, FT8/FT4,
+  JS8, tune, packet) in its place while you transmit, so a rig with
+  MONITOR on isn't recorded twice.
+- Video is a 1280x720 frame: frequency, mode, filter, VFO, RX/TX, the
+  meter, rig name, callsign and UTC time above the live spectrum and
+  waterfall. The picture follows the mode. CW adds the decoder's tone
+  waterfall and the contact as an RX/TX conversation. FT8/FT4, JS8 and
+  packet show their own waterfall and traffic in place of the scope.
+  FreeDV / RADE adds sync, SNR, a one-minute timeline of overs and the
+  callsigns heard.
+- While recording, the button shows a stop square and the elapsed time.
+  On phones the elapsed time takes the place of the UTC clock.
+- A video stops and saves itself after 30 minutes, an audio recording
+  after 6 hours.
+
+Meter:
+- New needle meter: the multi-scale analog face the IC-7610 draws on
+  its screen, with S, Po, SWR, ALC, COMP, Vd and Id under one needle.
+  It reads S on receive and the selected reading on transmit; tap the
+  meter to change it. FUNC > METER cycles AUTO / BAR / NEEDLE. AUTO is
+  the needle on the rigs that draw this face themselves (IC-7610,
+  IC-7600, IC-7760, IC-785x, IC-756PRO series, IC-R8600) and the bar on
+  the others. Recorded video shows whichever face is active.
+- The Po scale follows the rig's rated power. It assumed 100 W, so a
+  10 W rig never filled more than a tenth of the bar.
+- On dual-receiver rigs the S-meter shows the main receiver only. It
+  used to mix in the Sub receiver's readings.
+
+Server:
+- Started from a terminal, wfweb shows a status page instead of the
+  scrolling log: one URL per network address, the rig and its
+  connection, frequency and mode, connected browsers, the REST and
+  rigctld ports, the log file and the last warning. "l" switches to the
+  live log and back, "q" quits. Nothing changes off a terminal: pipes,
+  systemd, -b, --no-tui and WFWEB_NO_TUI=1 (set in the Docker image)
+  keep the plain log.
+- Quitting with "q" no longer crashes. Ctrl+C and SIGTERM can no longer
+  hang the server on the way out, and one that arrives during startup
+  is no longer lost.
+
+FT8 / FT4:
+- DXpedition / multi-answer messages such as
+  "KF8EXX RR73; W2ERC <G3VCQ> -14", sent by Fox/Hound and MSHV
+  stations, are read as two messages from one station. Clicking the row
+  answers the real sender, the auto-sequencer picks up a report or an
+  RR73 addressed to you, and the entity shown is the sender's. Before,
+  "RR73;" was taken for the callsign, and the server build spotted it
+  to PSK Reporter. A station answering two other callers at once no
+  longer makes wfweb stop calling. (#129)
+- The band selector offers the bands the rig has, so an IC-705, IC-9700
+  or IC-7100 gets 4m (70.154), 2m (144.174, FT4 144.170) and 70cm
+  (432.174).
+
+JS8:
+- The band selector follows the rig's bands too; 2m is 144.178.
+
+CW:
+- US 1x1 special-event calls (N6O, K1W) are recognised in the decoded
+  text and can be clicked.
+
+Audio (server build):
+- Safari could open the page with no RX audio until a reload or another
+  click, most often with the rig already in CW. The page now starts the
+  audio itself, shows AUDIO PAUSED on the scope for as long as the
+  browser holds it back, and a CLICK TO START pressed before the rig's
+  status arrived no longer leaves audio off.
+
+Logbook:
+- "Add QSO" filled in FT8 whatever the rig was doing, and the top-bar
+  LOG button logged the rig's mode even with the FT8 panel open. Both
+  now use the open FT8/FT4 or JS8 panel, otherwise the rig's mode.
+  (#125)
+
+
+v0.9.1 (2026-09-27)
+--------------------
+
+Upgrade notes (Docker):
+- The QSO log now lives on the server (see Logbook below), and the image
+  keeps its settings and log under /data. Mount a volume at /data, or
+  the log lasts only as long as the container. Settings that used to sit
+  at /root/.config/wfweb/wfweb.conf move to /data/wfweb/wfweb.conf. The
+  image no longer declares VOLUME ["/data"], because a hidden anonymous
+  volume would be lost on `docker run --rm`. wfweb warns at startup and
+  in the log panel when the log is on storage that won't survive the
+  container. DOCKER.md now shows the mount paths wfweb actually uses;
+  the documented volume used to persist nothing.
+
+AppImage:
+- New .AppImage downloads for Linux x86_64 and ARM64 (Raspberry Pi):
+  one file that runs on any distro with glibc 2.36 or newer (Debian 12+,
+  Ubuntu 24.04+, Fedora 37+, Arch, openSUSE…), not only the Debian and
+  Ubuntu releases the .debs target. `chmod +x` it and run it. It bundles
+  Qt, RADE, codec2 and the rest; the host needs only the ALSA library
+  and OpenSSL 3. Each build is boot-tested headless in CI before it
+  ships.
+
+Logbook (server build):
+- The QSO log is a server-side ADIF file shared by every browser, and
+  it's built for lifetime logs: 100k QSOs is a normal case. The panel
+  loads 100 rows at a time ("Load older" pages further back) and each
+  browser receives only the changes. On first connect a browser hands
+  its old local log to the server; the local copy is removed only once
+  the server confirms the log is on durable storage. (#109, thanks
+  MakoWish)
+- The log panel gets a Log management menu. "Download new QSOs (n)"
+  gives plain ADIF with only the QSOs not yet exported, ready for
+  another logging service. "Download the full logbook" keeps every
+  field, so it restores faithfully. "Import an ADIF file…" merges a file
+  and skips duplicates. Clear Log is gone from the UI. A REST DELETE
+  still clears the log, and the previous file is always kept as a
+  timestamped .bak.
+- Remote logging: --remote-log <host[:port]> sends every logged QSO to
+  an external logging program (GridTracker, JTAlert, Log4OM… over the
+  WSJT-X UDP protocol). --remote-log-decodes also forwards FT8/FT4
+  decodes. It's set on the server only, in the settings file ([RemoteLog])
+  or on the command line; the log panel shows the current state.
+- REST: paged GET /api/v1/logbook (limit, before, call), ADIF import
+  and export, and GET/PUT /api/v1/station. See REST_API.md.
+
+Station:
+- The station callsign and grid are kept on the server and applied to
+  every browser. Before, each browser pushed its own copy on connect and
+  the last one to connect won, so a stale tab could quietly bring back an
+  old callsign; QRZ then rejected QSOs. Every QSO is stamped with ADIF
+  STATION_CALLSIGN. (#109)
+
+FT8 / FT4:
+- Each decode row shows the sender's DXCC entity (from AD1C's cty.dat).
+  A gold star marks an entity never worked, a silver star one not yet
+  worked on this band, and stations already worked on this band are
+  dimmed. Both hints can be turned off in Station Settings.
+- The RX and TX markers move independently, as in WSJT-X. A click moves
+  both (TX stays put with Hold TX on), Shift+click moves TX only, and
+  Ctrl/Cmd+click moves RX only. On a touchscreen, drag the RX or TX tab
+  on the waterfall. (#117)
+- Phones: the entity column is shown, the TX/RX offsets fit on one line,
+  switching between DECODES and DIRECTED scrolls to the newest row, and
+  Erase clears whichever pane is showing. (#122)
+- Clicking a station that is still working someone else, or one that
+  just sent 73, now starts a real QSO: the sequence moves on when they
+  answer, instead of resending the grid forever. (#115)
+- Halt TX stops the transmission immediately. It used to let the halted
+  frame keep playing, and a second transmission could start on top of
+  it. (#118)
+- The QSO Messages block no longer cuts off its sixth row.
+
+Scope / waterfall:
+- The scope follows the rig's own CENTER / FIXED / SCROLL modes. In FIXED
+  and SCROLL the band edges stay put and the marker moves. On rigs whose
+  fixed edges can be written from CI-V (IC-7300, IC-7300MK2, IC-7610,
+  IC-705, IC-9700), the SPAN row picks the FIXED window: BAND covers the
+  ham band you're on, and a span key sets that width around the VFO. In
+  SCROLL, dragging to the edge of the scope moves the window by one page,
+  which makes SCROLL usable on a phone. The old FIXED / TRACK toggle for
+  waterfall history is now HOLD / PAN, used in CENTER. Connecting no
+  longer forces the rig into Center mode. (#113)
+- The spectrum trace is drawn at full device resolution as a continuous
+  outline. It is no longer a blocky staircase on HiDPI screens.
+
+Memories:
+- The IC-7600 is set up as the MAIN/SUB radio it is: the VFO tile
+  switches bands, each band shows its own frequency, and memories
+  read, write and name correctly. Firmware 2.00 is required. (#108)
+- A memory saved while SUB is selected stores SUB's frequency and mode
+  (IC-7600 and IC-7610). (#108)
+- The memory list stays on screen during a rescan, and a second save can
+  no longer overwrite a channel the scan hasn't read yet. Leaving memory
+  mode no longer shows the channel's frequency as VFO A. (#108)
+- Memory writes on Icoms connected over LAN stopped failing after the
+  first reconnect: the frame grew on every reconnect until the rig
+  refused it. IC-7300MK2 memory names are 16 characters. (#111)
+- The IC-718 and the IC-706 family can't read a memory channel back
+  over CI-V. They now get wfweb's own memory channels, stored on the
+  server (or in the browser, standalone) and marked as local. Rigs that
+  can't store channels at all report an error instead of silently doing
+  nothing. (#114)
+- POST /api/v1/radio/memories/{ch}/recall recalled channel 0 whatever
+  channel was asked for. Fixed.
+
+Web UI:
+- Shift+Up/Down or Ctrl+Up/Down tunes in 10 kHz steps. (#120)
+
+Packet:
+- The terminal shows CONNECTED, DISCONNECTED and the connecting and
+  disconnecting lines as they happen. Before, they only appeared after a
+  reload.
+
+Packaging:
+- The server looks for rig files next to its binary first, so relocated
+  installs such as the AppImage find them.
+- Removed desktop-GUI leftovers (Qt translations, the macOS plist) that a
+  headless app doesn't use.
+
+
+v0.9.0 (2026-09-13)
+--------------------
+
+Scope / waterfall:
+- The spectrum is drawn as one solid bar per bin on the rig's fixed
+  count scale, with the tracked noise floor seated at the axis so only
+  the noise peaks show as grass, a grey 4.5 s per-bin peak-hold ghost
+  behind the live sweep, and the trace easing toward each new sweep so
+  the IC-7300's ~4 sweeps/s over USB no longer looks like a slideshow.
+- The waterfall gets a navy -> blue -> cyan -> white palette anchored to
+  the noise floor with a steep 15 dB window, and slides continuously
+  between sweeps instead of stepping whole rows.
+- A scope sheet opens from the span indicator as a bottom strip, so the
+  scope stays visible while adjusting: SPAN, MODE, REF and SPEED, one
+  setting per line. MODE FIXED leaves the waterfall history where it was
+  painted and never pans on a drag (the rig's own behaviour, now the
+  default); TRACK is the previous panning behaviour. REF (AUTO / -2.5 /
+  +2.5 dB) and SPEED (SLOW / MID / FAST) are applied in the browser and
+  mirrored to the rig.
+
+CW:
+- Prosigns send and decode. Type <AR> / <SK> / <BK> and the like in the
+  keyer box; the transcript tracks a prosign as one unit so character
+  highlighting stays in step with what the rig is keying. On receive,
+  the nine run-together patterns that used to land on punctuation or '?'
+  now expand back to their <..> form.
+- A new AUTOTUNE button moves the dial so the loudest tone in the
+  200-1000 Hz band lands on the decode centre. It averages over 1.5 s,
+  so a single burst can't win the peak, and pulls at most +/-400 Hz.
+  Previously the only way to centre a signal was to click the right row
+  of the spectrogram, which phones don't even draw.
+
+Web UI:
+- Tapping the meter cycles its lower row through SWR, ALC, COMP, Vd and
+  Id, the same set the radio's own multi-function meter offers. Only
+  readings the connected radio can produce are offered, and the faces
+  are built from each .rig file's calibration table rather than
+  hardcoded numbers, which keeps Id honest across models (25 A on an
+  IC-7300, 4 A on an IC-905).
+- The top bar carries a tag with the rig model, and the same label goes
+  into the browser tab title, so several wfweb instances side by side
+  can be told apart. The server build's new -n/--name <tag> flag
+  replaces the model with a name of your choosing.
+- Gain meter polish: RX/TX section headers, tick marks visible above an
+  empty bar, gradient fill with a leading-edge needle.
+- Powering off a rig that cannot be woken again over the same cable now
+  warns first. The IC-7600 accepts power-on only from its [REMOTE] jack,
+  and leaves its USB interface unpowered in standby, so a USB session
+  can switch it off and never switch it back on.
+
+Rigs:
+- IC-7300 and IC-7300MK2 SWR calibration: the table's top point was
+  2410 instead of 241, so every reading above the red line came back far
+  too low - a real SWR near 4.5 decoded as about 3.1.
+
+Fixes:
+- Every panel is usable on a phone in portrait. Swept both forks at
+  390x844, 375x667 and 360x740: the packet header wraps so its controls
+  stay on screen, the heard-stations table scrolls sideways, the FreeDV
+  readout stays clear of the right edge, and the smallest buttons grew
+  to a tappable size.
+- The CW bar no longer buries the waterfall. The scope lays itself out
+  in the strip above the bar at every viewport, the bar is capped at 65%
+  of the scope area, and the scope stays tappable while decoding.
+- Opening or closing the CW bar - or any window resize - no longer wipes
+  the waterfall history.
+- The CW decoder starts when the page opens straight into CW (rig
+  already in CW at page load, or ?m=CW), not only when CW is entered
+  from another mode.
+- FT8 on a phone: the status bar and action row fit within 360px, and
+  the DIRECTED tab badge counts only messages addressed to your call
+  rather than all on-frequency traffic.
+- The power button is really gated on rig capability now. Rigs whose
+  .rig file declares no Power Control command (IC-718, IC-706 and
+  IC-746/756 families, IC-9100, IC-R7100) showed a button that dropped
+  the command but still raised the "Radio is powered off" screen.
+
+Build:
+- resources/build-ggmorse-wasm.sh fetches upstream ggmorse itself at the
+  commit pinned in GGMORSE_COMMIT, so the CW decoder WASM can be rebuilt
+  without an ad-hoc clone at an unrecorded revision.
+
+v0.8.6 (2026-09-06)
+--------------------
+
+Web UI:
+- The BAND picker is built from the rig's own band table instead of a
+  fixed HF list, so VHF/UHF rigs can reach their upper bands from it at
+  last: the IC-705 gains 144/430, the IC-9700 144/430/1200, and the
+  IC-905 up to 10 GHz. Keys appear only for bands the rig declares, the
+  grid keeps Icom's three-per-row shape, and per-band last-frequency
+  memory covers the new bands.
+- FILTER window: the three FIL tiles are replaced by one FIL tile that
+  opens a DUP-style window with FIL1/2/3, WIDTH, a twin-PBT graphic with
+  tap-to-centre PBT-1/2, and SHARP/SOFT filter shape.
+- Repeater TONE: a TONE window for TONE / TSQL / DTCS, with a readout in
+  the P.AMP/DUP stack. TONE and TSQL share one tone selection, since the
+  radio transmits the tone-squelch frequency in TSQL anyway. The tone
+  scan reads the sub-tone out of the received audio with a Goertzel bank
+  rather than engaging the rig's own tone squelch, which would mute the
+  receiver for the whole sweep.
+- DUP +/- repeater shift for the rigs that support it (IC-705, IC-9700,
+  IC-905, IC-785x), with IARU Region 2 offsets by default and Region 1
+  offered alongside, a kHz box for odd splits, and a readout under the
+  P.AMP/ATT one.
+- An RFG warning tile when RF gain sits below 100%.
+- The attenuator indicator reads ATT rather than the dB level.
+
+Standalone:
+- Memory channels can be recalled onto the radio, closing the last gap
+  against the server build. (#92)
+- Center scope mode and Carrier Point Center are forced on connect, so a
+  rig left in Fixed or Filter Center no longer gives a frozen waterfall
+  or a mistuned display. (#75)
+- ESC halts an in-flight FT8/JS8/FreeDV transmission before closing the
+  overlay, and an aborted digi TX cuts the sidetone immediately instead
+  of letting the monitor buffer play out.
+
+Rigs:
+- IC-7600 set commands went out as 0x25/0x26 rather than 0x05/0x06, and
+  the set-mode commands were missing the 0x05 sub-command entirely, so
+  every 1A 05 write (DATA OFF MOD, USB Mod Level) was addressed as 1A 00
+  and refused — the browser mic only modulated in a DATA sub-mode.
+  (#97, #102)
+- IC-7600 USB CI-V is capped at 19200 baud, which is what the radio
+  actually supports. (#99)
+- IC-705 P.AMP and ATT steps are band-aware.
+
+Fixes:
+- A blank memory channel is reported as null instead of 165 Hz / Unknown
+  / filter 255: an FF reply is cached as an explicit no-value, status and
+  REST emit null, and the SPA shows dashes.
+- Reads the rig keeps refusing are backed off instead of re-asked
+  forever. An IC-705 over LAN logged "Rig (FA) error" for the tuner every
+  few seconds for as long as it ran; after three consecutive refusals a
+  read drops to one attempt every 30 s, and a valid reply clears the
+  count.
+- LAN rigs no longer enumerate or probe USB serial ports at startup.
+- The DATA MOD OFF baseline survives server shutdown and repeated mic
+  enables, so the rig's modulation input is restored rather than left on
+  USB. (#95)
+
+Packaging:
+- The Debian packages depend on libqt5multimedia5-plugins, and wfweb
+  prints a hint when Qt reports no audio backend — the cause of "No rig
+  audio device found" reports on Raspberry Pi and arm64 builds. (#98)
+
+
+v0.8.5 (2026-08-31)
+--------------------
+
+Web UI:
+- Memory channels: the radio's memory keeper is now a first-class panel.
+  A VFO A | B | MEM selector switches the rig between VFO and memory
+  mode, memory channels can be recalled straight onto the radio, saved to
+  the next free slot with "+ Save", renamed inline, and the lit row shows
+  which channel the rig is actually on. A save-target picker chooses the
+  destination slot instead of always taking the next one. Memory groups
+  are read from the rig rather than assumed to be group 0, so multi-group
+  rigs (IC-9700) address the right bank and single-group rigs are left
+  alone. (#92)
+- Memory writes that silently failed now work: the FA path no longer
+  writes from empty caches while the rig is in MEM mode, and the IC-705
+  no longer stores DV garbage from uninitialised UR/R1/R2 buffers.
+- Memory panel controls are finger-sized on touch devices.
+- Fullscreen button and 100 Hz snap when dragging the waterfall to tune,
+  contributed by MakoWish. The button hides itself on iPhone, where the
+  Fullscreen API is unavailable, and a touch lift-off wobble no longer
+  nudges the frequency when a drag is committed. (#84, #85)
+
+Packet / APRS:
+- Packet TX no longer transmits a silent carrier on LAN-attached rigs:
+  DATA MOD OFF is routed to the audio transport before the packet TX,
+  which packet had never done (only the mic path did). Confirmed on air
+  with a digipeated 1200 bd beacon.
+- TX preamble now scales with baud rate for a ~400 ms TXDelay, instead of
+  a fixed symbol count that left slow bauds under-keyed.
+- New full-window APRS station map with real aprs-symbols icons, next to
+  the existing heard-stations table.
+- Denied geolocation now points at OS Location Services rather than
+  failing silently.
+
+Standalone:
+- Ported the 100 Hz drag snap and fullscreen button from the server build.
+  (The memory panel is server-build only for now.)
+
+Fixes:
+- bandType's copy-assignment operator wrote highFreq into lowFreq and
+  never copied highFreq. Dormant today, since bands are only
+  copy-constructed.
+
+Docs:
+- Support now points at GitHub issues, with wfweb@k1fm.us as a plain
+  mailbox alternative.
+
+
+v0.8.4 (2026-08-22)
+--------------------
+
+Web UI:
+- Jump-to-spot links: the page URL now accepts `?f=<kHz>&m=<mode>`, so
+  hyperlinks can tune the radio on arrival (e.g. `/?f=7024.5&m=CW` from a
+  DX-cluster spot). `m` accepts rig modes or the app modes FT8, FT4, JS8,
+  RADE and PKT, which open the matching panel and switch the rig to the
+  mode the app needs. An explicit `f` wins over the panel's standard dial
+  frequency, and the jump fires once per page load — reconnects never
+  re-tune the radio. Works on both the Server and Standalone builds. (#83)
+
+Standalone:
+- IC-705 no longer transmits silence over USB: the correct DATA MOD input
+  register is set to USB for the whole session (never WLAN), and the
+  radio's original setting is restored on disconnect. (#79)
+
+
+v0.8.3 (2026-07-08)
+--------------------
+
+Web UI:
+- New ANT / RX ANT antenna buttons on the FUNC page for rigs with
+  selectable antennas. (#76)
+- Attenuator and preamp rework: a P.AMP button toggles the preamp on its
+  own, and a new attenuator slider walks the rig's real attenuator steps
+  instead of assuming a fixed 20 dB. (#76)
+- Redesigned S-meter and TX meters to match the IC-7300 face.
+- Waterfall palette now auto-references the noise floor so weak signals
+  stay visible as band conditions change.
+
+Scope / waterfall:
+- Center scope mode is now forced on connect and the Carrier Point is
+  centered, so the waterfall marker, passband and span track tuning
+  correctly on rigs that power up in Fixed scope mode (e.g. IC-7610). The
+  Scope Center Type is now sent without the trailing scope-window byte. (#75)
+
+Server build:
+- Dropped the #72 LAN web-mic TX diagnostics, keeping a single one-shot
+  confirmation log line.
+
+
+v0.8.2 (2026-06-28)
+--------------------
+
+FT8/FT4 DIGI panel:
+- Editable, free-text FT8 messages. The DIGI message rows can now be
+  edited directly, with an honest preview of how an over-length message
+  will be truncated on air. Clicking a decoded caller builds the
+  canonical reply sequence and highlights stations calling you, and a
+  custom CQ now persists across sessions. (#74)
+- New opt-in ARRL Field Day mode that switches the panel to Field Day
+  exchange messages. Standard FT8/FT4 operation is unchanged when the
+  option is off. (#73)
+- Send now uses the correct slot parity and RR73, and the obsolete
+  in-panel help line was dropped. (#74)
+- Switching to a new target mid-transmission now cleanly halts the
+  in-flight frame instead of leaving the rig keyed on the old message;
+  the reply goes out on the next correct-parity slot. (#74)
+
+Server build:
+- Web mic now modulates LAN-attached rigs. On rigs reached over the
+  network (e.g. IC-7610) the mic audio is routed to the DATA-OFF mod
+  input selected by name (LAN vs USB) and coalesced into 20 ms chunks,
+  matching what the rig's network-audio buffer expects — previously the
+  rig keyed but produced no modulation. (#72)
+- IC-7300 power state is now reported correctly and recovers when the
+  radio starts powered off. (#71)
+- The REST port (8081) now serves a signpost page instead of the SPA,
+  so loading it over plain HTTP no longer freezes the UI. (#69)
+- The `-b` daemon no longer spins at 100% CPU: the keyboard thread now
+  stops on stdin EOF, and daemon mode keeps the Qt event-loop file
+  descriptors open instead of closing them out from under the event loop.
+
+
+v0.8.1 (2026-06-06)
+--------------------
+
+Server build:
+- New `--no-autoconnect` flag (or `WFWEB_NO_AUTOCONNECT=1` for docker
+  compose) starts with the LAN session closed, so a host or container
+  restart doesn't grab the radio away from other clients. The web UI's
+  Reconnect button performs the first connect. LAN only — serial mode
+  has no reconnect UI, so the flag warns and connects normally. (#70)
+
+Fixes:
+- Mic audio no longer leaks into modem transmissions. With the web mic
+  enabled, packet / FT8 / JS8 TX audio could go out garbled (mic frames
+  interleaved with the modem audio), and SSB voice could stay dead after
+  a packet burst. Modem-generated audio is now tagged at the source and
+  every sink enforces a single-writer rule while a modem burst is
+  flowing; mic voice re-arms cleanly after each burst. The standalone
+  TX ring also no longer accumulates seconds of stale mic audio that
+  played out ahead of a modem burst. (both builds)
+- Server-build pages now reload themselves automatically when the
+  server is upgraded mid-session, so a long-lived tab can't keep
+  running stale frontend code against a new server.
+- Standalone RX audio now starts on the first connect. The mic
+  permission prompt used to fire after the serial connect completed,
+  outside the click's user-activation window, so audio silently failed
+  until a lucky reload — the long-standing "reload 2-3 times before
+  audio works" bug.
+- The server now serves `.wasm` with the correct MIME type, so the JS8
+  codec module loads via the fast streaming-compile path.
+- Repeated TUNE activations no longer throw a duplicate AudioWorklet
+  registration error.
+
+Standalone:
+- The start page now mentions JS8 among the supported modes.
+
+
+v0.8.0 (2026-05-24)
+--------------------
+
+New mode — JS8:
+- JS8 keyboard-to-keyboard messaging, JS8Call-compatible and entirely
+  browser-side (WebAssembly codec), so it runs in both the Server and
+  Standalone builds with no extra software. The panel is a chat-style
+  messenger: per-station QSO tabs, a live "Heard" list, a command (CMD)
+  palette, group / @ALLCALL channels, a heartbeat network with auto-reply
+  and relay forwarding, ADIF logging to the shared log, and a shared
+  waterfall. All five submodes are supported — Slow (30 s), Normal (15 s),
+  Fast (10 s), JS8 40 (6 s), JS8 60 (4 s) — aligned with JS8Call 3.0.0
+  labels and HB rules. Powered by a vendored WASM build of
+  JS8Call-improved (KN4CRD).
+
+UI refresh:
+- All mode panels now share one design system: a single set of theme.css
+  design tokens (colors, type scale, spacing) and a .wf-* component kit
+  (buttons, tabs, fields, panels). Each mode keeps its identity through a
+  per-mode accent colour rather than bespoke styling. Panel headers, mode
+  badges, and control geometry are unified across CW, FT8/FT4, JS8, and
+  packet.
+
+Fixes:
+- Standalone can reconnect to a USB Icom after the Server build exits.
+  The server left the rig's scope waveform stream running on shutdown,
+  which buried the Standalone build's CI-V probe and forced a USB replug
+  to recover. The server now silences the scope stream before closing
+  the port. (both builds)
+- Restoring a suspended CW or FT8/FT4 (DIGI) bar now closes any
+  conflicting mode panel first, so the two can't fight over the screen.
+
+
+v0.7.2 (2026-05-08)
+--------------------
+
+Server build:
+- Hamlib rigctld TCP emulation on port 4532 for compatibility with fldigi,
+  WSJT-X, POTACAT, gpredict and other Hamlib clients. Disabled by default;
+  enable with `--rigctld-port 4532` or `RigCtldEnabled=true` in settings.
+  PTT requests route through the same setPTT path the WebSocket clients use,
+  so RADE EOO synthesis, packet TX gating and ALC meter polling stay
+  coherent. Default bind is `127.0.0.1`; pass `--rigctld-bind-all` to listen
+  on all interfaces (the Hamlib protocol is unauthenticated). (#64)
+
+Fixes:
+- CW decoder now stops when leaving CW mode. Previously the worker,
+  AudioWorklet, and audio graph stayed wired up after switching to SSB,
+  so the decoder kept consuming audio and logging detections forever.
+  Applies to both server and standalone builds. (#63)
+- FreeDV Reporter (and PSK Reporter) no longer announce a stale version
+  string after a version bump. The version moved from a `-D` flag in
+  `wfweb.pro` to `include/wfweb_version.h`, which Make's header-dependency
+  tracking actually picks up. Previously, bumping only `wfweb.pro` left
+  `freedvreporter.o` and `pskreporter.o` compiled against the old version
+  while other objects rebuilt — so the splash showed the new number but
+  the reporter advertised the old one. Affected v0.7.1 in the wild. (#65)
+
+
+v0.7.1 (2026-05-03)
+--------------------
+
+Standalone fixes:
+- Packet panel correctly resumes the user's last baud after a page reload.
+  Previously the modem booted at 300 regardless of selection, leaving 1200
+  / 9600 traffic silently undecoded until a baud button was clicked (#60)
+- Transmitted AX.25 frames now appear in the monitor pane, matching the
+  C++ server build (#61)
+- AX.25 packet TX is now DCD-aware so half-duplex collisions are avoided
+  on busy channels (#59)
+- Splash overlay scrolls properly on mobile and points first-time visitors
+  at the server build when the standalone isn't a fit
+
+
+v0.7.0 (2026-05-03)
+--------------------
+
+Standalone build (new):
+- Pure-browser wfweb — no C++ server required. Drives a USB Icom directly
+  over Web Serial; runs as a static SPA with no install
+- Published to https://wfweb.k1fm.us via GitHub Pages on every push, with
+  cache-busted asset URLs
+- Full non-audio CI-V control surface (frequency, mode, VFO, filters,
+  P.AMP/ATT, MON, scope/waterfall, MEM read/write/clear, power cycle)
+- Direct rig audio in/out (RX + SSB voice TX) over Web Serial / Web Audio
+- Per-rig caps generated from `rigs/*.rig` — 25 Icom rigs supported,
+  with effortless auto-detect (baud probe, per-rig USB CI-V clamp)
+- Packet station: Direwolf modem in WASM, AX.25 connected-mode link,
+  APRS heard-stations + beacon scheduler
+- RADE V1 voice mode in the browser (no codec2/FreeDV classic)
+- Virtual-rig mode for hardware-less testing — two tabs at
+  `/?virtual=1&id=N` talk over a same-origin BroadcastChannel
+- Splash redesigned for first-time visitors; pair / click-to-start flow
+- Source-and-docs pill links to release + README
+
+Frontend reorganization:
+- SPA forked into `resources/web/` (server), `resources/web-standalone/`
+  (standalone), and `resources/web-shared/` (both). Each `index.html` is
+  single-purpose; no runtime build gates
+- Local dev server `tools/serve-static.py` (fixed `dist/` on port 8000,
+  `Cache-Control: no-store`); survives a dist rebuild
+- Reporter checkboxes (FreeDV / PSK) disabled in the Standalone UI
+
+Features (server build):
+- Auto-open CW bar and decoder when entering a CW mode
+- "wfweb Standalone" / "wfweb Server" naming across docs and UI
+
+Fixes:
+- Packet: watchdog unkeys PTT when Qt5 IdleState never fires
+- Audio: prefer PulseAudio realm and skip `.monitor` inputs in auto-pick;
+  prefer CODEC over plain USB
+- RADE: generate EOO callsign frame on PTT-off for LAN-attached rigs
+- RADE: clear stale server callsign and show "(set callsign)" indicator
+  pointing at the Station Settings modal
+- Web: push saved callsign to server on transport open and on changes
+- Web: CW bar closes when leaving CW for non-CW-R modes
+- Web: CW and DIGI bars stay inside the 16:9 radio frame
+- Standalone: restart RX audio on reconnect; show TX meters; correct CW
+  WPM scaling for CW transmit; filter slider tracks per-filter bandwidth;
+  P.AMP/ATT cycle reaches PRE2; VFO B populated on first load;
+  CW/FT8/Packet/FreeDV overlays mutually exclusive; FT8 decode no longer
+  references stale ws.readyState; power-cycle wake-up preamble + clean
+  off-overlay + scope re-enable
+- Standalone: push sane gain defaults on first connect (AF 20%, RF 100%,
+  MIC 75%, SQL 0%) so a rig coming up at RF 0% doesn't look like a dead
+  receiver; user adjustments are preserved on subsequent connects
+
+Documentation:
+- README: new section on the Standalone build alongside Server
+- Describe the new `resources/` frontend layout (web / web-standalone /
+  web-shared)
+
+
+v0.6.2 (2026-04-29)
+--------------------
+
+Features:
+- Reporters: add pskreporter.info spotting for FT8/FT4 decodes (#44)
+
+Fixes:
+- APRS: populate Heard Stations on the USB audio path — previously
+  only the LAN audio path wired the parser (#51)
+- APRS: replace blocking confirm() for "Forget all heard stations"
+  with an in-app overlay modal
+- Webserver: track active VFO locally and populate Sub VFO at
+  startup so the UI reflects rig state on first connect (#31)
+- Audio: match --audio-device by substring with a system-default
+  tiebreak; honor the resolved device for browser audio (#43)
+
+CI:
+- Windows: bundle MinGW runtime DLLs needed by libcodec2
+
+
+v0.6.1 (2026-04-28)
+--------------------
+
+Fixes:
+- Web: letterbox packet bar so overlays fully cover it (#39)
+- Windows: clean shutdown on Ctrl-C and console close (#32)
+
+Testing / CI:
+- virtualrig: synthesize 0x27 scope/waterfall frames internally
+- virtualrig: synthesize CW transmission audio internally
+- virtualrig: spread waterfall noise floor across the whole spectrum
+- virtualrig: silent by default — install message handler, demote
+  per-event logs
+- virtualrig: fix macOS build — add missing include/lib paths
+- CI: fix tag detection under sh in containers
+
+Internal:
+- Remove RADE_SUPPORT and FREEDV_SUPPORT preprocessor guards
+
+
+v0.6.0 (2026-04-25)
+--------------------
+
+Packet (AX.25 / APRS / Terminal):
+- Add full packet station: live AX.25 frame monitor, connected-mode QSOs,
+  APRS heard-stations + beacon compose, and YAPP file transfer
+- Vendored Dire Wolf modem subset (300/1200 AFSK, 9600 G3RUH FSK) wired
+  into the web server; runs entirely server-side over the existing mic
+  and RX audio paths
+- Tabbed UI with MONITOR, RX/TX waterfall, and frame-type display
+- Tabbed terminal sessions with auto-select for the sole session, visible
+  connection state, selectable scrollback, and clickable callsigns that
+  populate the peer field
+- Real YAPP framing per IW3FQG spec; transfers show progress + abort and
+  gate completion on peer AF
+- AX.25 link layer: connected-mode address slots, CSMA + per-baud T1,
+  basic digipeating, force-disconnect, and DM on stray polls
+- AX.25 acks surface in the UI (pending TX flips on N(R) advance)
+- paclen scaled by baud; YAPP DT chunks follow
+- Modem state and panel layout persisted across wfweb restarts
+- Shared station callsign reused across CW, FT8/FT4, FreeDV reporter,
+  APRS, and the AX.25 link — set once in the gear dialog
+- TX path unified with mic/FT8 (drops the 300 ms unkey guard); USB tail
+  shaved by ~55 ms after a burst
+- Local TX monitor so the operator hears their own outgoing audio
+- Packet <-> FreeDV mutual exclusion; voice mode required when packet
+  is on
+- Waterfall: FT8-style palette, S0 renders as dark blue, ~60 px/s scroll
+- Fix Ctrl-C shutdown: clean up dwThread and wake the AX.25 dispatcher
+
+Documentation:
+- README: new "AX.25 packet" section with capability table, RX/TX flow,
+  and Direwolf attribution; comparison table and intro updated
+- THIRD_PARTY_LICENSES: add Dire Wolf entry (GPL-2.0-or-later)
+- resources/direwolf/README-vendoring.md: upstream commit + local patches
+
+Testing / CI:
+- New virtual rig simulator: closed-loop test bench with freq/mode-aware
+  channel routing, per-link attenuation matrix, per-mode TX bandwidth
+  filter, per-rig noise floor, and a web control panel on port 5900
+
+Fixes:
+- icomserver: clarify hasTxAudio setting on the config->LAN path; drop a
+  noisy per-packet TX-audio debug log
+
+
+v0.5.2 (2026-04-19)
+--------------------
+
+Features:
+- Add LAN disconnect/reconnect UI with clean shutdown
+- Add Main/Sub VFO awareness for Command29 radios (IC-7610, IC-785x,
+  IC-9700, IC-905)
+- Add touch and pointer event handling for spectrum and waterfall canvases
+- Refactor scope drag handling for improved frequency dragging interaction
+
+Fixes:
+- Fix Power On overlay rendering during powering-on state (#33)
+- Fix LAN reconnect leaving rigCaps unpopulated
+- Fix VFO label/frequency desync on non-cmd29 rigs
+- Fix deadlock from receiveCache routing frequency updates by VFO
+- Fix UI elements not populated after LAN power-up (#19)
+- Fix waterfall flash on drag release and waterfall dragging (#22)
+- Fix CW decoder audio cracking on Windows browsers (#21)
+- Fix Windows build: RADE Opus cmake generator and header patching
+
+Testing / CI:
+- Add integration test suite with mock Icom radio (49 tests covering USB
+  and LAN paths)
+- Run integration tests in all CI builds
+- Per-branch dev builds with branch name in filenames and tags
+- Publish dev-build pre-release on manual workflow runs
+
+Documentation:
+- Add CLAUDE.md and Claude Code commands for AI-assisted development
+
+
+v0.5.1 (2026-04-11)
+--------------------
+
+Features:
+- Add FreeDV Reporter integration (qso.freedv.org Socket.IO client) and
+  RADE EOO callsign encoding/decoding
+- Send continuous SNR updates to FreeDV Reporter while receiving
+- Add monitor (MON) control via CI-V commands
+- Add sidetone to DIGI TUNE and use same gain as regular TX
+- Show percentages instead of raw values on gain sliders
+- Accept hex CI-V addresses on --civ and drop the built-in address table
+
+Fixes:
+- Fix VFO/split commands on cmd29 rigs (IC-7610, IC-785x, IC-9700, IC-905)
+- Fix RADE TX power drift caused by shared ALC-controlled gain
+- Fix setCIVAddr signal/slot type mismatch
+- Send freedvModes independently of rigCaps to fix LAN race
+- Disable FreeDV on non-voice modes and force SSB when enabled
+- Make FreeDV and FT8/DIGI modes mutually exclusive
+- Reject .rig files passed to --settings with a helpful error
+
+Documentation:
+- Reorganize README with a Getting Started section
+- Drop --civ from LAN examples in README and DOCKER docs
+
+
+v0.5.0 (2026-04-05)
+--------------------
+
+FreeDV digital voice:
+- Add FreeDV codec2 support with 700D, 700E, and 1600 modes
+- Add RADE V1 neural voice codec as a FreeDV mode
+- ALC control for FreeDV TX; mode cycling and TX monitor in web UI
+- FreeDV button moved from FUNC menu to MODE overlay
+- Hide FreeDV button when codec2 is not available
+
+Platform support:
+- FreeDV and RADE support on all platforms: Linux (Docker/native), macOS,
+  and Windows
+- Windows: RADE and FreeDV codec2 added to vcpkg build (build.bat)
+- macOS: static-link RADE to eliminate dylib signing issues; ad-hoc
+  codesign binary and dylibs; re-sign after install_name_tool patching
+- Docker: RADE and FreeDV added to Docker build
+
+Fixes:
+- Fix segfault on Ctrl-C exit during FreeDV TX
+- Fix FreeDV TX silence after browser restart
+- Fix ALSA underruns after client disconnect during RADE/FreeDV TX
+- Scale RADE TX output to match codec2 FreeDV ALC levels
+- Fix RADE UI issues: stats display, logging, shutdown, and default mode
+- Fix codec2 CI build: clone outside MSYS2 shell
+- Fix macOS Gatekeeper block
+
+Packaging:
+- Add third-party license file (THIRD_PARTY_LICENSES) bundled in all
+  packages
+- Add .dockerignore to exclude host build artifacts
+
+Documentation:
+- Document macOS FreeDV and RADE build prerequisites
+- Update README with FreeDV/RADE features, credits, and licenses
+
+
+v0.4.2 (2026-03-29)
+--------------------
+
+Packaging:
+- Add native .deb builds for Debian 12 (Bookworm) and Debian 13 (Trixie),
+  fixing installation on Raspberry Pi OS Trixie (librtaudio7) (#15)
+- .deb filenames now include the target distro: ubuntu2404, debian12, debian13
+- Switch macOS artifact from tarball to zip
+
+Documentation:
+- Add git submodule init instructions to BUILDING.md (#15)
+- Document .deb package variants and which distro each targets in README
+- Add IC-7300 USB Docker quick-start example to README
+
+
+v0.4.1 (2026-03-28)
+--------------------
+
+Features:
+- Add memory channel browser: scan, write, recall, and clear radio memories
+- MEM button in FUNC panel opens memory browser overlay
+- REST API endpoint for memory recall (POST /api/v1/radio/memories/{ch}/recall)
+
+Fixes:
+- Fix filter resetting to FIL1 on every mode change from web UI
+- Fix split status detection (QVariant type mismatch caused silent failures)
+
+Notes:
+- Memory recall sets VFO frequency and mode only; the radio stays in VFO mode.
+  Full MEM mode is not supported because the Icom CI-V protocol has no
+  read-only query for memory state, and the IC-7300 does not send unsolicited
+  notifications when memory channels change from the front panel.
+
+
+v0.4.0 (2026-03-26)
+--------------------
+
+Features:
+- Add radio power on/off control via web UI
+- Add combined P.AMP/ATT button and spectrum indicator
+- Detect hardware power-off via consecutive FA errors
+
+Fixes:
+- Fix BW bar not updating when filter is changed
+
+
+v0.3.6 (2026-03-24)
+--------------------
+
+Fixes:
+- Fix radio menus closing by using .rig file periodic commands instead of
+  hardcoded aggressive CI-V polling that saturated the bus
+- Keep Power/SWR/ALC meter polling at priorityHighest for responsive meters
+
+Enhancements:
+- Shift waterfall history on frequency change to maintain signal alignment;
+  band jumps clear the waterfall
+
+
+v0.3.5 (2026-03-22)
+--------------------
+
+Build:
+- Add macOS (Apple Silicon) build to CI and release pipeline
+- Add macOS build instructions to BUILDING.md
+- Enable C++17 for Eigen compatibility on macOS
+- Bump GitHub Actions to Node.js 24 compatible versions
+
+Fixes:
+- Fix macOS TLS proxy truncating large responses and blocking WebSocket
+
+Docs:
+- Reorganize README: lead with screenshots and quick-start paths, highlight
+  Docker for IC-7300 Mk2 Ethernet users, link to BUILDING.md for build
+  instructions
+- Update screenshots
+
+
+v0.3.4 (2026-03-21)
+--------------------
+
+DIGI:
+- Smooth ALC control: replace bang-bang controller with proportional control
+  using EMA smoothing, dead zone, and asymmetric gain adjustment to eliminate
+  TX power fluctuations
+- Start at 25% gain instead of 100% to avoid overdriving the rig on first TX
+
+CLI:
+- Add --audio-device list option to enumerate available audio devices
+
+Bug fixes:
+- Fix auto-detection of USB Audio CODEC for rig server mode
+
+Docs:
+- Fix docs: rename wfview to wfweb in DOCKER.md, fix anchor link, add
+  clearconfig flag in README
+
+
+v0.3.3 (2026-03-21)
+--------------------
+
+Docker & rig server:
+- Docker support: multi-arch builds, comprehensive DOCKER.md documentation
+- Web and rig servers are now mutually exclusive: --no-web disables the web
+  interface and enables the Icom UDP rig server for LAN clients
+- Add --serial-port and --audio-system CLI flags for Docker USB access
+- Add --audio-device CLI flag to override audio device selection
+- Fix default audio device selection: "default" now correctly uses the
+  system default device (PipeWire/PulseAudio) instead of picking an output
+  monitor as input, which caused silent audio in rig server mode
+- Suppress rx latency status messages from headless console output
+- Upgrade Docker runtime base to Ubuntu 25.10
+
+
+v0.3.2 (2026-03-20)
+--------------------
+
+LAN/UDP support:
+- LAN/UDP connection support in headless mode (servermain): connect to a
+  remote rig over the network without the GUI
+- CLI overrides for full LAN configuration without a .ini file: --lan,
+  --lan-control, --lan-serial, --lan-audio, --lan-user, --lan-pass,
+  --civ, --manufacturer
+- --no-server / -S flag to disable the built-in rig server when
+  connecting to a remote rig that already runs one
+- Audio streaming works over LAN with proper codec/sample rate config
+  and 150ms latency defaults for remote buffering
+
+CLI:
+- --port / -p flag to override the web server port from the command line
+- Fix --help and --version hanging (defer keyboard thread start)
+
+
+v0.3.1 (2026-03-19)
+--------------------
+
+DIGI panel:
+- Smooth ALC control to eliminate TX power fluctuations during FT8/FT4
+
+Infrastructure:
+- Include Windows build in release pipeline
+
+
+v0.3.0 (2026-03-16)
+--------------------
+
+Windows:
+- Windows build support via vcpkg (opus, portaudio, hidapi, openssl,
+  eigen3, qcustomplot); build.bat script for local builds
+- SSL certificate generation via OpenSSL C API on Windows (no openssl
+  CLI dependency)
+- USB audio capture on Windows with poll timer and COM initialization
+- GitHub Actions CI: Windows build job with vcpkg caching and ZIP
+  artifact upload
+- BUILDING-WINDOWS.md build instructions
+
+Fixes:
+- Fix intermittent slow S-meter and delayed frequency changes: a signal
+  delivery race between rigServer and servermain meant the polling setup
+  block was sometimes skipped entirely on startup (no auto-information,
+  no recurring polls, no queue interval recalculation); fix by setting
+  rigAvailable immediately on entry to prevent the race
+- Fix queue flooding from stale-cache re-requests: remove SWR
+  always-re-request special case in getCache() and use addUnique()
+  instead of add() to prevent duplicate immediate commands piling up
+
+
+v0.2.6 (2026-03-16)
+--------------------
+
+Fixes:
+- Fix slow S-meter updates in wfweb: the queue had too many meters at
+  priorityHighest (5 items vs 1 in the GUI), starving S-meter polls;
+  move ALC meter to priorityHigh to reduce contention
+
+
+v0.2.5 (2026-03-16)
+--------------------
+
+Infrastructure:
+- Rename headless binary from wfserver to wfweb; project file renamed
+  from wfserver.pro to wfweb.pro
+- Rename systemd/wfserver.service to systemd/wfweb.service; update
+  ExecStart path and description
+- Update systemd/wfweb@.service ExecStart from wfview to wfweb
+- Update GitHub Actions workflow to build wfweb.pro
+- Remove wfview.pro (GUI build); wfweb.pro is now the sole build target
+- Update README to reflect the new binary name
+
+
+v0.2.4 (2026-03-13)
+--------------------
+
+DIGI panel (FT8/FT4):
+- Waterfall scroll speed reduced 4x for better readability
+- Horizontal separator lines drawn at time slot boundaries
+- TX/RX markers now show full signal bandwidth as semi-transparent bands
+  instead of thin 3px lines; TX band turns red when armed
+- Callsign labels moved to top of waterfall (below TX/RX indicators) and
+  persist for 5 time slots; cleared on band change
+- Fix callsign label frequency offset (~15 Hz) — labels now centered on
+  the actual signal position
+- ALC meter and auto-gain control for FT8/FT4 TX: gain is reduced
+  automatically when ALC exceeds threshold
+- Local TX monitor volume reduced to avoid clipping
+- DIGI panel stays open during rig-initiated mode changes
+- Removed separate DIGI Log button (use shared QSO Log instead)
+
+Web UI:
+- Shared QSO log panel for CW, SSB, and FT8/FT4 with editable fields
+- Filter settings panel with bandwidth, PBT, and filter shape controls
+- MIC GAIN slider added to the GAIN panel
+- Fix duplicate CW progress bar when re-clicking a memory button
+- Fix DIGI panel visibility on mode change and panel restore
+- Fix blank entry appearing on QSO log edit
+
+
+v0.2.3 (2026-03-08)
+--------------------
+
+REST API:
+- New plain-HTTP REST API at /api/v1/radio/* for scripting, automation, and
+  microcontroller integration (ESP32, Pico W, Arduino — no TLS required)
+- In SSL mode a second HTTP listener binds the WebSocket port so curl/scripts
+  can reach the API without a TLS stack
+- Endpoints: frequency, mode, VFO (select/swap/equalize), PTT, meters (S/SWR/power),
+  gains (AF/RF/power/squelch), RX DSP (preamp, NB, NR, AGC, auto-notch, filter
+  width), TX settings (split, tuner, compressor, monitor), CW send/stop
+- Full combined status via GET /api/v1/radio; CORS headers on all responses
+- Fix: buffer incoming data per-socket so requests fragmented across TCP
+  segments are fully reassembled before parsing
+
+DIGI panel (FT8/FT4):
+- Auto-tune to standard FT8/FT4 calling frequency when the DIGI panel is
+  opened, matched by nearest VFO within 500 kHz
+- Block self-QSO clicks: clicking a decode row transmitted by MY CALL is
+  now a no-op
+
+Audio:
+- Fix mic audio loss after FT8 TX: FT8 completion no longer tears down the
+  USB audio path when the user mic is active; mic frames are suppressed
+  during TX without closing the AudioWorklet session
+- Remove over-aggressive ALSA IdleState watchdog that dropped mic frames
+  after any buffer underrun; ALSA's own snd_pcm_recover handles transients
+- MIC OFF overlay is now a persistent MIC ON/OFF toggle button
+
+Documentation:
+- REST_API.md: full endpoint reference with curl examples, response schemas,
+  port table, and shell scripting recipes
+
+
+v0.2.2 (2026-03-03)
+--------------------
+
+DIGI panel (FT8/FT4):
+- Fix TX double-fire regression: user-initiated TX uses a 13 s slot window
+  while auto re-arm reverts to 4.5 s, preventing the same slot firing twice
+- Fix TX waterfall splatter and add local TX audio monitor
+- Fix auto-QSO cycle, TX slot-window logic, and QSO logging state machine
+
+Audio:
+- Fix ALSA underruns during FT8 TX (USB audio path): server-side pre-buffer
+  accumulates PCM chunks until the ALSA buffer is full before starting
+  playback; IdleState watchdog stops the device cleanly when the buffer
+  drains at end of TX, eliminating snd_pcm_recover underruns
+
+Infrastructure:
+- ft8ts submodule updated to v0.0.12; upstream ships the pack28 fix
+  (short callsigns like K1FM no longer corrupted); local vendored patch removed
+- CI: overwrite release assets on re-tag
+
+
+v0.2.1 (2026-03-02)
+--------------------
+
+Infrastructure:
+- ft8ts: vendor patched dist locally pending upstream fix for issue #1
+  (pack28 bug corrupting 4-character callsigns like K1FM)
+- README: FT8 screenshot, vertical mobile screenshots, CW/FT8 feature rows
+
+
+v0.2.0 (2026-03-01)
+--------------------
+
+DIGI panel (FT8/FT4):
+- Fix marker/signal alignment: markers now point to the visual centre of the
+  tone span rather than tone 0, correcting a ~12 Hz low bias
+- TX waterfall loopback: the transmitted signal is now visible in the DIGI
+  waterfall during TX (locally generated samples fed into the FFT pipeline)
+- QSO logged indicator: a green confirmation row is appended to the Directed
+  panel whenever a QSO is logged (manually or automatically)
+- Version string: console log now shows "WFWEB" with the server version
+  received at connect time; hardcoded date/version string removed
+- Waterfall frequency range: display now spans 300-2800 Hz (was 0-3000 Hz),
+  with matching scale labels, input bounds, FFT bin mapping, and click handler
+- Layout: Directed and QSO Messages columns merged into a single right column
+- Mobile: long-press (500 ms) on a decode row triggers the same action as
+  double-click on desktop; haptic feedback via navigator.vibrate(40)
+- CQ calling controls added; double-click arm supported in QSO Messages panel
+- Decoded frames sorted by decreasing SNR within each slot
+- Web Worker used for FT8/FT4 decode to keep the UI thread responsive
+- Waterfall frequency labels; TX/RX UX and QSO state machine fixes
+- RX frequency control; smarter row-click handling; auto-desist on busy DX
+- Panel rationalization; FT8/USB-only enforcement; deferred TX re-arm fix
+- Mobile UI tweaks: no waterfall callsigns on small screens, stacked CQ
+  buttons, message-only decode rows
+
+Web UI:
+- Panel rationalization and layout cleanup
+
+
+v0.1.1 (2026-02-22)
+--------------------
+
+Packaging and stability:
+- Audio error banner with actionable message shown on connection failure
+- Dynamic splash screen shows the actual version string at runtime
+- Fix USB audio device discovery in headless/ALSA mode
+- Bake IC-7300 defaults into the binary so the app works out of the box
+  without a config file (Manufacturer=0, RigCIVuInt=148, SerialPortRadio=auto,
+  SerialPortBaud=115200)
+- Trim audio error message to remove misleading suggestion
+- .deb package: fix missing librtaudio6 dependency; add postinst script for
+  systemd daemon-reload; fix YAML syntax in CI workflow
+- systemd template unit file added; audio config docs clarified
+- GitHub Actions CI: Linux x86_64 and ARM64 builds with .deb artifact upload
+
+
+v0.1.0 (2026-02-21)
+--------------------
+
+Initial wfweb release, forked from wfview upstream (master, April 2023).
+
+Web interface:
+- Built-in HTTP/WebSocket server (HTTPS, self-signed certificate generated by
+  openssl on first launch); default port 8080
+- Browser-based radio control: frequency (dual VFO), mode, PTT, RF/AF/SQL gain
+- Real-time S-meter, SWR, and power meter display
+- RX audio streaming: server decodes rig codec to PCM Int16 LE, delivered as
+  binary WebSocket frames; browser AudioWorklet with ring buffer and pre-buffer
+- TX audio streaming: browser microphone via getUserMedia() to AudioWorklet to
+  Int16 PCM to WebSocket to USB audio output or LAN TX path
+- Mobile-responsive UI
+- Headless operation: run without a display using QT_QPA_PLATFORM=offscreen
+
+CW:
+- CW transmission interface with macro buttons
+- Toggle-behaviour keying; mobile gesture support; TX audio tail fix
+- CW decoder using ggmorse (Goertzel algorithm); replaces earlier deep-learning
+  attempt; decoder waterfall display; frequency alignment fix
+- Mobile-responsive DECODE button and callsign detection
+
+FT8/FT4 DIGI panel (initial):
+- UTC-aligned 15 s / 7.5 s RX slot windows
+- 4x decimation to 12 kHz; decoded with ft8ts ES module (WebAssembly)
+- Band selector with standard calling frequencies (160 m - 6 m)
+- All / Directed decode panels; Enable TX / Halt TX / Log QSO / Erase buttons
+- Settings modal for MY CALL / MY GRID
+- pack28 bug in ft8ts.mjs patched: 4-character callsigns were corrupted
+
+Infrastructure:
+- Rebranded to wfweb; headless operation documented
+- ggmorse LICENSE file added
+- openssl documented as a runtime dependency
+- README: HTTPS/self-signed certificate noted; screenshots added
+- Regulatory disclaimer added

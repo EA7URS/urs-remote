@@ -1,0 +1,442 @@
+#include "controlserver.h"
+#include "channelmixer.h"
+#include "rigslot.h"
+
+#include <QDebug>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTcpServer>
+#include <QTcpSocket>
+
+namespace {
+// Single-page UI embedded in the binary — no external assets so the bench
+// stays self-contained. Polls /api/state every 500 ms, POSTs to /api/set
+// on edit. Kept tight on purpose: one file, no framework.
+// Bumped on every rebuild so the browser's displayed build stamp makes it
+// obvious which binary is answering. __DATE__/__TIME__ expand at compile
+// time; there's no need to persist them elsewhere.
+const char* kBuildStamp = __DATE__ " " __TIME__;
+
+const char* kIndexHtml = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Virtual Rig Bench</title>
+<style>
+body { font: 13px/1.4 system-ui, sans-serif; margin: 20px; max-width: 1100px; color: #222; }
+h1 { font-size: 18px; margin: 0 0 8px; }
+h2 { font-size: 14px; margin: 24px 0 8px; color: #555; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid #eee; text-align: left; }
+th { font-weight: 600; color: #555; background: #fafafa; }
+.ptt-on  { color: #c00; font-weight: bold; }
+.ptt-off { color: #999; }
+input[type=number] { width: 72px; padding: 2px 4px; font: inherit; }
+select { font: inherit; padding: 2px 6px; }
+td.src { font-weight: 600; background: #fafafa; }
+.band-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; background: #eef; color: #336; font-size: 11px; }
+.kind-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; vertical-align: middle; }
+.kind-internal { background: #efe; color: #363; }
+.kind-external { background: #fee; color: #933; }
+.ext-info { font-family: ui-monospace, monospace; font-size: 11px; color: #555; }
+.ext-info code { background: #f5f5f5; padding: 0 4px; border-radius: 3px; }
+.controls { margin: 12px 0; }
+.hint { color: #888; font-size: 12px; }
+.grid td { text-align: center; }
+</style>
+</head>
+<body>
+<h1>Virtual Rig Bench</h1>
+<p class="hint">Per-link attenuation is keyed on the <em>source</em> rig's band — when rig A transmits on 20 m, the mixer looks up the 20 m column of A's row.</p>
+
+<h2>Rigs</h2>
+<table id="rigs">
+<thead><tr><th>#</th><th>Name</th><th>Freq</th><th>Band</th><th>Mode</th><th>PTT</th><th>Noise RMS</th></tr></thead>
+<tbody></tbody>
+</table>
+
+<h2>Path attenuation (dB) — symmetric</h2>
+<div class="controls">
+  Band: <select id="bandSel"></select>
+  <span class="hint">&nbsp;one cell per rig pair. A ↔ B uses the same value whichever side transmits.</span>
+</div>
+<table id="atten"><thead><tr><th>Pair</th><th>Attenuation (dB)</th></tr></thead><tbody></tbody></table>
+<p class="hint" id="buildStamp"></p>
+
+<script>
+const MODE_NAMES = {
+  0x00:"LSB", 0x01:"USB", 0x02:"AM", 0x03:"CW", 0x04:"RTTY",
+  0x05:"FM",  0x07:"CW-R", 0x08:"RTTY-R", 0x17:"DV"
+};
+const BANDS = ["160m","80m","60m","40m","30m","20m","17m","15m","12m","10m","6m","2m","70cm","other"];
+
+function fmtHz(hz) {
+  if (hz >= 1000000) return (hz/1000000).toFixed(3) + " MHz";
+  if (hz >= 1000)    return (hz/1000).toFixed(3)    + " kHz";
+  return hz + " Hz";
+}
+function gainToDb(g) {
+  if (g <= 1e-6) return -120;
+  return 20 * Math.log10(g);
+}
+function dbToGain(db) { return Math.pow(10, db/20); }
+
+let state = null;
+let lastRigCount = -1;
+let lastAttenKey = "";       // band + rigCount — rebuild pair table when either changes
+
+async function fetchState() {
+  const r = await fetch("/api/state");
+  state = await r.json();
+  render();
+}
+
+async function postSet(obj) {
+  await fetch("/api/set", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(obj)
+  });
+  // Do not refetch synchronously — the poll loop will pick it up. Refetching
+  // here causes an extra render() which can interrupt the user mid-keystroke.
+}
+
+// Build the rigs table once; on each poll just update the text cells and
+// any input whose <input> isn't currently focused. Rebuilding innerHTML
+// would blow away the input the user is typing into, making them unable
+// to type more than a single character before the next 500 ms poll fires.
+function ensureRigsTable() {
+  if (lastRigCount === state.rigs.length) return;
+  lastRigCount = state.rigs.length;
+  const tbody = document.querySelector("#rigs tbody");
+  tbody.innerHTML = state.rigs.map(r => {
+    const kindPill = r.kind === "external"
+      ? `<span class="kind-pill kind-external">external</span>`
+      : `<span class="kind-pill kind-internal">internal</span>`;
+    const extRow = r.kind === "external" ? `
+      <tr class="ext-info">
+        <td></td>
+        <td colspan="6">
+          CAT  → <code>Hamlib NET rigctl</code> on
+          <code>127.0.0.1:${r.rigctldPort}</code><br>
+          Output → <code>${r.paOutputSink}</code>
+          &nbsp;&nbsp;Input → <code>${r.paInputSource}</code>
+        </td>
+      </tr>` : "";
+    return `
+    <tr data-rig="${r.idx}">
+      <td>${r.idx}</td>
+      <td>${r.name}${kindPill}</td>
+      <td data-cell="freq"></td>
+      <td data-cell="band"></td>
+      <td data-cell="mode"></td>
+      <td data-cell="ptt"></td>
+      <td><input type="number" data-kind="noise" data-rig="${r.idx}" min="0" max="1000" step="1"></td>
+    </tr>${extRow}`;
+  }).join("");
+}
+
+function updateRigsTable() {
+  ensureRigsTable();
+  for (const r of state.rigs) {
+    const tr = document.querySelector(`tr[data-rig="${r.idx}"]`);
+    if (!tr) continue;
+    tr.querySelector('[data-cell="freq"]').textContent = fmtHz(r.freq);
+    tr.querySelector('[data-cell="band"]').innerHTML = `<span class="band-pill">${r.band}</span>`;
+    tr.querySelector('[data-cell="mode"]').textContent = MODE_NAMES[r.mode] || "0x"+r.mode.toString(16);
+    const pttCell = tr.querySelector('[data-cell="ptt"]');
+    pttCell.textContent = r.ptt ? "TX" : "—";
+    pttCell.className = r.ptt ? "ptt-on" : "ptt-off";
+    const inp = tr.querySelector('input[data-kind="noise"]');
+    if (inp && document.activeElement !== inp) inp.value = r.noiseRms;
+  }
+}
+
+function ensureAttenTable() {
+  const band = document.getElementById("bandSel").value;
+  const key = band + "/" + state.rigs.length;
+  if (key === lastAttenKey) return;
+  lastAttenKey = key;
+
+  const body = document.querySelector("#atten tbody");
+  const n = state.rigs.length;
+  let rows = "";
+  for (let i = 0; i < n; ++i) {
+    for (let j = i + 1; j < n; ++j) {
+      rows += `<tr data-pair="${i}-${j}">
+        <td><span class="src">#${i}</span> ↔ <span class="src">#${j}</span>
+            <span class="hint">&nbsp;${state.rigs[i].name} ↔ ${state.rigs[j].name}</span></td>
+        <td><input type="number" data-kind="atten" data-src="${i}" data-dst="${j}" data-band="${band}" min="-120" max="20" step="1"></td>
+      </tr>`;
+    }
+  }
+  if (!rows) rows = `<tr><td colspan="2" class="hint">need at least two rigs</td></tr>`;
+  body.innerHTML = rows;
+}
+
+function updateAttenTable() {
+  ensureAttenTable();
+  const band = document.getElementById("bandSel").value;
+  const n = state.rigs.length;
+  for (let i = 0; i < n; ++i) {
+    for (let j = i + 1; j < n; ++j) {
+      const inp = document.querySelector(`tr[data-pair="${i}-${j}"] input[data-kind="atten"]`);
+      if (!inp) continue;
+      inp.dataset.band = band;
+      if (document.activeElement !== inp) {
+        inp.value = gainToDb(state.atten[band][i][j]).toFixed(1);
+      }
+    }
+  }
+}
+
+function renderBandSelector() {
+  const sel = document.getElementById("bandSel");
+  if (sel.options.length) return;  // populate once; user's choice wins
+  sel.innerHTML = BANDS.map(b => `<option value="${b}">${b}</option>`).join("");
+  if (state && state.rigs.length) sel.value = state.rigs[0].band;
+}
+
+function render() {
+  renderBandSelector();
+  updateRigsTable();
+  updateAttenTable();
+  document.getElementById("buildStamp").textContent = "virtualrig build: " + (state.build || "unknown");
+}
+
+document.addEventListener("change", e => {
+  const el = e.target;
+  if (!el.matches("input[data-kind]")) return;
+  const v = parseFloat(el.value);
+  if (!Number.isFinite(v)) return;
+  if (el.dataset.kind === "noise") {
+    postSet({type:"noise", rig: parseInt(el.dataset.rig), rms: v});
+  } else if (el.dataset.kind === "atten") {
+    postSet({type:"atten",
+             src: parseInt(el.dataset.src),
+             dst: parseInt(el.dataset.dst),
+             band: el.dataset.band,
+             gain: dbToGain(v)});
+  }
+});
+document.getElementById("bandSel").addEventListener("change", () => {
+  if (state) { lastAttenKey = ""; updateAttenTable(); }
+});
+
+fetchState();
+setInterval(fetchState, 500);
+</script>
+</body>
+</html>
+)HTML";
+} // namespace
+
+controlServer::controlServer(channelMixer* mixer, QObject* parent)
+    : QObject(parent), mixer(mixer)
+{
+}
+
+controlServer::~controlServer()
+{
+    // QTcpServer + socket children are parented; Qt cleans them up.
+}
+
+bool controlServer::listen(quint16 port)
+{
+    server = new QTcpServer(this);
+    connect(server, &QTcpServer::newConnection, this, &controlServer::onNewConnection);
+    if (!server->listen(QHostAddress::Any, port)) {
+        qWarning() << "controlServer: listen on" << port << "failed:" << server->errorString();
+        return false;
+    }
+    qInfo() << "controlServer: listening on http://127.0.0.1:" << port;
+    return true;
+}
+
+void controlServer::onNewConnection()
+{
+    while (QTcpSocket* s = server->nextPendingConnection()) {
+        connect(s, &QTcpSocket::readyRead,    this, &controlServer::onReadyRead);
+        connect(s, &QTcpSocket::disconnected, this, &controlServer::onDisconnected);
+        buffers.insert(s, QByteArray());
+    }
+}
+
+void controlServer::onDisconnected()
+{
+    auto* s = qobject_cast<QTcpSocket*>(sender());
+    if (!s) return;
+    buffers.remove(s);
+    s->deleteLater();
+}
+
+void controlServer::onReadyRead()
+{
+    auto* s = qobject_cast<QTcpSocket*>(sender());
+    if (!s) return;
+    buffers[s].append(s->readAll());
+    QByteArray& buf = buffers[s];
+
+    // Wait for end-of-headers. Small request bodies (JSON) fit in one read,
+    // but do a content-length check just in case.
+    int hdrEnd = buf.indexOf("\r\n\r\n");
+    if (hdrEnd < 0) return;
+
+    int contentLen = 0;
+    int clPos = buf.indexOf("Content-Length:");
+    if (clPos < 0) clPos = buf.indexOf("content-length:");
+    if (clPos >= 0 && clPos < hdrEnd) {
+        int lineEnd = buf.indexOf("\r\n", clPos);
+        QByteArray val = buf.mid(clPos + 15, lineEnd - clPos - 15).trimmed();
+        contentLen = val.toInt();
+    }
+    if (buf.size() < hdrEnd + 4 + contentLen) return;
+
+    // Parse request line.
+    int firstLineEnd = buf.indexOf("\r\n");
+    QByteArray reqLine = buf.left(firstLineEnd);
+    QList<QByteArray> parts = reqLine.split(' ');
+    if (parts.size() < 2) { s->disconnectFromHost(); return; }
+    QByteArray method = parts[0];
+    QByteArray path = parts[1];
+    QByteArray body = buf.mid(hdrEnd + 4, contentLen);
+    buf.remove(0, hdrEnd + 4 + contentLen);
+
+    handleRequest(s, method, path, body);
+}
+
+void controlServer::handleRequest(QTcpSocket* s, const QByteArray& method,
+                                  const QByteArray& path, const QByteArray& body)
+{
+    if (method == "GET" && (path == "/" || path == "/index.html")) {
+        sendResponse(s, 200, "text/html; charset=utf-8", kIndexHtml);
+        return;
+    }
+    if (method == "GET" && path == "/api/state") {
+        sendResponse(s, 200, "application/json", renderStateJson());
+        return;
+    }
+    if (method == "POST" && path == "/api/set") {
+        QByteArray err = applySetJson(body);
+        if (err.isEmpty()) sendResponse(s, 200, "application/json", "{\"ok\":true}");
+        else               sendResponse(s, 400, "application/json",
+                                        "{\"ok\":false,\"error\":\"" + err + "\"}");
+        return;
+    }
+    sendResponse(s, 404, "text/plain", "not found\n");
+}
+
+void controlServer::sendResponse(QTcpSocket* s, int status,
+                                 const QByteArray& contentType, const QByteArray& body)
+{
+    const char* reason = "OK";
+    if (status == 400) reason = "Bad Request";
+    if (status == 404) reason = "Not Found";
+    QByteArray resp;
+    resp += "HTTP/1.1 " + QByteArray::number(status) + " " + reason + "\r\n";
+    resp += "Content-Type: " + contentType + "\r\n";
+    resp += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    // The UI evolves across rebuilds; don't let the browser hold onto a
+    // stale copy after a restart. Belt + suspenders for older browsers.
+    resp += "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n";
+    resp += "Pragma: no-cache\r\n";
+    resp += "Expires: 0\r\n";
+    resp += "Connection: close\r\n\r\n";
+    resp += body;
+    s->write(resp);
+    s->flush();
+    s->disconnectFromHost();
+}
+
+QByteArray controlServer::renderStateJson() const
+{
+    QJsonObject root;
+
+    QJsonArray rigs;
+    for (int i = 0; i < mixer->rigCount(); ++i) {
+        RigSlot* r = mixer->rigAt(i);
+        QJsonObject o;
+        o["idx"] = i;
+        if (r) {
+            o["name"] = r->name();
+            o["freq"] = (qint64)r->freq();
+            o["mode"] = (int)r->mode();
+            o["band"] = channelMixer::bandName(channelMixer::bandForFreq(r->freq()));
+            o["ptt"] = r->isTransmitting();
+            o["kind"] = (r->kind() == RigSlot::External) ? "external" : "internal";
+            if (r->kind() == RigSlot::External) {
+                o["rigctldPort"]   = r->rigctldPort();
+                o["paOutputSink"]  = r->paOutputSink();
+                o["paInputSource"] = r->paInputSource();
+            }
+        } else {
+            o["name"] = "—";
+            o["freq"] = 0;
+            o["mode"] = 0;
+            o["band"] = "other";
+            o["ptt"] = false;
+            o["kind"] = "internal";
+        }
+        o["noiseRms"] = mixer->noiseLevel(i);
+        rigs.append(o);
+    }
+    root["rigs"] = rigs;
+    root["channelRouting"] = mixer->channelRoutingEnabled();
+    root["build"] = kBuildStamp;
+
+    QJsonObject atten;
+    for (int b = 0; b < channelMixer::BandCount; ++b) {
+        auto band = (channelMixer::Band)b;
+        QJsonArray matrix;
+        for (int i = 0; i < mixer->rigCount(); ++i) {
+            QJsonArray row;
+            for (int j = 0; j < mixer->rigCount(); ++j) {
+                if (i == j) row.append(QJsonValue());  // null
+                else        row.append(mixer->linkAttenuation(i, j, band));
+            }
+            matrix.append(row);
+        }
+        atten[channelMixer::bandName(band)] = matrix;
+    }
+    root["atten"] = atten;
+
+    return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
+
+QByteArray controlServer::applySetJson(const QByteArray& body)
+{
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(body, &err);
+    if (err.error != QJsonParseError::NoError) return "invalid json";
+    if (!doc.isObject()) return "expected object";
+    QJsonObject o = doc.object();
+    QString type = o.value("type").toString();
+
+    if (type == "noise") {
+        int rig = o.value("rig").toInt(-1);
+        double rms = o.value("rms").toDouble(-1);
+        if (rig < 0 || rms < 0) return "bad noise params";
+        if (rms > 1000) rms = 1000;
+        mixer->setNoiseLevel(rig, (float)rms);
+        return QByteArray();
+    }
+    if (type == "atten") {
+        int src = o.value("src").toInt(-1);
+        int dst = o.value("dst").toInt(-1);
+        QString bandStr = o.value("band").toString();
+        double gain = o.value("gain").toDouble(-1);
+        if (src < 0 || dst < 0 || gain < 0) return "bad atten params";
+        // Map band name → enum.
+        channelMixer::Band band = channelMixer::BandOther;
+        for (int b = 0; b < channelMixer::BandCount; ++b) {
+            if (channelMixer::bandName((channelMixer::Band)b) == bandStr) {
+                band = (channelMixer::Band)b;
+                break;
+            }
+        }
+        mixer->setLinkAttenuation(src, dst, band, (float)gain);
+        return QByteArray();
+    }
+    return "unknown type";
+}

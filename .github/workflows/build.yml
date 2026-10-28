@@ -1,0 +1,874 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # One build id for the whole run. A release build (v* tag) is the bare
+  # version from include/wfweb_version.h; a dev build appends
+  # +dev.<UTC date>.<short sha>, which Debian sorts above the release it was
+  # cut from and below the next one, so apt installs each dev build over the
+  # previous and the next release still replaces it. Computed once so the
+  # .deb Version, every file name and the release page agree even when the
+  # run straddles midnight UTC.
+  meta:
+    name: Build id
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.id.outputs.version }}
+      pkg_version: ${{ steps.id.outputs.pkg_version }}
+      dev_id: ${{ steps.id.outputs.dev_id }}
+      sha_short: ${{ steps.id.outputs.sha_short }}
+      date: ${{ steps.id.outputs.date }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute build id
+        id: id
+        run: |
+          VERSION=$(grep '#define WFWEB_VERSION' include/wfweb_version.h | grep -oP '[\d.]+')
+          SHA_SHORT=$(git rev-parse --short HEAD)   # same width as wfweb --version prints
+          DATE=$(date -u +%Y-%m-%d)
+          case "${{ github.ref }}" in
+            refs/tags/v*) DEV_ID="" ;;
+            *) DEV_ID="dev.${DATE//-/}.${SHA_SHORT}" ;;
+          esac
+          {
+            echo "version=${VERSION}"
+            echo "sha_short=${SHA_SHORT}"
+            echo "date=${DATE}"
+            echo "dev_id=${DEV_ID}"
+            echo "pkg_version=${VERSION}${DEV_ID:++${DEV_ID}}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION}${DEV_ID:++${DEV_ID}}"
+
+  build-linux-ubuntu2404:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+            deb_arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            deb_arch: arm64
+
+    name: Ubuntu 24.04 (${{ matrix.deb_arch }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qtmultimedia5-dev libqt5websockets5-dev \
+            libopus-dev libeigen3-dev \
+            portaudio19-dev librtaudio-dev \
+            libhidapi-dev libudev-dev libpulse-dev \
+            libcodec2-dev \
+            cmake autoconf automake libtool curl \
+            openssl dpkg-dev
+
+      - name: Build RADE
+        run: |
+          cd resources/radae_nopy
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Build
+        run: |
+          qmake wfweb.pro
+          make -j$(nproc)
+
+      - name: Install rig definitions
+        run: |
+          sudo mkdir -p /usr/local/share/wfview/rigs
+          sudo cp rigs/*.rig /usr/local/share/wfview/rigs/
+
+      - name: Run tests
+        run: |
+          sudo apt-get install -y python3-pytest python3-requests
+          python3 -m pytest tests/ -v
+
+      - name: Build .deb
+        run: |
+          VERSION=${{ needs.meta.outputs.pkg_version }}
+          DEB_ROOT=$(pwd)/deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}
+
+          sudo make install INSTALL_ROOT=${DEB_ROOT}
+          sudo chown -R $(id -u):$(id -g) $(pwd)/deb-build
+
+          # Bundle librade.so (not packaged by distros yet)
+          mkdir -p ${DEB_ROOT}/usr/lib
+          cp resources/radae_nopy/build/src/librade.so* ${DEB_ROOT}/usr/lib/
+
+          # Install license files
+          mkdir -p ${DEB_ROOT}/usr/share/doc/wfweb
+          cp LICENSE THIRD_PARTY_LICENSES ${DEB_ROOT}/usr/share/doc/wfweb/
+
+          mkdir -p ${DEB_ROOT}/DEBIAN
+
+          cat > ${DEB_ROOT}/DEBIAN/control << EOF
+          Package: wfweb
+          Version: ${VERSION}
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: Alain De Carolis <adecarolis@users.noreply.github.com>
+          Depends: openssl, libqt5core5t64, libqt5gui5t64,
+           libqt5network5t64, libqt5serialport5, libqt5multimedia5,
+           libqt5multimedia5-plugins,
+           libqt5websockets5,
+           libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
+           libudev1, librtaudio6, libcodec2-1.2
+          Section: hamradio
+          Priority: optional
+          Homepage: https://github.com/adecarolis/wfweb
+          Description: wfview fork with built-in web interface for browser-based ham radio remote control.
+           wfweb adds an HTTPS/WebSocket server to wfview, enabling full radio
+           control and real-time audio streaming from any browser without
+           installing client software. Based on wfview by Elliott H. Liggett W6EL
+           and Phil E. Taylor M0VSE (https://gitlab.com/eliggett/wfview).
+          EOF
+
+          sed -i 's/^          //' ${DEB_ROOT}/DEBIAN/control
+
+          printf '#!/bin/sh\nset -e\nldconfig || true\n' > ${DEB_ROOT}/DEBIAN/postinst
+          printf 'if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf '    systemctl daemon-reload || true\nfi\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "wfweb installed. To start automatically at boot, run:"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "  systemctl enable --now wfweb@\$USER"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          chmod 755 ${DEB_ROOT}/DEBIAN/postinst
+
+          dpkg-deb --build --root-owner-group ${DEB_ROOT}
+
+          mv deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}.deb \
+             wfweb_${VERSION}-ubuntu2404_${{ matrix.deb_arch }}.deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-${{ matrix.arch }}-ubuntu2404-deb
+          path: wfweb_*-ubuntu2404_${{ matrix.deb_arch }}.deb
+          retention-days: 30
+
+  build-linux-debian12:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+            deb_arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            deb_arch: arm64
+
+    name: Debian 12 Bookworm (${{ matrix.deb_arch }})
+    runs-on: ${{ matrix.os }}
+    container: debian:bookworm
+
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qtmultimedia5-dev libqt5websockets5-dev \
+            libopus-dev libeigen3-dev \
+            portaudio19-dev librtaudio-dev \
+            libhidapi-dev libudev-dev libpulse-dev \
+            libcodec2-dev \
+            cmake autoconf automake libtool curl \
+            openssl dpkg-dev
+
+      - name: Build RADE
+        run: |
+          cd resources/radae_nopy
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Build
+        run: |
+          qmake wfweb.pro
+          make -j$(nproc)
+
+      - name: Install rig definitions
+        run: |
+          mkdir -p /usr/local/share/wfview/rigs
+          cp rigs/*.rig /usr/local/share/wfview/rigs/
+
+      - name: Run tests
+        run: |
+          apt-get install -y python3-pytest python3-requests
+          python3 -m pytest tests/ -v
+
+      - name: Build .deb
+        run: |
+          VERSION=${{ needs.meta.outputs.pkg_version }}
+          DEB_ROOT=$(pwd)/deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}
+
+          make install INSTALL_ROOT=${DEB_ROOT}
+
+          # Bundle librade.so
+          mkdir -p ${DEB_ROOT}/usr/lib
+          cp resources/radae_nopy/build/src/librade.so* ${DEB_ROOT}/usr/lib/
+
+          # Install license files
+          mkdir -p ${DEB_ROOT}/usr/share/doc/wfweb
+          cp LICENSE THIRD_PARTY_LICENSES ${DEB_ROOT}/usr/share/doc/wfweb/
+
+          mkdir -p ${DEB_ROOT}/DEBIAN
+
+          cat > ${DEB_ROOT}/DEBIAN/control << EOF
+          Package: wfweb
+          Version: ${VERSION}
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: Alain De Carolis <adecarolis@users.noreply.github.com>
+          Depends: openssl, libqt5core5a, libqt5gui5,
+           libqt5network5, libqt5serialport5, libqt5multimedia5,
+           libqt5multimedia5-plugins,
+           libqt5websockets5,
+           libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
+           libudev1, librtaudio6, libcodec2-1.0
+          Section: hamradio
+          Priority: optional
+          Homepage: https://github.com/adecarolis/wfweb
+          Description: wfview fork with built-in web interface for browser-based ham radio remote control.
+           wfweb adds an HTTPS/WebSocket server to wfview, enabling full radio
+           control and real-time audio streaming from any browser without
+           installing client software. Based on wfview by Elliott H. Liggett W6EL
+           and Phil E. Taylor M0VSE (https://gitlab.com/eliggett/wfview).
+          EOF
+
+          sed -i 's/^          //' ${DEB_ROOT}/DEBIAN/control
+
+          printf '#!/bin/sh\nset -e\nldconfig || true\n' > ${DEB_ROOT}/DEBIAN/postinst
+          printf 'if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf '    systemctl daemon-reload || true\nfi\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "wfweb installed. To start automatically at boot, run:"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "  systemctl enable --now wfweb@\$USER"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          chmod 755 ${DEB_ROOT}/DEBIAN/postinst
+
+          dpkg-deb --build --root-owner-group ${DEB_ROOT}
+
+          mv deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}.deb \
+             wfweb_${VERSION}-debian12_${{ matrix.deb_arch }}.deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-${{ matrix.arch }}-debian12-deb
+          path: wfweb_*-debian12_${{ matrix.deb_arch }}.deb
+          retention-days: 30
+
+  build-linux-debian13:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+            deb_arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            deb_arch: arm64
+
+    name: Debian 13 Trixie (${{ matrix.deb_arch }})
+    runs-on: ${{ matrix.os }}
+    container: debian:trixie
+
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qtmultimedia5-dev libqt5websockets5-dev \
+            libopus-dev libeigen3-dev \
+            portaudio19-dev librtaudio-dev \
+            libhidapi-dev libudev-dev libpulse-dev \
+            libcodec2-dev \
+            cmake autoconf automake libtool curl \
+            openssl dpkg-dev
+
+      - name: Build RADE
+        run: |
+          cd resources/radae_nopy
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Build
+        run: |
+          qmake wfweb.pro
+          make -j$(nproc)
+
+      - name: Install rig definitions
+        run: |
+          mkdir -p /usr/local/share/wfview/rigs
+          cp rigs/*.rig /usr/local/share/wfview/rigs/
+
+      - name: Run tests
+        run: |
+          apt-get install -y python3-pytest python3-requests
+          python3 -m pytest tests/ -v
+
+      - name: Build .deb
+        run: |
+          VERSION=${{ needs.meta.outputs.pkg_version }}
+          DEB_ROOT=$(pwd)/deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}
+
+          make install INSTALL_ROOT=${DEB_ROOT}
+
+          # Bundle librade.so
+          mkdir -p ${DEB_ROOT}/usr/lib
+          cp resources/radae_nopy/build/src/librade.so* ${DEB_ROOT}/usr/lib/
+
+          # Install license files
+          mkdir -p ${DEB_ROOT}/usr/share/doc/wfweb
+          cp LICENSE THIRD_PARTY_LICENSES ${DEB_ROOT}/usr/share/doc/wfweb/
+
+          mkdir -p ${DEB_ROOT}/DEBIAN
+
+          cat > ${DEB_ROOT}/DEBIAN/control << EOF
+          Package: wfweb
+          Version: ${VERSION}
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: Alain De Carolis <adecarolis@users.noreply.github.com>
+          Depends: openssl, libqt5core5t64, libqt5gui5t64,
+           libqt5network5t64, libqt5serialport5, libqt5multimedia5,
+           libqt5multimedia5-plugins,
+           libqt5websockets5,
+           libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
+           libudev1, librtaudio7, libcodec2-1.2
+          Section: hamradio
+          Priority: optional
+          Homepage: https://github.com/adecarolis/wfweb
+          Description: wfview fork with built-in web interface for browser-based ham radio remote control.
+           wfweb adds an HTTPS/WebSocket server to wfview, enabling full radio
+           control and real-time audio streaming from any browser without
+           installing client software. Based on wfview by Elliott H. Liggett W6EL
+           and Phil E. Taylor M0VSE (https://gitlab.com/eliggett/wfview).
+          EOF
+
+          sed -i 's/^          //' ${DEB_ROOT}/DEBIAN/control
+
+          printf '#!/bin/sh\nset -e\nldconfig || true\n' > ${DEB_ROOT}/DEBIAN/postinst
+          printf 'if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf '    systemctl daemon-reload || true\nfi\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "wfweb installed. To start automatically at boot, run:"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          printf 'echo "  systemctl enable --now wfweb@\$USER"\n' >> ${DEB_ROOT}/DEBIAN/postinst
+          chmod 755 ${DEB_ROOT}/DEBIAN/postinst
+
+          dpkg-deb --build --root-owner-group ${DEB_ROOT}
+
+          mv deb-build/wfweb_${VERSION}_${{ matrix.deb_arch }}.deb \
+             wfweb_${VERSION}-debian13_${{ matrix.deb_arch }}.deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-${{ matrix.arch }}-debian13-deb
+          path: wfweb_*-debian13_${{ matrix.deb_arch }}.deb
+          retention-days: 30
+
+  build-linux-appimage:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+
+    name: AppImage (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    # Built on the oldest supported base so the bundle runs on anything with
+    # glibc >= 2.36 (Debian 12+, Ubuntu 24.04+, Fedora 37+, Arch, openSUSE...).
+    # Everything above glibc is bundled, including the desktop libraries
+    # linuxdeploy normally leaves out (see EXTRA_LIBS below). The host only
+    # provides ALSA (libasound2) and OpenSSL 3.
+    container: debian:bookworm
+
+    steps:
+      - name: Install git
+        run: |
+          # Remember what a bare Debian 12 ships before installing anything:
+          # the self-containment check below allows only those libraries.
+          dpkg-query -W -f='${Package}\n' > /tmp/base-packages
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qtmultimedia5-dev libqt5websockets5-dev \
+            libqt5multimedia5-plugins \
+            libopus-dev libeigen3-dev \
+            portaudio19-dev librtaudio-dev \
+            libhidapi-dev libudev-dev libpulse-dev \
+            libcodec2-dev \
+            build-essential cmake autoconf automake libtool curl file \
+            openssl
+
+      - name: Build RADE
+        run: |
+          cd resources/radae_nopy
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Build
+        run: |
+          qmake wfweb.pro PREFIX=/usr
+          make -j$(nproc)
+
+      - name: Fetch linuxdeploy
+        run: |
+          curl -fsSL -O \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          curl -fsSL -O \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
+          # Static FUSE 3 runtime: the classic runtime needs libfuse2, which
+          # minimal server installs no longer ship.
+          curl -fsSL -o appimage-runtime \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-${{ matrix.arch }}
+          chmod +x linuxdeploy-*.AppImage
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          ARCH: ${{ matrix.arch }}
+          EXTRA_PLATFORM_PLUGINS: libqoffscreen.so
+        run: |
+          VERSION=${{ needs.meta.outputs.pkg_version }}
+
+          make install INSTALL_ROOT=$(pwd)/AppDir
+          # The unit file hardcodes /usr/local/bin; it means nothing inside the bundle
+          rm -rf AppDir/usr/lib/systemd
+          mkdir -p AppDir/usr/share/doc/wfweb
+          cp LICENSE THIRD_PARTY_LICENSES AppDir/usr/share/doc/wfweb/
+
+          cat > wfweb.desktop << EOF
+          [Desktop Entry]
+          Type=Application
+          Name=wfweb
+          Comment=Browser-based remote control for amateur radio transceivers
+          Exec=wfweb
+          Icon=wfweb
+          Terminal=true
+          Categories=Network;HamRadio;
+          EOF
+
+          # linuxdeploy leaves these to the host, assuming a desktop install.
+          # Headless hosts (Pi OS Lite, servers) lack them, and the binary
+          # hard-links them through Qt5Gui and RtAudio, so ship them too.
+          # ALSA stays host-provided: it is tied to the host's alsa.conf.
+          EXTRA_LIBS=""
+          for lib in libjack.so.0 libGL.so.1 libGLX.so.0 libGLdispatch.so.0 \
+                     libX11.so.6 libX11-xcb.so.1 libxcb.so.1 \
+                     libfreetype.so.6 libfontconfig.so.1 libharfbuzz.so.0 libglib-2.0.so.0 libexpat.so.1; do
+            EXTRA_LIBS="$EXTRA_LIBS --library /usr/lib/$(gcc -print-multiarch)/$lib"
+          done
+
+          export LD_LIBRARY_PATH=$(pwd)/resources/radae_nopy/build/src
+          export LDAI_RUNTIME_FILE=$(pwd)/appimage-runtime
+          export LDAI_OUTPUT=wfweb_${VERSION}-${{ matrix.arch }}.AppImage
+          PATH=$(pwd):$PATH ./linuxdeploy-${{ matrix.arch }}.AppImage \
+            --appdir AppDir \
+            --desktop-file wfweb.desktop \
+            --icon-file resources/web-shared/favicon.svg --icon-filename wfweb \
+            $EXTRA_LIBS \
+            --plugin qt \
+            --output appimage
+
+      - name: Check the bundle is self-contained
+        run: |
+          # This container has every library installed, so booting the bundle
+          # here proves nothing about a bare host. Instead resolve what the
+          # headless process loads (binary, offscreen platform, audio and
+          # bearer plugins) and fail on anything that comes from the host
+          # beyond what a bare Debian 12 image ships, plus ALSA. OpenSSL is
+          # dlopen'd, so it never shows up here.
+          cd AppDir
+          ldd usr/bin/wfweb usr/plugins/platforms/libqoffscreen.so \
+              usr/plugins/audio/*.so usr/plugins/bearer/*.so \
+            | awk '/=> \//{print $1, $3}' | grep -v " $(pwd)/usr/" \
+            | awk '{print $1}' | sort -u > /tmp/host-libs
+          echo "Host-provided: $(tr '\n' ' ' < /tmp/host-libs)"
+          grep -qx libc.so.6 /tmp/host-libs || { echo "ldd resolution produced nothing"; exit 1; }
+          { cat /tmp/base-packages; echo libasound2; } \
+            | xargs dpkg -L | xargs -n1 basename | sort -u > /tmp/allowed
+          if comm -23 /tmp/host-libs /tmp/allowed | grep .; then
+            echo "^ needed from the host but not bundled: add it to EXTRA_LIBS"
+            exit 1
+          fi
+
+      - name: Smoke test
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          WFWEB_NO_AUTOCONNECT: 1
+        run: |
+          ./wfweb_*.AppImage --version
+          # Boot the bundle headless: it must find its own rig files and bring
+          # up HTTPS with the bundled Qt and the host's OpenSSL 3.
+          # timeout signals the whole process group (runtime + wrapped app) on kill
+          HOME=$(mktemp -d) timeout 60 ./wfweb_*.AppImage -d -p 18080 > smoke.log 2>&1 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sk -o /dev/null https://127.0.0.1:18080/; then ok=1; break; fi
+            sleep 1
+          done
+          kill $PID || true; wait $PID || true
+          [ "$ok" = 1 ] || { cat smoke.log; echo "AppImage web server did not answer"; exit 1; }
+          grep -q "Found Rig" smoke.log || { cat smoke.log; echo "AppImage did not find its rig files"; exit 1; }
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-${{ matrix.arch }}-appimage
+          path: wfweb_*-${{ matrix.arch }}.AppImage
+          retention-days: 30
+
+  build-macos:
+    needs: meta
+    name: macOS (Apple Silicon)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: brew install qt@5 portaudio opus openssl@3 codec2 cmake autoconf automake libtool
+
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/thestk/rtaudio.git ../rtaudio
+          git clone --depth 1 https://gitlab.com/libeigen/eigen.git ../eigen
+          git clone --depth 1 https://github.com/xiph/opus.git ../opus
+          mkdir -p ../r8brain-free-src
+
+      - name: Build RADE
+        run: |
+          cd resources/radae_nopy
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Build
+        run: |
+          /opt/homebrew/opt/qt@5/bin/qmake wfweb.pro
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        run: |
+          pip3 install --break-system-packages pytest requests websockets
+          python3 -m pytest tests/ -v
+
+      - name: Package zip
+        run: |
+          mkdir -p wfweb-macos-arm64
+          cp wfweb wfweb-macos-arm64/
+          cp -r rigs wfweb-macos-arm64/
+          cp LICENSE THIRD_PARTY_LICENSES wfweb-macos-arm64/
+          # RADE is compiled directly into the binary on macOS (no dylibs needed)
+          zip -r "wfweb_${{ needs.meta.outputs.pkg_version }}-macos-arm64.zip" wfweb-macos-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-macos-arm64
+          path: wfweb*-macos-arm64.zip
+          retention-days: 30
+
+  build-windows:
+    needs: meta
+    name: Windows x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Qt 5.15.2
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+
+      - name: Install vcpkg packages
+        run: vcpkg install eigen3:x64-windows portaudio:x64-windows hidapi:x64-windows openssl:x64-windows
+
+      - name: Clone rtaudio
+        run: git clone --depth 1 https://github.com/thestk/rtaudio.git ..\rtaudio
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build RADE custom Opus (MSYS2)
+        shell: C:\msys64\usr\bin\bash.exe -l {0}
+        run: |
+          pacman -S --noconfirm autoconf automake libtool make patch gcc cmake
+          cd "$GITHUB_WORKSPACE/resources/radae_nopy"
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Patch Opus headers for MSVC
+        shell: pwsh
+        run: |
+          $nnet = "resources\radae_nopy\build\build_opus-prefix\src\build_opus\dnn\nnet.h"
+          (Get-Content $nnet -Raw) -replace `
+            '#define RADE_EXPORT __attribute__\(\(visibility\("default"\)\)\)', `
+            "#ifdef _MSC_VER`n    #define RADE_EXPORT`n  #else`n    #define RADE_EXPORT __attribute__((visibility(""default"")))`n  #endif" `
+            | Set-Content $nnet
+
+          $api = "resources\radae_nopy\src\rade_api.h"
+          (Get-Content $api -Raw) -replace `
+            '#if IS_BUILDING_RADE_API', `
+            "#if defined(RADE_STATIC)`n#define RADE_EXPORT`n#elif IS_BUILDING_RADE_API" `
+            | Set-Content $api
+
+      - name: Build custom Opus (MSVC)
+        shell: cmd
+        run: |
+          cmake -S resources\radae_nopy\build\build_opus-prefix\src\build_opus -B resources\radae_nopy\build\opus_msvc_build -DOPUS_DRED=ON -DOPUS_OSCE=ON -DBUILD_SHARED_LIBS=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF -A x64
+          cmake --build resources\radae_nopy\build\opus_msvc_build --config Release
+
+      - name: Clone codec2
+        run: git clone --depth 1 https://github.com/drowe67/codec2.git codec2
+
+      - name: Build codec2 (FreeDV) via MSYS2 MinGW
+        shell: C:\msys64\usr\bin\bash.exe -l {0}
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-x86_64-cmake mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-tools-git
+          export PATH="/mingw64/bin:$PATH"
+          CODEC2="$(cygpath "$GITHUB_WORKSPACE")/codec2"
+          cd "$CODEC2"
+          mkdir -p build_mingw && cd build_mingw
+          /mingw64/bin/cmake -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DUNITTEST=OFF \
+            -DCMAKE_C_COMPILER=/mingw64/bin/gcc.exe \
+            -DCMAKE_MAKE_PROGRAM=/mingw64/bin/mingw32-make.exe \
+            ..
+          /mingw64/bin/mingw32-make -j$(nproc) codec2
+
+      - name: Install codec2 into vcpkg prefix
+        shell: pwsh
+        run: |
+          $vcpkg = "C:\vcpkg\installed\x64-windows"
+
+          # DLL for runtime
+          Copy-Item "codec2\build_mingw\src\libcodec2.dll" "$vcpkg\bin\" -Force
+
+          # Generate MSVC import lib from MinGW DLL
+          & C:\msys64\mingw64\bin\gendef.exe codec2\build_mingw\src\libcodec2.dll
+          lib /def:libcodec2.def /out:"$vcpkg\lib\codec2.lib" /machine:x64
+
+          # Headers
+          New-Item -ItemType Directory -Force -Path "$vcpkg\include\codec2" | Out-Null
+          $headers = @("codec2.h", "codec2_fdmdv.h", "codec2_fifo.h", "codec2_cohpsk.h",
+                       "codec2_fm.h", "codec2_ofdm.h", "freedv_api.h", "reliable_text.h",
+                       "comp.h", "modem_stats.h")
+          foreach ($h in $headers) { Copy-Item "codec2\src\$h" "$vcpkg\include\codec2\" -Force }
+          Copy-Item "codec2\build_mingw\codec2\version.h" "$vcpkg\include\codec2\" -Force
+
+      - name: Build
+        shell: cmd
+        run: |
+          qmake wfweb.pro CONFIG+=release "VCPKG_DIR=C:/vcpkg/installed/x64-windows" "DEFINES-=FTDI_SUPPORT"
+          nmake release
+
+      # Separate Qt Widgets exe that composes wfweb's command line and runs
+      # it as a child process (launcher/README.md). Lands next to wfweb.exe.
+      - name: Build launcher
+        shell: cmd
+        run: |
+          cd launcher
+          qmake launcher.pro CONFIG+=release
+          nmake release
+
+      - name: Deploy Qt runtime
+        shell: cmd
+        run: windeployqt --release --no-translations --no-opengl-sw wfweb-release\wfweb.exe wfweb-release\wfweb-launcher.exe
+
+      - name: Deploy vcpkg DLLs and assets
+        shell: pwsh
+        run: |
+          $vcpkgBin = "C:\vcpkg\installed\x64-windows\bin"
+          $out = "wfweb-release"
+
+          # vcpkg DLLs (opus is statically linked via RADE custom build)
+          foreach ($dll in @("portaudio.dll", "hidapi.dll",
+                             "libcodec2.dll",
+                             "libssl-3-x64.dll", "libcrypto-3-x64.dll")) {
+            $src = Join-Path $vcpkgBin $dll
+            if (Test-Path $src) { Copy-Item $src $out -Force }
+          }
+
+          # MinGW runtime DLLs required by libcodec2.dll (built via MSYS2 MinGW)
+          $mingwBin = "C:\msys64\mingw64\bin"
+          foreach ($dll in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
+            $src = Join-Path $mingwBin $dll
+            if (Test-Path $src) { Copy-Item $src $out -Force }
+          }
+
+          # OpenSSL 1.1 aliases for Qt 5.15
+          if (!(Test-Path "$out\libssl-1_1-x64.dll") -and (Test-Path "$out\libssl-3-x64.dll")) {
+            Copy-Item "$out\libssl-3-x64.dll" "$out\libssl-1_1-x64.dll"
+          }
+          if (!(Test-Path "$out\libcrypto-1_1-x64.dll") -and (Test-Path "$out\libcrypto-3-x64.dll")) {
+            Copy-Item "$out\libcrypto-3-x64.dll" "$out\libcrypto-1_1-x64.dll"
+          }
+
+          # Rig files
+          New-Item -ItemType Directory -Force -Path "$out\rigs" | Out-Null
+          Copy-Item "rigs\*.rig" "$out\rigs\" -Force
+
+          # License files
+          Copy-Item "LICENSE" "$out\" -Force
+          Copy-Item "THIRD_PARTY_LICENSES" "$out\" -Force
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path wfweb-release -DestinationPath "wfweb_${{ needs.meta.outputs.pkg_version }}-windows-x86_64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wfweb-windows-x86_64
+          path: wfweb*-windows-x86_64.zip
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: [meta, build-linux-ubuntu2404, build-linux-debian12, build-linux-debian13, build-linux-appimage, build-macos, build-windows]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    env:
+      IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      # One rolling pre-release per branch, so its URL stays stable; what
+      # changes on every build is its name, its notes, its assets and where
+      # the tag points.
+      TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('dev-{0}', github.ref_name) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+
+      # The release action only creates a tag that does not exist yet (at the
+      # repository's default branch, not at the built commit), so a reused dev
+      # tag would stay on whatever it was first created at. Move it to the
+      # commit these assets were built from.
+      - name: Point the dev tag at this commit
+        if: env.IS_RELEASE == 'false'
+        run: git push --force origin "${GITHUB_SHA}:refs/tags/${TAG}"
+
+      # The release action overwrites same-named assets only; a dev build of
+      # the next version would otherwise pile up next to the previous one.
+      - name: Drop the previous dev build's assets
+        if: env.IS_RELEASE == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # No release yet on a new branch: nothing to prune (the shell runs with pipefail).
+          { gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true; } \
+            | xargs -r -n1 gh release delete-asset "$TAG" --yes
+
+      - name: Write dev release notes
+        if: env.IS_RELEASE == 'false'
+        run: |
+          {
+            echo "Development build of \`${{ github.ref_name }}\` at ${{ needs.meta.outputs.sha_short }}, ${{ needs.meta.outputs.date }}."
+            echo
+            echo '```'
+            git log -1 --format='%h %s' HEAD
+            echo '```'
+            echo
+            echo "Packages are versioned \`${{ needs.meta.outputs.pkg_version }}\`: \`apt install ./<file>.deb\` upgrades the previous dev build, and the next release upgrades this one."
+            echo "Built by [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "${{ env.IS_RELEASE == 'true' && github.ref_name || format('Development build: {0} @ {1} ({2})', github.ref_name, needs.meta.outputs.sha_short, needs.meta.outputs.date) }}"
+          body_path: ${{ env.IS_RELEASE == 'false' && 'release-notes.md' || '' }}
+          prerelease: ${{ env.IS_RELEASE == 'false' }}
+          files: |
+            wfweb-x86_64-ubuntu2404-deb/*.deb
+            wfweb-arm64-ubuntu2404-deb/*.deb
+            wfweb-x86_64-debian12-deb/*.deb
+            wfweb-arm64-debian12-deb/*.deb
+            wfweb-x86_64-debian13-deb/*.deb
+            wfweb-arm64-debian13-deb/*.deb
+            wfweb-x86_64-appimage/*.AppImage
+            wfweb-aarch64-appimage/*.AppImage
+            wfweb-macos-arm64/wfweb*-macos-arm64.zip
+            wfweb-windows-x86_64/wfweb*-windows-x86_64.zip
+          generate_release_notes: ${{ env.IS_RELEASE == 'true' }}
+          overwrite: true

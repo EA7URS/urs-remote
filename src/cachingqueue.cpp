@@ -1,0 +1,770 @@
+/*
+ *  This is a singleton queue (only 1 instance can be created)
+ *
+ *  Although subclassing QThread is often not recommended, I think that this is
+ *  a valid use case for subclassing.
+ *
+*/
+#include "logcategories.h"
+#include "cachingqueue.h"
+
+#define CACHE_LOCK_TIME 100
+
+cachingQueue* cachingQueue::instance{};
+QMutex cachingQueue::instanceMutex;
+
+cachingQueue *cachingQueue::getInstance(QObject* parent)
+{
+    QMutexLocker locker(&instanceMutex);
+    if (instance == Q_NULLPTR)
+    {
+        instance = new cachingQueue(parent);
+        instance->setObjectName(("cachingQueue()"));
+        connect (instance, SIGNAL(finished()),instance, SLOT(deleteLater()));
+        instance->start(QThread::TimeCriticalPriority);
+    }
+    qDebug() << "Returning instance of cachingQueue() to calling process:" << ((parent != Q_NULLPTR) ? parent->objectName(): "<unknown>");
+    return instance;
+}
+
+cachingQueue::~cachingQueue()
+{
+    aborted = true;
+    if (mutex.tryLock(CACHE_LOCK_TIME)) {
+        mutex.unlock();
+        waiting.wakeOne(); // wake the thread and signal it to exit.
+    }
+    else {
+        qWarning(logRig()) << "Failed to delete cachingQueue() after" << CACHE_LOCK_TIME << "ms, mutex locked";
+    }
+    qInfo() << "Destroying caching queue (parent closing)";
+    // Let run() return before ~QThread: it aborts the process ("Destroyed
+    // while thread is still running") if it gets there before the woken
+    // thread has left, which is only a matter of scheduling.
+    if (!wait(2000))
+        qWarning(logRig()) << "cachingQueue() thread did not stop";
+}
+
+void cachingQueue::run()
+{
+    // Setup queue.
+    qInfo() << "Starting caching queue handler thread (ThreadId:" << QThread::currentThreadId() << ")";
+
+    QDeadlineTimer deadline(queueInterval);
+    QMutexLocker locker(&mutex);
+
+    quint16 counter=priorityImmediate;
+
+    while (!aborted)
+    {
+        if (!waiting.wait(&mutex, deadline.remainingTime()))
+        {
+            // Time to process the queue - mutex is locked
+            queuePriority prio = priorityImmediate;
+
+            // priorityNone=0, priorityImmediate=1, priorityHighest=2, priorityHigh=3, priorityMediumHigh=5, priorityMedium=7, priorityMediumLow=11, priorityLow=19, priorityLowest=23
+
+            // If no immediate commands then process the rest of the queue
+            if (!queue.contains(prio)) {
+                if (counter % priorityHighest == 0)
+                    prio = priorityHighest;
+                else if (counter % priorityHigh == 0)
+                    prio = priorityHigh;
+                else if (counter % priorityMediumHigh == 0)
+                    prio = priorityMediumHigh;
+                else if (counter % priorityMedium == 0)
+                    prio = priorityMedium;
+                else if (counter % priorityMediumLow == 0)
+                    prio = priorityMediumLow;
+                else if (counter % priorityLow == 0)
+                    prio = priorityLow;
+                else if (counter % priorityLowest == 0) {
+                    prio = priorityLowest;
+                    counter = priorityImmediate;
+                }
+            }
+            counter++;
+
+            //auto it = queue.upperBound(prio);
+            //it--; //upperBound returns the item immediately following the last key.
+            //if (it != queue.end() && it.key() == prio)
+            auto it = queue.find(prio);
+            if (it != queue.end()) {
+                while (it != queue.end() && it.key() == prio)
+                {
+                    it++;
+                }
+                it--;
+                auto item = it.value();
+
+                // A recurring read the rig keeps refusing sits out its retry
+                // window (see CACHE_NAK_LIMIT): it is rotated but not sent.
+                // Sets and one-shot reads always go out.
+                bool held = false;
+                if (item.recurring && !item.param.isValid()) {
+                    auto cv = findCache(item.command, item.receiver);
+                    held = (cv != cache.end() && cv->backedOff());
+                }
+                if (!held) {
+                    if (!item.param.isValid())
+                        countUnanswered(item.command, item.receiver);
+                    emit haveCommand(item.command,item.param,item.receiver);
+                }
+                it=queue.erase(it);
+                //queue.remove(prio,it.value()); // Will remove ALL matching commands which breaks some things (memory bulk write)
+
+                // If this is a recurring command, add it back into the queue.
+                if (item.recurring && prio != priorityImmediate) {
+                    queue.insert(prio,item);
+                }
+
+                // An immediate set was put in the cache by add(); everything
+                // else is stamped here, as it goes out, so that a read's req
+                // is the time it was last asked (countUnanswered).
+                if (!held && (prio != priorityImmediate || !item.param.isValid())) {
+                    updateCache(false,item.command,item.param,item.receiver);
+                }
+            }
+#ifdef Q_OS_MACOS
+            while (!items.isEmpty()) {
+                emit sendValue(items.dequeue());
+            }
+            while (!messages.isEmpty()) {
+                emit sendMessage(messages.dequeue());
+            }
+#else
+            QCoreApplication::processEvents();
+#endif
+            deadline.setRemainingTime(queueInterval); // reset the deadline to the poll frequency
+
+        }
+        else if (!aborted) {
+            // Mutex is locked
+            while (!items.isEmpty()) {
+                emit sendValue(items.dequeue());
+            }
+            while (!messages.isEmpty()) {
+                emit sendMessage(messages.dequeue());
+            }
+            if (queueInterval != -1 && deadline.isForever())
+                deadline.setRemainingTime(queueInterval); // reset the deadline to the poll frequency
+        }
+    }
+}
+
+void cachingQueue::interval(qint64 val)
+{
+    this->queueInterval = val;
+    if (mutex.tryLock()) {
+        mutex.unlock();
+        waiting.wakeAll();
+    }
+    emit intervalUpdated(val);
+    qInfo() << "Changing queue interval to" << val << "ms";
+}
+
+funcs cachingQueue::checkCommandAvailable(funcs cmd,bool set)
+{
+    Q_UNUSED(set)
+    if (rigCaps != Q_NULLPTR && cmd != funcNone && cmd != funcSelectVFO && !rigCaps->commands.contains(cmd)) {
+        // We don't have the requested command!
+        return funcNone;
+    }
+    return cmd;
+}
+
+void cachingQueue::add(queuePriority prio ,funcs func, bool recurring, uchar receiver)
+{
+    queueItem q(func,recurring,receiver);
+    add(prio,q,false);
+}
+
+void cachingQueue::addUnique(queuePriority prio ,funcs func, bool recurring, uchar receiver)
+{
+    queueItem q(func,recurring, receiver);
+    add(prio,q,true);
+}
+
+void cachingQueue::addUnique(queuePriority prio, queueItem item)
+{
+    add(prio,item,true);
+}
+
+void cachingQueue::add(queuePriority prio ,queueItem item, bool unique)
+{
+    // If the queue isn't running, no point adding to it!
+    if (this->queueInterval != -1)
+    {
+        item.command=checkCommandAvailable(item.command,item.param.isValid());
+        if ((item.receiver != 0xff || rigState.receiver == item.receiver) && item.command != funcNone)
+        {
+            QMutexLocker locker(&mutex);
+
+            // Do not add a duplicate recurring command of the same priority
+            if (!item.recurring || isRecurring(item.command,item.receiver) != prio)
+            {
+                if (item.recurring && prio == queuePriority::priorityImmediate) {
+                    qWarning() << "cachingQueue::add() Warning, cannot add recurring command with immediate priority!" << funcString[item.command];
+                } else {
+                    if (unique) {
+                        // A read never replaces a pending item of the same
+                        // command; the new read is dropped and the pending one
+                        // keeps its place.
+                        // - A pending set: queueItem equality ignores the
+                        //   value, so the 5 Hz status read of the PTT state
+                        //   deleted a queued key before it went out (#147).
+                        //   The commander reads a set back anyway.
+                        // - A pending read: removing it and inserting the new
+                        //   one sent it to the back of the line. A value the
+                        //   status asked for again before the backlog ahead of
+                        //   it drained (getCache() re-asks on every miss) was
+                        //   pushed back each time and never read: COMP, last
+                        //   in the status, on the macOS CI runner.
+                        if (!item.param.isValid()) {
+                            for (auto it = queue.constFind(prio); it != queue.cend() && it.key() == prio; ++it) {
+                                if (it.value().command == item.command && it.value().receiver == item.receiver
+                                        && it.value().recurring == item.recurring)
+                                    return;
+                            }
+                        }
+                        int count=queue.remove(prio,item);
+                        if (count>0)
+                            qDebug() << "cachingQueue::add() deleted" << count << "entries from queue for" << funcString[item.command] << "on receiver" << item.receiver;
+                    }
+
+                    // Don't immediately request funcTransceiverId, wait for the queue to run
+                    if (item.recurring && item.command != funcTransceiverId) {
+                        // also insert an immediate command to get the current value "now" (removes the need to get rigstate)
+                        queueItem it=item;
+                        it.recurring=false;
+                        it.param.clear();
+                        queue.insert(queue.cend(),priorityImmediate, it);
+                    }
+                    queue.insert(prio, item);
+
+                }
+            }
+            // An immediate set goes into the cache now, before the rig has
+            // answered; a read is stamped when it is sent (run()).
+            if (!item.recurring && prio == priorityImmediate && item.param.isValid())
+            {
+                updateCache(false,item.command,item.param,item.receiver);
+            }
+        }
+    }
+}
+
+vfoCommandType cachingQueue::getVfoCommand(vfo_t vfo,uchar rx, bool set)
+{
+    vfoCommandType cmd;
+    cmd.receiver = rx;
+    cmd.vfo = vfo;
+    if (rigCaps != Q_NULLPTR) {
+        QMutexLocker locker(&mutex);
+
+        if (set) {
+            cmd.modeFunc = ((rigCaps->commands.contains(funcMode)) ? funcMode: funcModeSet) ;
+            cmd.freqFunc = ((rigCaps->commands.contains(funcFreq)) ? funcFreq: funcFreqSet) ;
+        } else {
+            cmd.modeFunc = ((rigCaps->commands.contains(funcMode)) ? funcMode: funcModeGet) ;
+            cmd.freqFunc = ((rigCaps->commands.contains(funcFreq)) ? funcFreq: funcFreqGet) ;
+        }
+
+        if (!rigCaps->hasCommand29) {
+            // This radio has no direct access to each receiver (main/sub
+            if (rigState.vfoMode == vfoModeType_t::vfoModeVfo && (rigState.receiver == 0 && rx == 0))
+            {
+                // This is acting on main
+                if (vfo == vfoA) {
+                    cmd.modeFunc = ((rigCaps->commands.contains(funcSelectedMode)) ? funcSelectedMode: cmd.modeFunc);
+                    cmd.freqFunc = ((rigCaps->commands.contains(funcSelectedFreq)) ? funcSelectedFreq: cmd.freqFunc);
+                } else if (vfo == vfoB){
+                    cmd.modeFunc = ((rigCaps->commands.contains(funcUnselectedMode)) ? funcUnselectedMode: cmd.modeFunc);
+                    cmd.freqFunc = ((rigCaps->commands.contains(funcUnselectedFreq)) ? funcUnselectedFreq: cmd.freqFunc);
+                }
+            }
+            else if (rx == rigState.receiver)
+            {
+                // Requesting receiver is current
+                cmd.receiver = 0;
+            }
+            else
+            {
+                // Requesting receiver is not current.
+                cmd.modeFunc = funcNone;
+                cmd.freqFunc = funcNone;
+                cmd.receiver = 0xff;
+            }
+        }
+    }
+    qDebug(logRig()) << "Queue VFO:" << vfo << "rx:" << rx<< "set:" << set << "mode:" << funcString[cmd.modeFunc] << "freq:" << funcString[cmd.freqFunc] << "rigstate: vfoMode:" << rigState.vfoMode << "vfo" << rigState.vfo << "rx" << rigState.receiver;
+    return cmd;
+}
+
+// Operating frequency / mode. In memory mode the per-VFO cache never fills
+// while the periodic 25 00 / 26 00 poll keeps the Selected one live with the
+// recalled channel (IC-7300, measured); anything that only looked at the
+// named slot saw nothing there: setFilter silently did nothing (#138) and the
+// status went out with null freq/mode. rigctld had the same hole from the
+// other side: a slot nothing polls answered the last value *set* (#147).
+// The named slot first, then the Selected one, then the plain read. Only
+// funcs the rig has are consulted: getCache() re-requests an empty slot.
+cacheItem cachingQueue::operatingFreqCache(const vfoCommandType &t)
+{
+    if (rigCaps == Q_NULLPTR || t.freqFunc == funcNone) return cacheItem();
+    cacheItem c = getCache(t.freqFunc, t.receiver);
+    if (!c.value.isValid() && rigCaps->commands.contains(funcSelectedFreq))
+        c = getCache(funcSelectedFreq, 0);
+    for (funcs f : {funcFreq, funcFreqGet})
+        if (!c.value.isValid() && rigCaps->commands.contains(f))
+            c = getCache(f, t.receiver);
+    return c;
+}
+
+cacheItem cachingQueue::operatingModeCache(const vfoCommandType &t)
+{
+    if (rigCaps == Q_NULLPTR || t.modeFunc == funcNone) return cacheItem();
+    cacheItem c = getCache(t.modeFunc, t.receiver);
+    if (!c.value.isValid() && rigCaps->commands.contains(funcSelectedMode))
+        c = getCache(funcSelectedMode, 0);
+    for (funcs f : {funcMode, funcModeGet})
+        if (!c.value.isValid() && rigCaps->commands.contains(f))
+            c = getCache(f, t.receiver);
+    return c;
+}
+
+queuePriority cachingQueue::del(funcs func, uchar receiver)
+{
+    // This will immediately delete any matching commands.
+    queuePriority prio = priorityNone;
+    if (func != funcNone)
+    {
+        QMutexLocker locker(&mutex);
+        auto it = std::find_if(queue.begin(), queue.end(), [func,receiver](const queueItem& c) {  return (c.command == func && c.receiver == receiver && c.recurring == true); });
+        //auto it(queue.begin());
+        if (it != queue.end()) {
+            prio = it.key();
+            int count = queue.remove(it.key(),it.value());
+            if (count>0)
+                qDebug() << "cachingQueue()::del" << count << "entries from queue for" << funcString[func] << "on receiver" << receiver;
+        }
+    }
+    return prio;
+}
+
+
+// Block until the worker has handed every priorityImmediate command to the
+// rig thread (one per tick), or timeoutMs elapses.  Used on shutdown so a
+// final command queued during teardown — the DATA MOD OFF restore for an
+// active web mic — is dispatched before the rig port is closed (#95).
+bool cachingQueue::waitForImmediate(int timeoutMs)
+{
+    QDeadlineTimer deadline(timeoutMs);
+    while (!deadline.hasExpired()) {
+        {
+            QMutexLocker locker(&mutex);
+            if (!queue.contains(priorityImmediate))
+                return true;
+        }
+        QThread::msleep(5);
+    }
+    return false;
+}
+
+queuePriority cachingQueue::getQueued(funcs func, uchar receiver)
+{
+    queuePriority prio = priorityNone;
+    if (func != funcNone)
+    {
+        QMutexLocker locker(&mutex);
+        auto it = std::find_if(queue.begin(), queue.end(), [func,receiver](const queueItem& c) {  return (c.command == func && c.receiver == receiver && c.recurring); });
+        //auto it(queue.begin());
+        if (it != queue.end()) {
+            prio = it.key();
+        }
+    }
+    return prio;
+}
+
+queuePriority cachingQueue::changePriority(queuePriority newprio, funcs func, uchar receiver)
+{
+    queuePriority prio = priorityNone;
+    if (func != funcNone && newprio != priorityImmediate)
+    {
+        QMutexLocker locker(&mutex);
+        auto it = std::find_if(queue.begin(), queue.end(), [func,receiver](const queueItem& c) {  return (c.command == func && c.receiver == receiver && c.recurring); });
+        //auto it(queue.begin());
+        if (it != queue.end()) {
+            prio = it.key();
+            auto item = it.value();
+            it=queue.erase(it);
+            queue.insert(newprio,item);
+        }
+    }
+    return prio;
+}
+
+queuePriority cachingQueue::isRecurring(funcs func, uchar receiver)
+{
+    // Does NOT lock the mutex
+    auto rec = std::find_if(queue.begin(), queue.end(), [func,receiver](const queueItem& c) {  return (c.command == func && c.receiver == receiver && c.recurring); });
+    if (rec != queue.end())
+    {
+        return rec.key();
+    }
+    return queuePriority::priorityNone;
+}
+
+void cachingQueue::clear()
+{
+    QMutexLocker locker(&mutex);
+    queue.clear();
+}
+void cachingQueue::message(QString msg)
+{
+
+    if (mutex.tryLock(CACHE_LOCK_TIME)) {
+        messages.append(msg);
+        mutex.unlock();
+        qDebug() << "Received:" << msg;
+#ifndef Q_OS_MACOS
+        waiting.wakeOne();
+#endif
+    } else {
+        qWarning(logRig()) << "Queue failed to send message() after" << CACHE_LOCK_TIME << "ms, mutex locked";
+    }
+}
+
+void cachingQueue::receiveValue(funcs func, QVariant value, uchar receiver)
+{
+    qDebug(logRig()) << "receiveValue() func=" << funcString[func] << " receiver=" << receiver << " value=" << value;
+    if (mutex.tryLock(CACHE_LOCK_TIME)) {
+        cacheItem c = cacheItem(func,value,receiver);
+        items.enqueue(c);
+        updateCache(true,func,value,receiver);
+        mutex.unlock();
+#ifndef Q_OS_MACOS
+        waiting.wakeOne();
+#endif
+    } else {
+        qWarning(logRig()) << "Failed to receiveValue() after" << CACHE_LOCK_TIME << "ms, mutex locked";
+    }
+}
+
+
+// Mutex MUST be locked by the calling function.
+QMultiMap<funcs,cacheItem>::iterator cachingQueue::findCache(funcs func, uchar receiver)
+{
+    auto cv = cache.find(func);
+    while (cv != cache.end() && cv->command == func) {
+        if (cv->receiver == receiver)
+            return cv;
+        ++cv;
+    }
+    return cache.end();
+}
+
+// The rig refused a read of func (Icom FA/NG).  Counts consecutive refusals on
+// the cache entry — getCache() and the run loop back the read off once the
+// count reaches CACHE_NAK_LIMIT — and returns the new count so the caller can
+// log accordingly (the commander owns the log line, since it follows the
+// rig's own error).  A valid reply (updateCache) clears the count.
+int cachingQueue::receiveNak(funcs func, uchar receiver)
+{
+    if (func == funcNone)
+        return 0;
+    int count = 0;
+    cacheItem tripped;
+    if (mutex.tryLock(CACHE_LOCK_TIME)) {
+        auto cv = findCache(func, receiver);
+        if (cv == cache.end()) {
+            cacheItem c;
+            c.command = func;
+            c.receiver = receiver;
+            cv = cache.insert(func, c);
+        }
+        count = ++cv->nak;
+        cv->reply = QDateTime::currentDateTime(); // an NG is an answer: not unanswered
+        if (count == CACHE_NAK_LIMIT)
+            tripped = *cv;
+        mutex.unlock();
+    } else {
+        qWarning(logRig()) << "Failed to receiveNak() after" << CACHE_LOCK_TIME << "ms, mutex locked";
+    }
+    if (count == CACHE_NAK_LIMIT)
+        emit cacheRejected(tripped);
+    return count;
+}
+
+// Called as a read goes out, with the mutex held.  If the same read went
+// out before and nothing came back since — no value, no NG — that silence
+// counts as a refusal, so a rig that ignores a command is backed off like
+// one that answers FA (CACHE_NAK_LIMIT) instead of being asked again on
+// every status build for as long as it runs.  A refresh of a value the rig
+// did answer once is not counted: a lost reply there costs nothing.
+void cachingQueue::countUnanswered(funcs func, uchar receiver)
+{
+    auto cv = findCache(func, receiver);
+    if (cv == cache.end() || cv->value.isValid() || !cv->req.isValid())
+        return;
+    if (cv->reply.isValid() && cv->reply >= cv->req)
+        return;
+    int count = ++cv->nak;
+    if (count == CACHE_NAK_LIMIT) {
+        qInfo(logRig()) << "Rig has not answered" << count << "consecutive reads of" << funcString[func]
+                        << "- backing off to one attempt every" << CACHE_NAK_RETRY_SECS << "s";
+        emit cacheRejected(*cv);
+    }
+}
+
+void cachingQueue::updateCache(bool reply, queueItem item)
+{
+    // Mutex MUST be locked by the calling function.
+
+    // We need to make sure that all "main" frequencies/modes are updated.
+    if (reply)
+    {
+        // Is this a command that might have updated our state?
+        if (item.command == funcSatelliteMode && item.param.value<bool>()) {
+            qDebug(logRig()) << "updateCache: vfoMode -> vfoModeSat (was" << rigState.vfoMode << ")";
+            rigState.vfoMode=vfoModeType_t::vfoModeSat;
+        }
+        if (item.command == funcMemoryMode && item.param.value<bool>()) {
+            qDebug(logRig()) << "updateCache: vfoMode -> vfoModeMem (was" << rigState.vfoMode << ")";
+            rigState.vfoMode=vfoModeType_t::vfoModeMem;
+        }
+        if (item.command == funcVFOMode && item.param.value<bool>()) {
+            qDebug(logRig()) << "updateCache: vfoMode -> vfoModeVfo (was" << rigState.vfoMode << ")";
+            rigState.vfoMode=vfoModeType_t::vfoModeVfo;
+        }
+        if (item.command == funcVFOBandMS) {
+            qDebug(logRig()) << "updateCache: receiver ->" << item.param.value<uchar>() << "(was" << rigState.receiver << ")";
+            rigState.receiver = item.param.value<uchar>();
+        }
+    } else {
+        // If we are requesting a particular VFO, set our state as the rig will not reply
+        if (item.command == funcSelectVFO) {
+            qDebug(logRig()) << "updateCache: selectVFO ->" << item.param.value<vfo_t>() << "(was vfo=" << rigState.vfo << " vfoMode=" << rigState.vfoMode << ")";
+            rigState.vfo = item.param.value<vfo_t>();
+            if (item.param.value<vfo_t>() != vfoMem)
+                rigState.vfoMode = vfoModeType_t::vfoModeVfo;
+            else
+                rigState.vfoMode = vfoModeType_t::vfoModeMem;
+        } else if (item.command == funcVFOASelect) {
+            qDebug(logRig()) << "updateCache: VFO A selected (was vfo=" << rigState.vfo << ")";
+            rigState.vfo = vfo_t::vfoA;
+            rigState.vfoMode = vfoModeType_t::vfoModeVfo;
+        } else if (item.command == funcVFOBSelect && rigCaps->numVFO > 1) {
+            qDebug(logRig()) << "updateCache: VFO B selected (was vfo=" << rigState.vfo << ")";
+            rigState.vfo = vfo_t::vfoB;
+            rigState.vfoMode = vfoModeType_t::vfoModeVfo;
+        } else if (item.command == funcVFOMainSelect) {
+            qDebug(logRig()) << "updateCache: VFO Main selected (was vfo=" << rigState.vfo << " rx=" << rigState.receiver << ")";
+            rigState.vfo = vfo_t::vfoMain;
+            rigState.receiver=0;
+            rigState.vfoMode = vfoModeType_t::vfoModeVfo;
+        } else if (item.command == funcVFOSubSelect && rigCaps->numReceiver > 1) {
+            qDebug(logRig()) << "updateCache: VFO Sub selected (was vfo=" << rigState.vfo << " rx=" << rigState.receiver << ")";
+            rigState.vfo = vfo_t::vfoSub;
+            rigState.receiver=1;
+            rigState.vfoMode = vfoModeType_t::vfoModeVfo;
+        }
+    }
+
+    auto cv = cache.find(item.command);
+    while (cv != cache.end() && cv->command == item.command) {
+        if (cv->receiver == item.receiver) {
+            bool recovered = false;
+            if (reply) {
+                cv->reply = QDateTime::currentDateTime();
+                if (item.param.isValid()) {
+                    // The rig answered: earlier refusals are history.  A read
+                    // coming back from back-off is announced even when its
+                    // value is unchanged, so listeners that reacted to the
+                    // refusal (the tuner tile) can undo that.
+                    recovered = cv->nak >= CACHE_NAK_LIMIT;
+                    cv->nak = 0;
+                }
+            } else {
+                cv->req = QDateTime::currentDateTime();
+            }
+            // If we are sending an actual value, update the cache with it
+            // Value will be replaced if invalid on next get()
+
+            if (compare(item.param,cv.value().value) || recovered)
+            {
+                cv->value.clear();
+                cv->value.setValue(item.param);
+
+                emit cacheUpdated(cv.value());
+            }
+            return;
+            // We have found (and updated) a matching item so return
+        }
+        ++cv;
+    }
+
+    cacheItem c;
+    c.command = item.command;
+    c.receiver = item.receiver;
+
+    if (reply) {
+        c.reply = QDateTime::currentDateTime();
+    } else {
+        c.req = QDateTime::currentDateTime();
+    }
+    // If we are sending an actual value, update the cache with it
+    // Value will be replaced if invalid on next get()
+    if (item.param.isValid())
+    {
+        c.value.setValue(item.param);
+    }
+
+    cache.insert(item.command,c);
+
+    // Notify listeners on the first valid value for a command too — web clients
+    // depend on cacheUpdated for state changes such as funcPowerControl, which
+    // may be inserted (not updated) the first time the radio reports off (#71).
+    if (c.value.isValid()) {
+        emit cacheUpdated(c);
+    }
+}
+
+
+void cachingQueue::updateCache(bool reply, funcs func, QVariant value, uchar receiver)
+{
+    queueItem q(func,value,false,receiver);
+    updateCache(reply,q);
+}
+
+
+cacheItem cachingQueue::getCache(funcs func, uchar receiver)
+{
+    cacheItem ret;
+    if (func != funcNone) {
+        QMutexLocker locker(&mutex);
+        auto it = cache.find(func);
+        while (it != cache.end() && it->command == func)
+        {
+            if (it->receiver == receiver) {
+                ret = cacheItem(*it);
+                break;
+            }
+            ++it;
+        }
+    }
+    // If the cache is more than 5-20 seconds old, re-request it as it may be stale (maybe make this a config option?)
+    // Using priorityhighest WILL slow down the S-Meter when a command intensive client is connected to rigctl
+    // ...but not while the rig is refusing it: a read that never gets a valid
+    // value (IC-705 tuner status with no AH-705 attached, filter width on a
+    // receive-only band) would otherwise be re-asked on every status build.
+    if (func != funcNone && func != funcPowerControl && func != funcSelectVFO && func != funcDuplexMode && !ret.backedOff()
+        && (!ret.value.isValid() || ret.reply.addSecs(QRandomGenerator::global()->bounded(5,20)) <= QDateTime::currentDateTime())) {
+        addUnique(priorityImmediate,func,false,receiver);
+    }
+    return ret;
+}
+
+//Calling function MUST call unlockMutex() once finished with data
+QMultiMap<funcs,cacheItem>* cachingQueue::getCacheItems()
+{
+    mutex.lock();
+    return &cache;
+}
+
+//Calling function MUST call unlockMutex() once finished with data
+QMultiMap <queuePriority,queueItem>* cachingQueue::getQueueItems()
+{
+    mutex.lock();
+    return &queue;
+}
+
+bool cachingQueue::compare(QVariant a, QVariant b)
+{
+    bool changed = false;
+
+    if (a.isValid() && b.isValid()) {
+
+        // Compare the details
+        if (!strcmp(a.typeName(),"bool")){
+            if (a.value<bool>() != b.value<bool>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"QString")) {
+            changed=true;
+        } else if (!strcmp(a.typeName(),"uchar")) {
+            if (a.value<uchar>() != b.value<uchar>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"ushort")) {
+            if (a.value<ushort>() != b.value<ushort>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"short")) {
+            if (a.value<short>() != a.value<short>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"uint")) {
+            if (a.value<uint>() != b.value<uint>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"int")) {
+            if (a.value<int>() != b.value<int>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"double")) {
+            if (a.value<double>() != b.value<double>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"modeInfo")) {
+            if (a.value<modeInfo>().mk != b.value<modeInfo>().mk || a.value<modeInfo>().reg != b.value<modeInfo>().reg
+                || a.value<modeInfo>().filter != b.value<modeInfo>().filter || a.value<modeInfo>().data != b.value<modeInfo>().data) {
+                changed=true;
+            }
+        } else if(!strcmp(a.typeName(),"freqt")) {
+            if (a.value<freqt>().Hz != b.value<freqt>().Hz)
+                changed=true;
+        } else if(!strcmp(a.typeName(),"antennaInfo")) {
+            if (a.value<antennaInfo>().antenna != b.value<antennaInfo>().antenna || a.value<antennaInfo>().rx != b.value<antennaInfo>().rx)
+                changed=true;
+        } else if(!strcmp(a.typeName(),"rigInput")) {
+            if (a.value<rigInput>().type != b.value<rigInput>().type)
+                changed=true;
+        } else if (!strcmp(a.typeName(),"duplexMode_t")) {
+            if (a.value<duplexMode_t>() != b.value<duplexMode_t>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"toneInfo")) {
+            if (a.value<toneInfo>().tone != b.value<toneInfo>().tone)
+                changed=true;
+        } else if (!strcmp(a.typeName(),"meter_t")) {
+            if (a.value<meter_t>() != b.value<meter_t>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"vfo_t")) {
+            if (a.value<vfo_t>() != b.value<vfo_t>())
+                changed=true;
+        } else if (!strcmp(a.typeName(),"lpfhpf")) {
+            if (a.value<lpfhpf>().lpf != b.value<lpfhpf>().lpf || a.value<lpfhpf>().hpf != b.value<lpfhpf>().hpf  )
+                changed=true;
+        } else if (!strcmp(a.typeName(),"spectrumBounds")) {
+            if (a.value<spectrumBounds>().edge != b.value<spectrumBounds>().edge ||
+                    a.value<spectrumBounds>().start != b.value<spectrumBounds>().start ||
+                    a.value<spectrumBounds>().end != b.value<spectrumBounds>().end  )
+                changed=true;
+        } else if (!strcmp(a.typeName(),"centerSpanData")) {
+            if (a.value<centerSpanData>().reg != b.value<centerSpanData>().reg || a.value<centerSpanData>().freq != b.value<centerSpanData>().freq  )
+                changed=true;
+        } else if (!strcmp(a.typeName(),"rptrAccessData")) {
+            if (a.value<rptrAccessData>().accessMode != b.value<rptrAccessData>().accessMode ||
+                            a.value<rptrAccessData>().turnOffTSQL != b.value<rptrAccessData>().turnOffTSQL ||
+                            a.value<rptrAccessData>().turnOffTone != b.value<rptrAccessData>().turnOffTone)
+                changed=true;
+        } else if (!strcmp(a.typeName(),"scopeData") || !strcmp(a.typeName(),"memoryType")
+                   || !strcmp(a.typeName(), "memoryTagType") || !strcmp(a.typeName(), "memorySplitType")
+                   || !strcmp(a.typeName(),"bandStackType")  || !strcmp(a.typeName(),"timekind") || !strcmp(a.typeName(),"datekind")
+                   || !strcmp(a.typeName(),"meterkind") || !strcmp(a.typeName(),"udpPreferences")
+                   || !strcmp(a.typeName(),"scopeEdgeSetting")) {
+            changed=true; // Always different
+        } else {
+            // Maybe Try simple comparison?
+            qInfo () << "Unsupported cache value:" << a.typeName();
+        }
+    } else if (a.isValid()) {
+        changed = true;
+    }
+
+    return changed;
+}
+
