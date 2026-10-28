@@ -20,9 +20,12 @@
 #include <QUdpSocket>
 #include <QUrlQuery>
 #include <QSettings>
+#include <QHash>
+#include <QList>
 #include <memory>
 #include <atomic>
 #include "logbook.h"
+#include "userdatabase.h"
 
 #if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
 #include <QAudioDeviceInfo>
@@ -205,8 +208,11 @@ private:
                           const QByteArray &extraHeaders = QByteArray());
     void handleRestRequest(QTcpSocket *socket, const QString &method,
                            const QString &path, const QUrlQuery &query,
-                           const QByteArray &body);
-    void sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json);
+                           const QByteArray &body, const QByteArray &headerSection);
+    void sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json,
+                          const QByteArray &extraHeaders = QByteArray());
+    bool isSecureTransport(QTcpSocket *socket) const;
+    void closeUserWebSockets(const QString &userId);
     QJsonObject buildInfoJson() const;
     void sendJsonToAll(const QJsonObject &obj);
     void sendJsonTo(QWebSocket *client, const QJsonObject &obj);
@@ -285,6 +291,10 @@ private:
     quint16 webHttpsPort = 0;          // configured HTTPS/web-UI port, for the REST signpost (#69)
     QWebSocketServer *wsServer = nullptr;
     QList<QWebSocket *> wsClients;
+    QHash<QWebSocket *, QString> wsUserIds_;
+    QHash<QWebSocket *, qint64> wsSessionExpiries_;
+    QHash<QString, QList<qint64>> failedLoginTimes_;
+    UserDatabase userDatabase_;
     cachingQueue *queue = nullptr;
     rigCapabilities *rigCaps = nullptr;
     QTimer *statusTimer = nullptr;

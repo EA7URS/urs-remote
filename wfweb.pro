@@ -4,7 +4,7 @@
 #
 #-------------------------------------------------
 
-QT       += core serialport network multimedia websockets
+QT       += core serialport network multimedia websockets sql
 
 
 TARGET = wfweb
@@ -370,7 +370,8 @@ SOURCES += \
     src/webserver.cpp \
     src/wsjtxmessage.cpp \
     src/logbook.cpp \
-    src/memorystore.cpp
+    src/memorystore.cpp \
+    src/userdatabase.cpp
 
 macx:SOURCES += src/tlsproxy.cpp
 
@@ -430,6 +431,7 @@ HEADERS  += \
     include/webserver.h \
     include/wsjtxmessage.h \
     include/logbook.h \
-    include/memorystore.h
+    include/memorystore.h \
+    include/userdatabase.h
 
 macx:HEADERS += include/tlsproxy.h

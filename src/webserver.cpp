@@ -17,6 +17,8 @@
 #include <QThread>
 #include <QDateTime>
 #include <QHostInfo>
+#include <QNetworkRequest>
+#include <QUrl>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -41,6 +43,56 @@
 // power on a full-duty signal. Kept separate from freedvTxGain so the
 // classic-FreeDV ALC loop can't affect RADE.
 static constexpr float RADE_TX_GAIN = 0.4f;
+
+static QByteArray httpHeaderValue(const QByteArray &headers, const QByteArray &name)
+{
+    const QByteArray prefix = name.toLower() + ':';
+    for (const QByteArray &line : headers.split('\n')) {
+        const QByteArray trimmed = line.trimmed();
+        if (trimmed.toLower().startsWith(prefix))
+            return trimmed.mid(prefix.size()).trimmed();
+    }
+    return QByteArray();
+}
+
+static QString sessionCookieValue(const QByteArray &headers)
+{
+    const QByteArray cookies = httpHeaderValue(headers, "Cookie");
+    for (const QByteArray &entry : cookies.split(';')) {
+        const int equal = entry.indexOf('=');
+        if (equal < 0) continue;
+        if (entry.left(equal).trimmed() == "wfweb_session")
+            return QString::fromLatin1(entry.mid(equal + 1).trimmed());
+    }
+    return QString();
+}
+
+static bool sameRequestOrigin(const QByteArray &headers, bool tls)
+{
+    const QByteArray originHeader = httpHeaderValue(headers, "Origin");
+    if (originHeader.isEmpty()) return true; // non-browser clients do not send Origin
+
+    const QString scheme = tls ? QStringLiteral("https://") : QStringLiteral("http://");
+    const QUrl origin(QString::fromUtf8(originHeader));
+    const QUrl hostUrl(scheme + QString::fromUtf8(httpHeaderValue(headers, "Host")));
+    if (!origin.isValid() || !hostUrl.isValid() || origin.host().isEmpty() || hostUrl.host().isEmpty())
+        return false;
+    const int originPort = origin.port(origin.scheme() == QLatin1String("https") ? 443 : 80);
+    const int hostPort = hostUrl.port(tls ? 443 : 80);
+    return origin.scheme() == (tls ? QLatin1String("https") : QLatin1String("http"))
+            && origin.host().compare(hostUrl.host(), Qt::CaseInsensitive) == 0
+            && originPort == hostPort;
+}
+
+static QByteArray sessionSetCookie(const QString &token, bool tls, int maxAge)
+{
+    QByteArray cookie = "Set-Cookie: wfweb_session=" + token.toLatin1()
+            + "; Max-Age=" + QByteArray::number(maxAge)
+            + "; Path=/; HttpOnly; SameSite=Strict";
+    if (tls) cookie += "; Secure";
+    cookie += "\r\n";
+    return cookie;
+}
 
 // Repeater duplex direction on the wire. The browser and the REST clients
 // speak these three names; the parser only ever caches simplex / DUP- / DUP+,
@@ -378,6 +430,22 @@ void webServer::init(quint16 httpPort, quint16 wsPort)
     this->setObjectName("Web Server");
     queue = cachingQueue::getInstance();
     rigCaps = queue->getRigCaps();
+
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QString authError;
+    if (dataDir.isEmpty() || !QDir().mkpath(dataDir)) {
+        qCritical() << "Web: Cannot create local user database directory:" << dataDir;
+        webListen_ = ListenFailed;
+        restListen_ = ListenFailed;
+        return;
+    }
+    QFile::setPermissions(dataDir, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    if (!userDatabase_.open(dataDir + "/users.sqlite3", &authError)) {
+        qCritical() << "Web: Cannot initialize local user database:" << authError;
+        webListen_ = ListenFailed;
+        restListen_ = ListenFailed;
+        return;
+    }
 
     connect(queue, SIGNAL(rigCapsUpdated(rigCapabilities*)), this, SLOT(receiveRigCaps(rigCapabilities*)));
     connect(queue, SIGNAL(cacheUpdated(cacheItem)), this, SLOT(receiveCache(cacheItem)));
@@ -727,7 +795,7 @@ void webServer::onHttpReadyRead()
     int sepIdx = request.indexOf("\r\n\r\n");
     if (sepIdx < 0) return;
 
-    qDebug() << "REST headers:" << request.left(sepIdx);
+    // Do not log request headers: they can contain the HttpOnly session cookie.
 
     QByteArray headerSection = request.left(sepIdx);
     QByteArray lowerHeaders = headerSection.toLower();
@@ -776,7 +844,7 @@ void webServer::onHttpReadyRead()
 
     // REST API routing
     if (path.startsWith("/api/v1/")) {
-        handleRestRequest(socket, method, path, query, body);
+        handleRestRequest(socket, method, path, query, body, headerSection);
         return;
     }
 
@@ -794,9 +862,22 @@ void webServer::onHttpReadyRead()
         return;
     }
 
-    // Default to index.html
     if (path == "/") {
         path = "/index.html";
+    }
+    if (path == "/login") path = "/login.html";
+    if (path == "/admin") path = "/admin.html";
+
+    const AuthUser pageUser = userDatabase_.userForSession(sessionCookieValue(headerSection));
+    if (path == "/index.html" && (!pageUser.authenticated || pageUser.mustChangePassword))
+        path = "/login.html";
+    if (path == "/admin.html") {
+        if (!pageUser.authenticated || pageUser.mustChangePassword) {
+            path = "/login.html";
+        } else if (!pageUser.isAdmin) {
+            sendHttpResponse(socket, 403, "Forbidden", "text/plain", "Administrator access required");
+            return;
+        }
     }
 
     serveStaticFile(socket, path, headerSection);
@@ -809,6 +890,16 @@ void webServer::onHttpDisconnected()
         socketBuffers.remove(socket);
         socket->deleteLater();
     }
+}
+
+bool webServer::isSecureTransport(QTcpSocket *socket) const
+{
+    if (!socket) return false;
+    if (qobject_cast<QSslSocket *>(socket)) return true;
+#ifdef Q_OS_MACOS
+    if (useOpenSslProxy && socket->localPort() == internalHttpPort) return true;
+#endif
+    return false;
 }
 
 void webServer::serveStaticFile(QTcpSocket *socket, const QString &path, const QByteArray &headerSection)
@@ -950,7 +1041,8 @@ void webServer::sendHttpResponse(QTcpSocket *socket, int statusCode, const QStri
     socket->disconnectFromHost();
 }
 
-void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json)
+void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJsonObject &json,
+                                const QByteArray &extraHeaders)
 {
     QByteArray body;
     if (!json.isEmpty())
@@ -961,9 +1053,14 @@ void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJson
     case 200: statusText = "OK"; break;
     case 202: statusText = "Accepted"; break;
     case 400: statusText = "Bad Request"; break;
+    case 401: statusText = "Unauthorized"; break;
+    case 403: statusText = "Forbidden"; break;
     case 404: statusText = "Not Found"; break;
     case 405: statusText = "Method Not Allowed"; break;
+    case 409: statusText = "Conflict"; break;
+    case 429: statusText = "Too Many Requests"; break;
     case 503: statusText = "Service Unavailable"; break;
+    case 500: statusText = "Internal Server Error"; break;
     default:  statusText = "OK"; break;
     }
 
@@ -975,6 +1072,8 @@ void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJson
     response.append("Access-Control-Allow-Origin: *\r\n");
     response.append("Access-Control-Allow-Methods: GET, PUT, POST, DELETE, OPTIONS\r\n");
     response.append("Access-Control-Allow-Headers: Content-Type\r\n");
+    response.append("Cache-Control: no-store\r\n");
+    response.append(extraHeaders);
     response.append("\r\n");
     response.append(body);
 
@@ -985,7 +1084,7 @@ void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJson
 
 void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                                    const QString &path, const QUrlQuery &query,
-                                   const QByteArray &body)
+                                   const QByteArray &body, const QByteArray &headerSection)
 {
     // Normalize path: strip trailing slash
     QString p = path;
@@ -999,6 +1098,203 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         if (err.error != QJsonParseError::NoError || !doc.isObject()) return QJsonObject();
         return doc.object();
     };
+
+    const QString sessionToken = sessionCookieValue(headerSection);
+    const AuthUser currentUser = userDatabase_.userForSession(sessionToken);
+    const bool tls = isSecureTransport(socket);
+
+    if (p == "/api/v1/auth/login") {
+        if (method != "POST") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        if (!tls && !socket->peerAddress().isLoopback()) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Login requires HTTPS outside localhost."}});
+            return;
+        }
+        if (!sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+
+        const QString peer = socket->peerAddress().toString();
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        QList<qint64> &attempts = failedLoginTimes_[peer];
+        while (!attempts.isEmpty() && attempts.first() <= now - 900)
+            attempts.removeFirst();
+        if (attempts.size() >= 5) {
+            const int waitSeconds = int(qMax<qint64>(1, 900 - (now - attempts.first())));
+            sendRestResponse(socket, 429, QJsonObject{{"error", "Too many failed logins. Try again later."}},
+                             "Retry-After: " + QByteArray::number(waitSeconds) + "\r\n");
+            return;
+        }
+
+        const QJsonObject input = parseBody();
+        AuthUser user;
+        if (!userDatabase_.verifyCredentials(input.value("userId").toString(),
+                                             input.value("password").toString(), &user)) {
+            attempts.append(now);
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Invalid user ID or password."}});
+            return;
+        }
+        failedLoginTimes_.remove(peer);
+        QString token;
+        qint64 expiry = 0;
+        if (!userDatabase_.createSession(user.userId, &token, &expiry)) {
+            sendRestResponse(socket, 500, QJsonObject{{"error", "Could not create login session."}});
+            return;
+        }
+        user.sessionExpiresAt = expiry;
+        sendRestResponse(socket, 200,
+                         QJsonObject{{"userId", user.userId}, {"isAdmin", user.isAdmin},
+                                     {"mustChangePassword", user.mustChangePassword}},
+                         sessionSetCookie(token, tls, 8 * 60 * 60));
+        return;
+    }
+
+    if (p == "/api/v1/auth/me") {
+        if (method != "GET") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        } else if (!currentUser.authenticated) {
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
+        } else {
+            sendRestResponse(socket, 200,
+                             QJsonObject{{"userId", currentUser.userId},
+                                         {"isAdmin", currentUser.isAdmin},
+                                         {"mustChangePassword", currentUser.mustChangePassword}});
+        }
+        return;
+    }
+
+    if (p == "/api/v1/auth/logout") {
+        if (method != "POST") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        if (!sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+        if (currentUser.authenticated) {
+            userDatabase_.revokeSessions(currentUser.userId);
+            closeUserWebSockets(currentUser.userId);
+        }
+        sendRestResponse(socket, 200, QJsonObject{{"ok", true}}, sessionSetCookie(QString(), tls, 0));
+        return;
+    }
+
+    if (p == "/api/v1/auth/password") {
+        if (method != "POST") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        if (!currentUser.authenticated) {
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
+            return;
+        }
+        if (!sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+        const QJsonObject input = parseBody();
+        AuthUser verified;
+        const QString newPassword = input.value("newPassword").toString();
+        if (!userDatabase_.verifyCredentials(currentUser.userId,
+                                             input.value("currentPassword").toString(), &verified)) {
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Current password is incorrect."}});
+            return;
+        }
+        if (!UserDatabase::validPassword(newPassword)) {
+            sendRestResponse(socket, 400, QJsonObject{{"error", "Password must be at least 12 characters."}});
+            return;
+        }
+        QString error;
+        if (!userDatabase_.changePassword(currentUser.userId, newPassword, &error)) {
+            qWarning() << "Web auth: password update failed:" << error;
+            sendRestResponse(socket, 500, QJsonObject{{"error", "Could not update password."}});
+            return;
+        }
+        userDatabase_.revokeSessions(currentUser.userId);
+        closeUserWebSockets(currentUser.userId);
+        QString token;
+        qint64 expiry = 0;
+        if (!userDatabase_.createSession(currentUser.userId, &token, &expiry)) {
+            sendRestResponse(socket, 500, QJsonObject{{"error", "Password changed, but could not create a new session."}},
+                             sessionSetCookie(QString(), tls, 0));
+            return;
+        }
+        sendRestResponse(socket, 200,
+                         QJsonObject{{"userId", currentUser.userId},
+                                     {"isAdmin", currentUser.isAdmin},
+                                     {"mustChangePassword", false}},
+                         sessionSetCookie(token, tls, 8 * 60 * 60));
+        return;
+    }
+
+    if (p.startsWith("/api/v1/admin/")) {
+        if (!currentUser.authenticated) {
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
+            return;
+        }
+        if (currentUser.mustChangePassword) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Change the initial password first."}});
+            return;
+        }
+        if (!currentUser.isAdmin) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Administrator access required."}});
+            return;
+        }
+        if ((method == "POST" || method == "PUT" || method == "DELETE")
+                && !sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+        if (p == "/api/v1/admin/users") {
+            if (method == "GET") {
+                sendRestResponse(socket, 200, QJsonObject{{"users", userDatabase_.users()}});
+            } else if (method == "POST") {
+                const QJsonObject input = parseBody();
+                QString error;
+                if (!userDatabase_.createUser(input.value("userId").toString(),
+                                              input.value("password").toString(), false, &error)) {
+                    const int status = error == QLatin1String("That user ID already exists.") ? 409 : 400;
+                    sendRestResponse(socket, status, QJsonObject{{"error", error}});
+                    return;
+                }
+                sendRestResponse(socket, 200, QJsonObject{{"userId", UserDatabase::normalizedUserId(
+                                                               input.value("userId").toString())}});
+            } else {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            }
+            return;
+        }
+        const QString promotePrefix = QStringLiteral("/api/v1/admin/users/");
+        const QString promoteSuffix = QStringLiteral("/promote");
+        if (method == "POST" && p.startsWith(promotePrefix) && p.endsWith(promoteSuffix)) {
+            const QString userId = p.mid(promotePrefix.size(),
+                                         p.size() - promotePrefix.size() - promoteSuffix.size());
+            QString error;
+            if (!userDatabase_.promoteUser(userId, &error)) {
+                sendRestResponse(socket, error == QLatin1String("User not found.") ? 404 : 400,
+                                 QJsonObject{{"error", error}});
+                return;
+            }
+            sendRestResponse(socket, 200, QJsonObject{{"userId", UserDatabase::normalizedUserId(userId)},
+                                                      {"isAdmin", true}});
+            return;
+        }
+        sendRestResponse(socket, 404, QJsonObject{{"error", "Not found"}});
+        return;
+    }
+
+    if (!currentUser.authenticated) {
+        sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
+        return;
+    }
+    if (currentUser.mustChangePassword) {
+        sendRestResponse(socket, 403, QJsonObject{{"error", "Change the initial password before using the radio."}});
+        return;
+    }
 
     // --- Station identity: one callsign + grid for the whole server ---
     if (p == "/api/v1/station") {
@@ -1775,14 +2071,34 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
 void webServer::onWsNewConnection()
 {
     QWebSocket *pSocket = wsServer->nextPendingConnection();
+    if (!pSocket) return;
+
+    const QNetworkRequest request = pSocket->request();
+    const QUrl requestUrl = pSocket->requestUrl();
+    const bool tls = sslEnabled;
+    QByteArray requestHeaders = "Host: " + request.rawHeader("Host");
+    if (requestHeaders.endsWith("Host: "))
+        requestHeaders += requestUrl.authority().toUtf8();
+    requestHeaders += "\r\nOrigin: " + request.rawHeader("Origin")
+            + "\r\nCookie: " + request.rawHeader("Cookie") + "\r\n";
+    const AuthUser user = userDatabase_.userForSession(sessionCookieValue(requestHeaders));
+    if (!user.authenticated || user.mustChangePassword
+            || !sameRequestOrigin(requestHeaders, tls)) {
+        qInfo() << "Web: Rejected unauthenticated WebSocket from" << pSocket->peerAddress().toString();
+        pSocket->close();
+        pSocket->deleteLater();
+        return;
+    }
 
     connect(pSocket, &QWebSocket::textMessageReceived, this, &webServer::onWsTextMessage);
     connect(pSocket, &QWebSocket::binaryMessageReceived, this, &webServer::onWsBinaryMessage);
     connect(pSocket, &QWebSocket::disconnected, this, &webServer::onWsDisconnected);
 
     wsClients.append(pSocket);
+    wsUserIds_.insert(pSocket, user.userId);
+    wsSessionExpiries_.insert(pSocket, user.sessionExpiresAt);
     browserCount_ = wsClients.size();
-    qInfo() << "Web client connected:" << pSocket->peerAddress().toString();
+    qInfo() << "Web client connected:" << user.userId << pSocket->peerAddress().toString();
 
     // Send current state to new client
     sendCurrentState(pSocket);
@@ -1791,7 +2107,11 @@ void webServer::onWsNewConnection()
 void webServer::onWsTextMessage(QString message)
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
-    if (!pClient) return;
+    if (!pClient || !wsClients.contains(pClient)) return;
+    if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+        pClient->close();
+        return;
+    }
 
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8(), &parseError);
@@ -1854,13 +2174,30 @@ void webServer::onWsDisconnected()
         packetUsbTxActive = false;
         audioClients.remove(pClient);
         wsClients.removeAll(pClient);
+        wsUserIds_.remove(pClient);
+        wsSessionExpiries_.remove(pClient);
         browserCount_ = wsClients.size();
         pClient->deleteLater();
     }
 }
 
+void webServer::closeUserWebSockets(const QString &userId)
+{
+    const QList<QWebSocket *> clients = wsClients;
+    for (QWebSocket *client : clients) {
+        if (wsUserIds_.value(client) == userId)
+            client->close();
+    }
+}
+
 void webServer::onWsBinaryMessage(QByteArray message)
 {
+    QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
+    if (!pClient || !wsClients.contains(pClient)) return;
+    if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+        pClient->close();
+        return;
+    }
     if (message.size() < 6) return;
 
     quint8 msgType = static_cast<quint8>(message[0]);
@@ -4667,27 +5004,47 @@ void webServer::sendPeriodicStatus()
 void webServer::sendJsonToAll(const QJsonObject &obj)
 {
     QByteArray data = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
     for (QWebSocket *client : wsClients) {
+        if (wsSessionExpiries_.value(client, 0) <= now) {
+            client->close();
+            continue;
+        }
         client->sendTextMessage(QString::fromUtf8(data));
     }
 }
 
 void webServer::sendJsonTo(QWebSocket *client, const QJsonObject &obj)
 {
+    if (!client || !wsClients.contains(client)) return;
+    if (wsSessionExpiries_.value(client, 0) <= QDateTime::currentSecsSinceEpoch()) {
+        client->close();
+        return;
+    }
     QByteArray data = QJsonDocument(obj).toJson(QJsonDocument::Compact);
     client->sendTextMessage(QString::fromUtf8(data));
 }
 
 void webServer::sendBinaryToAll(const QByteArray &data)
 {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
     for (QWebSocket *client : wsClients) {
+        if (wsSessionExpiries_.value(client, 0) <= now) {
+            client->close();
+            continue;
+        }
         client->sendBinaryMessage(data);
     }
 }
 
 void webServer::sendBinaryToAudioClients(const QByteArray &data)
 {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
     for (QWebSocket *client : audioClients) {
+        if (!wsClients.contains(client) || wsSessionExpiries_.value(client, 0) <= now) {
+            client->close();
+            continue;
+        }
         client->sendBinaryMessage(data);
     }
 }

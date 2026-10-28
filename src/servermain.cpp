@@ -117,25 +117,11 @@ servermain::servermain(const QString settingsFile, const cmdLineOverrides& overr
             Q_ARG(quint16, effectiveWebPort), Q_ARG(quint16, effectiveWebPort + 1));
         qInfo(logSystem()) << "Web server starting on port" << effectiveWebPort;
 
-        // rigctld lives on webThread so it shares cachingQueue with webServer
-        // and pttRequested→onRigCtlPtt is an in-thread queued connection.
+        // The Hamlib protocol has no authentication, so it cannot run beside
+        // the login-protected web control interface.
         if (prefs.rigCtlEnabled) {
-            rigctl = new rigCtlD();
-            rigctl->moveToThread(webThread);
-            rigctl->setBindAddress(prefs.rigCtlBindAll
-                                   ? QHostAddress::Any
-                                   : QHostAddress::LocalHost);
-            connect(webThread, &QThread::finished, rigctl, &QObject::deleteLater);
-            connect(rigctl, &rigCtlD::pttRequested,
-                    web, &webServer::onRigCtlPtt,
-                    Qt::QueuedConnection);
-            // rigCtlClient::rigCtlClient subscribes to cachingQueue::rigCapsUpdated
-            // directly per-connection, so we don't fan out from rigCtlD.
-            QMetaObject::invokeMethod(rigctl, "startServer",
-                                      Qt::QueuedConnection,
-                                      Q_ARG(qint16, prefs.rigCtlPort));
-            qInfo(logSystem()) << "rigctld starting on port" << prefs.rigCtlPort
-                               << (prefs.rigCtlBindAll ? "(0.0.0.0)" : "(127.0.0.1)");
+            qWarning(logSystem()) << "rigctld disabled while the authenticated web interface is enabled;"
+                                     << "the Hamlib TCP protocol has no login support";
         }
     }
 
