@@ -2289,7 +2289,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
 }
 </style>
 <style>
-#transmitDeniedDialog, #usageLimitDeniedDialog, #radioAccessDialog {
+#transmitDeniedDialog, #usageLimitDeniedDialog, #usageWarningDialog, #radioAccessDialog {
     position: fixed;
     inset: auto;
     top: 50%;
@@ -2300,7 +2300,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
     max-height: min(85vh, 32rem);
     overflow: auto;
 }
-#transmitDeniedDialog::backdrop, #usageLimitDeniedDialog::backdrop, #radioAccessDialog::backdrop { background: rgba(0, 0, 0, .72); }
+#transmitDeniedDialog::backdrop, #usageLimitDeniedDialog::backdrop, #usageWarningDialog::backdrop, #radioAccessDialog::backdrop { background: rgba(0, 0, 0, .72); }
 </style>
 <!-- JS8 messenger panel styles — shared with the standalone build via
      resources/web-shared/js8-panel.css. -->
@@ -2316,6 +2316,11 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
     <h2 id="usageLimitDeniedTitle" style="margin-top:0; color:#38d1c5">Tiempo de uso agotado</h2>
     <p id="usageLimitDeniedMessage">Has agotado el tiempo autorizado para usar la radio.</p>
     <button type="button" onclick="document.getElementById('usageLimitDeniedDialog').close()">Entendido</button>
+</dialog>
+<dialog id="usageWarningDialog" aria-labelledby="usageWarningTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
+    <h2 id="usageWarningTitle" style="margin-top:0; color:#38d1c5">Tiempo de uso diario</h2>
+    <p id="usageWarningMessage">Te quedan 10 minutos de uso diario autorizado.</p>
+    <button type="button" onclick="document.getElementById('usageWarningDialog').close()">Entendido</button>
 </dialog>
 <dialog id="radioAccessDialog" aria-labelledby="radioAccessTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
     <h2 id="radioAccessTitle" style="margin-top:0; color:#38d1c5">Radio ocupada</h2>
@@ -3603,6 +3608,14 @@ function handleMessage(msg) {
     if (window.Packet && window.Packet.onMessage) window.Packet.onMessage(msg);
     if (msg.type === 'transmitDenied') {
         showTransmitDenied(msg.message);
+        return;
+    }
+    if (msg.type === 'usageWarning') {
+        var warningDialog = document.getElementById('usageWarningDialog');
+        var warningMessage = document.getElementById('usageWarningMessage');
+        if (warningMessage && msg.message) warningMessage.textContent = msg.message;
+        if (warningDialog && !warningDialog.open && typeof warningDialog.showModal === 'function') warningDialog.showModal();
+        else if (!warningDialog || typeof warningDialog.showModal !== 'function') window.alert(msg.message || 'Queda poco tiempo de uso diario autorizado.');
         return;
     }
     if (msg.type === 'usageLimitDenied') {
