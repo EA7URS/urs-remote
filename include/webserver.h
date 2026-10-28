@@ -271,6 +271,8 @@ private:
     bool isFreeDVCompatibleMode(rigMode_t mk) const;
     void sendCurrentState(QWebSocket *client);
     void checkRadioUsageLimits();
+    QString otherRadioUserConnected(const QString &userId) const;
+    void takeOverRadioConnections(const QString &userId);
     QString modeToString(modeInfo m);
     // JSON for a cached rig value, or null when the rig had nothing to report
     // (blank memory channel): Hz == 0 / a default modeInfo / filter 0xff.

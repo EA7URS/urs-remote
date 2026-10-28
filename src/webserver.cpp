@@ -1415,6 +1415,15 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                                          {"error", usage.value(QStringLiteral("message")).toString()}});
             return;
         }
+        const QString activeOtherUser = otherRadioUserConnected(currentUser.userId);
+        if (!currentUser.isAdmin && !activeOtherUser.isEmpty()) {
+            sendRestResponse(socket, 409,
+                             QJsonObject{{"code", "radio_busy"},
+                                         {"error", "La radio está siendo utilizada por otro usuario."}});
+            return;
+        }
+        if (currentUser.isAdmin && method != "GET" && !activeOtherUser.isEmpty())
+            takeOverRadioConnections(currentUser.userId);
     }
 
     // --- Station identity: one callsign + grid for the whole server ---
@@ -2204,6 +2213,14 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
 
 // --- WebSocket ---
 
+static void rejectWebSocket(QWebSocket *socket, const QJsonObject &message)
+{
+    if (!socket) return;
+    QObject::connect(socket, &QWebSocket::disconnected, socket, &QObject::deleteLater);
+    socket->sendTextMessage(QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)));
+    socket->close();
+}
+
 void webServer::onWsNewConnection()
 {
     QWebSocket *pSocket = wsServer->nextPendingConnection();
@@ -2226,9 +2243,27 @@ void webServer::onWsNewConnection()
         return;
     }
 
+    const QString activeOtherUser = otherRadioUserConnected(user.userId);
+    if (!user.isAdmin && !activeOtherUser.isEmpty()) {
+        rejectWebSocket(pSocket, QJsonObject{{"type", "radioBusy"},
+                                             {"message", "La radio está siendo utilizada por otro usuario. Inténtalo más tarde."}});
+        return;
+    }
+
     QJsonObject usage;
     QString usageError;
     const QString usageSession = userDatabase_.startUsageSession(user.userId, &usage, &usageError);
+    if (usageSession.isEmpty()) {
+        const QString message = usage.value(QStringLiteral("message")).toString().isEmpty()
+                ? (usageError.isEmpty() ? QStringLiteral("No se ha podido comprobar el tiempo autorizado. Inténtalo de nuevo.")
+                                        : usageError)
+                : usage.value(QStringLiteral("message")).toString();
+        rejectWebSocket(pSocket, QJsonObject{{"type", "usageLimitDenied"}, {"message", message}});
+        return;
+    }
+
+    if (user.isAdmin && !activeOtherUser.isEmpty())
+        takeOverRadioConnections(user.userId);
 
     connect(pSocket, &QWebSocket::textMessageReceived, this, &webServer::onWsTextMessage);
     connect(pSocket, &QWebSocket::binaryMessageReceived, this, &webServer::onWsBinaryMessage);
@@ -2239,16 +2274,6 @@ void webServer::onWsNewConnection()
     wsSessionExpiries_.insert(pSocket, user.sessionExpiresAt);
     browserCount_ = wsClients.size();
     qInfo() << "Web client connected:" << user.userId << pSocket->peerAddress().toString();
-
-    if (usageSession.isEmpty()) {
-        const QString message = usage.value(QStringLiteral("message")).toString().isEmpty()
-                ? (usageError.isEmpty() ? QStringLiteral("No se ha podido comprobar el tiempo autorizado. Inténtalo de nuevo.")
-                                        : usageError)
-                : usage.value(QStringLiteral("message")).toString();
-        sendJsonTo(pSocket, QJsonObject{{"type", "usageLimitDenied"}, {"message", message}});
-        pSocket->close();
-        return;
-    }
     wsUsageSessionIds_.insert(pSocket, usageSession);
     if (!usageQuotaTimer_) {
         usageQuotaTimer_ = new QTimer(this);
@@ -2353,6 +2378,30 @@ void webServer::closeUserWebSockets(const QString &userId)
     for (QWebSocket *client : clients) {
         if (wsUserIds_.value(client) == userId)
             client->close();
+    }
+}
+
+QString webServer::otherRadioUserConnected(const QString &userId) const
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (QWebSocket *client : wsClients) {
+        if (client && client->state() == QAbstractSocket::ConnectedState
+                && wsSessionExpiries_.value(client, 0) > now
+                && wsUserIds_.value(client) != userId)
+            return wsUserIds_.value(client);
+    }
+    return QString();
+}
+
+void webServer::takeOverRadioConnections(const QString &userId)
+{
+    const QList<QWebSocket *> clients = wsClients;
+    for (QWebSocket *client : clients) {
+        if (!client || !wsClients.contains(client) || wsUserIds_.value(client) == userId)
+            continue;
+        sendJsonTo(client, QJsonObject{{"type", "radioControlTakenOver"},
+                                       {"message", "Un administrador ha tomado el control de la radio y ha cerrado esta sesión."}});
+        client->close();
     }
 }
 
