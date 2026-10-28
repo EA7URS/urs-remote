@@ -89,9 +89,7 @@ bool validProfile(const QJsonObject &profile, bool includeEmail, QString *error)
         if (error) *error = QStringLiteral("El indicativo debe tener entre 1 y 32 letras, números, puntos, guiones o guiones bajos.");
         return false;
     }
-    const QStringList required = {QStringLiteral("firstName"), QStringLiteral("lastName"),
-                                  QStringLiteral("street"), QStringLiteral("city"),
-                                  QStringLiteral("postalCode")};
+    const QStringList required = {QStringLiteral("firstName"), QStringLiteral("lastName")};
     for (const QString &field : required) {
         const QString value = profile.value(field).toString().trimmed();
         if (value.isEmpty() || value.size() > 120) {
@@ -99,9 +97,13 @@ bool validProfile(const QJsonObject &profile, bool includeEmail, QString *error)
             return false;
         }
     }
-    if (profile.value(QStringLiteral("province")).toString().trimmed().size() > 120) {
-        if (error) *error = QStringLiteral("La provincia no puede superar 120 caracteres.");
-        return false;
+    const QStringList optionalAddress = {QStringLiteral("street"), QStringLiteral("city"),
+                                         QStringLiteral("postalCode"), QStringLiteral("province")};
+    for (const QString &field : optionalAddress) {
+        if (profile.value(field).toString().trimmed().size() > 120) {
+            if (error) *error = QStringLiteral("Los datos de dirección no pueden superar 120 caracteres por campo.");
+            return false;
+        }
     }
     if (includeEmail) {
         const QString email = profile.value(QStringLiteral("email")).toString().trimmed();

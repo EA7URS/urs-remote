@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Crear usuario</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 1rem; }
+    main { width: min(100%, 52rem); padding: 1.5rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    header, nav { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1 { margin: 0; color: #38d1c5; font-size: 1.5rem; }
+    a { color: #48cfc4; }
+    form { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .8rem; align-items: end; margin-top: 1.5rem; }
+    label { display: grid; gap: .35rem; color: #b8d0d2; }
+    input, select { width: 100%; padding: .7rem; border: 1px solid #28545b; border-radius: .45rem; background: #071114; color: #fff; font: inherit; }
+    button { padding: .7rem 1rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
+    button.secondary { border: 1px solid #28545b; background: transparent; color: #b8d0d2; }
+    #notice { min-height: 1.4rem; margin: .8rem 0; color: #ff9b8f; }
+    @media (max-width: 480px) { header { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>Crear usuario</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/admin.html">Volver al listado</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav></header>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <form id="createForm">
+    <label>Indicativo / ID<input id="newUserId" required maxlength="32" autocomplete="off"></label>
+    <label>Contraseña temporal<input id="newUserPassword" type="password" required minlength="12" autocomplete="new-password"></label>
+    <label>Nombre<input name="firstName" required maxlength="120"></label>
+    <label>Apellidos<input name="lastName" required maxlength="120"></label>
+    <label>Email<input name="email" type="email" required maxlength="254"></label>
+    <label>Calle (opcional)<input name="street" maxlength="120"></label>
+    <label>Población (opcional)<input name="city" maxlength="120"></label>
+    <label>Código postal (opcional)<input name="postalCode" maxlength="120"></label>
+    <label>Provincia (opcional)<input name="province" maxlength="120"></label>
+    <label>Perfil operativo<select name="operationalProfile"><option value="licensed">Usuario con licencia</option><option value="capture">Usuario de captación</option></select></label>
+    <button type="submit">Crear usuario</button>
+  </form>
+</main>
+<script>
+const notice = document.getElementById('notice');
+async function api(url, options = {}) {
+  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  const result = await response.json().catch(() => ({}));
+  if (response.status === 401) { location.replace('/login.html'); throw new Error('Inicia sesión para continuar.'); }
+  if (!response.ok) throw new Error(result.error || 'La solicitud ha fallado.');
+  return result;
+}
+api('/api/v1/auth/me').then(user => { if (!user.isAdmin) location.replace('/home.html'); })
+  .catch(error => { notice.textContent = error.message; });
+document.getElementById('createForm').addEventListener('submit', async event => {
+  event.preventDefault(); notice.textContent = '';
+  try {
+    const form = event.target;
+    const result = await api('/api/v1/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...Object.fromEntries(new FormData(form).entries()), userId: document.getElementById('newUserId').value, password: document.getElementById('newUserPassword').value }) });
+    location.replace('/admin-edit.html?userId=' + encodeURIComponent(result.userId) + '&created=1');
+  } catch (error) { notice.textContent = error.message; }
+});
+document.getElementById('logout').addEventListener('click', async () => {
+  try { await api('/api/v1/auth/logout', { method: 'POST' }); } finally { location.replace('/login.html'); }
+});
+</script>
+</body>
+</html>
