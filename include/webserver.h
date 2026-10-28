@@ -297,6 +297,8 @@ private:
     QHash<QWebSocket *, QString> wsUserIds_;
     QHash<QWebSocket *, QString> wsUsageSessionIds_;
     QHash<QWebSocket *, qint64> wsSessionExpiries_;
+    QHash<QString, QString> dailyUsageWarningPeriods_;
+    QHash<QString, QSet<int>> dailyUsageWarnings_;
     QTimer *usageQuotaTimer_ = nullptr;
     QHash<QString, QList<qint64>> failedLoginTimes_;
     UserDatabase userDatabase_;

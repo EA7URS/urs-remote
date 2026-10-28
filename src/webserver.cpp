@@ -2441,14 +2441,89 @@ void webServer::takeOverRadioConnections(const QString &userId)
 
 void webServer::checkRadioUsageLimits()
 {
+    const QString currentDay = QDateTime::fromSecsSinceEpoch(
+                QDateTime::currentSecsSinceEpoch(), Qt::LocalTime).date().toString(Qt::ISODate);
+    QList<QString> staleWarningUsers;
+    for (auto it = dailyUsageWarningPeriods_.cbegin(); it != dailyUsageWarningPeriods_.cend(); ++it) {
+        if (!it.value().startsWith(currentDay + QLatin1Char(':')))
+            staleWarningUsers.append(it.key());
+    }
+    for (const QString &userId : staleWarningUsers) {
+        dailyUsageWarningPeriods_.remove(userId);
+        dailyUsageWarnings_.remove(userId);
+    }
+
     const QList<QWebSocket *> clients = wsClients;
     for (QWebSocket *client : clients) {
         if (!wsClients.contains(client)) continue;
         const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(client));
-        if (usage.value(QStringLiteral("allowed")).toBool()) continue;
-        sendJsonTo(client, QJsonObject{{"type", "usageLimitDenied"},
-                                       {"message", usage.value(QStringLiteral("message")).toString()}});
-        client->close();
+        if (!usage.value(QStringLiteral("allowed")).toBool()) {
+            sendJsonTo(client, QJsonObject{{"type", "usageLimitDenied"},
+                                           {"message", usage.value(QStringLiteral("message")).toString()}});
+            client->close();
+            continue;
+        }
+
+        const QString userId = wsUserIds_.value(client);
+        const QJsonObject daily = usage.value(QStringLiteral("daily")).toObject();
+        if (daily.isEmpty() || daily.value(QStringLiteral("limitMinutes")).isNull()
+                || daily.value(QStringLiteral("remainingSeconds")).isNull()) {
+            dailyUsageWarningPeriods_.remove(userId);
+            dailyUsageWarnings_.remove(userId);
+            continue;
+        }
+
+        const qint64 remainingSeconds = daily.value(QStringLiteral("remainingSeconds")).toVariant().toLongLong();
+        const qint64 resetAt = daily.value(QStringLiteral("resetAt")).toVariant().toLongLong();
+        const QString dailyPeriod = currentDay + QLatin1Char(':') + QString::number(resetAt)
+                + QLatin1Char(':') + QString::number(usage.value(QStringLiteral("profileId")).toInt())
+                + QLatin1Char(':') + QString::number(daily.value(QStringLiteral("limitMinutes")).toInt());
+        const bool newPeriod = dailyUsageWarningPeriods_.value(userId) != dailyPeriod;
+        if (newPeriod) {
+            dailyUsageWarningPeriods_.insert(userId, dailyPeriod);
+            QSet<int> notified;
+            int warning = 0;
+            if (remainingSeconds <= 2 * 60) {
+                notified = QSet<int>{10, 5, 2};
+                warning = 2;
+            } else if (remainingSeconds <= 5 * 60) {
+                notified = QSet<int>{10, 5};
+                warning = 5;
+            } else if (remainingSeconds <= 10 * 60) {
+                notified.insert(10);
+                warning = 10;
+            }
+            dailyUsageWarnings_.insert(userId, notified);
+            if (warning > 0) {
+                const QJsonObject event{{"type", "usageWarning"},
+                                        {"minutesRemaining", warning},
+                                        {"message", QStringLiteral("Te quedan %1 minutos de uso diario autorizado.").arg(warning)}};
+                for (QWebSocket *recipient : wsClients) {
+                    if (wsUserIds_.value(recipient) == userId) sendJsonTo(recipient, event);
+                }
+            }
+            continue;
+        }
+
+        QSet<int> notified = dailyUsageWarnings_.value(userId);
+        int warning = 0;
+        for (const int minutes : {10, 5, 2}) {
+            if (remainingSeconds > minutes * 60 || notified.contains(minutes)) continue;
+            warning = minutes;
+        }
+        if (warning > 0) {
+            for (const int minutes : {10, 5, 2}) {
+                if (minutes >= warning && remainingSeconds <= minutes * 60)
+                    notified.insert(minutes);
+            }
+            dailyUsageWarnings_.insert(userId, notified);
+            const QJsonObject event{{"type", "usageWarning"},
+                                    {"minutesRemaining", warning},
+                                    {"message", QStringLiteral("Te quedan %1 minutos de uso diario autorizado.").arg(warning)}};
+            for (QWebSocket *recipient : wsClients) {
+                if (wsUserIds_.value(recipient) == userId) sendJsonTo(recipient, event);
+            }
+        }
     }
 }
 
