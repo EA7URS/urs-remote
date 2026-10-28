@@ -862,15 +862,22 @@ void webServer::onHttpReadyRead()
         return;
     }
 
+    const AuthUser pageUser = userDatabase_.userForSession(sessionCookieValue(headerSection));
     if (path == "/") {
-        path = "/index.html";
+        path = pageUser.authenticated && !pageUser.mustChangePassword
+                ? "/home.html" : "/login.html";
     }
     if (path == "/login") path = "/login.html";
+    if (path == "/home") path = "/home.html";
+    if (path == "/profile") path = "/profile.html";
     if (path == "/admin") path = "/admin.html";
 
-    const AuthUser pageUser = userDatabase_.userForSession(sessionCookieValue(headerSection));
     if (path == "/index.html" && (!pageUser.authenticated || pageUser.mustChangePassword))
         path = "/login.html";
+    if (path == "/home.html" || path == "/profile.html") {
+        if (!pageUser.authenticated || pageUser.mustChangePassword)
+            path = "/login.html";
+    }
     if (path == "/admin.html") {
         if (!pageUser.authenticated || pageUser.mustChangePassword) {
             path = "/login.html";

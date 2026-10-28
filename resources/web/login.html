@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EA7URS Remote · Sign in</title>
+  <title>EA7URS Remote · Iniciar sesión</title>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
     * { box-sizing: border-box; }
@@ -23,23 +23,23 @@
 <body>
 <main>
   <h1>EA7URS Remote</h1>
-  <p>Sign in to access the IC-7610 control panel.</p>
-  <p class="hint">Fresh test database: user ID <strong>EA7URS</strong>, password <strong>EA7URS</strong>. You must choose a new password before opening radio controls.</p>
+  <p>Inicia sesión para acceder al control del IC-7610.</p>
+  <p class="hint">Base de datos de prueba nueva: identificador <strong>EA7URS</strong>, contraseña <strong>EA7URS</strong>. Debes elegir una contraseña nueva antes de abrir los controles de la radio.</p>
   <form id="loginForm">
-    <label for="userId">User ID</label>
+    <label for="userId">Identificador</label>
     <input id="userId" name="userId" autocomplete="username" required autofocus>
-    <label for="password">Password</label>
+    <label for="password">Contraseña</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Sign in</button>
+    <button type="submit">Iniciar sesión</button>
   </form>
   <form id="changeForm" hidden>
-    <label for="currentPassword">Current password</label>
+    <label for="currentPassword">Contraseña actual</label>
     <input id="currentPassword" type="password" autocomplete="current-password" required>
-    <label for="newPassword">New password (12 characters minimum)</label>
+    <label for="newPassword">Contraseña nueva (mínimo 12 caracteres)</label>
     <input id="newPassword" type="password" autocomplete="new-password" minlength="12" required>
-    <label for="confirmPassword">Confirm new password</label>
+    <label for="confirmPassword">Confirmar contraseña nueva</label>
     <input id="confirmPassword" type="password" autocomplete="new-password" minlength="12" required>
-    <button type="submit">Change password and continue</button>
+    <button type="submit">Cambiar contraseña y continuar</button>
   </form>
   <div id="notice" role="status" aria-live="polite"></div>
 </main>
@@ -55,13 +55,13 @@ function showPasswordChange() {
   loginForm.hidden = true;
   changeForm.hidden = false;
   document.getElementById('currentPassword').focus();
-  notice.textContent = 'Choose a private password before using the radio.';
+  notice.textContent = 'Elige una contraseña privada antes de usar la radio.';
 }
 fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => {
   if (!response.ok) return;
   const user = await response.json();
   if (user.mustChangePassword) showPasswordChange();
-  else location.replace('/index.html');
+  else location.replace('/home.html');
 }).catch(() => {});
 loginForm.addEventListener('submit', async event => {
   event.preventDefault();
@@ -72,11 +72,11 @@ loginForm.addEventListener('submit', async event => {
       password: document.getElementById('password').value
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || 'Sign in failed.');
+    if (!response.ok) throw new Error(result.error || 'No se pudo iniciar sesión.');
     if (result.mustChangePassword) {
       document.getElementById('currentPassword').value = document.getElementById('password').value;
       showPasswordChange();
-    } else location.replace('/index.html');
+    } else location.replace('/home.html');
   } catch (error) { notice.textContent = error.message; }
 });
 changeForm.addEventListener('submit', async event => {
@@ -84,7 +84,7 @@ changeForm.addEventListener('submit', async event => {
   notice.textContent = '';
   const next = document.getElementById('newPassword').value;
   if (next !== document.getElementById('confirmPassword').value) {
-    notice.textContent = 'The new passwords do not match.';
+    notice.textContent = 'Las contraseñas nuevas no coinciden.';
     return;
   }
   try {
@@ -93,8 +93,8 @@ changeForm.addEventListener('submit', async event => {
       newPassword: next
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || 'Password change failed.');
-    location.replace('/index.html');
+    if (!response.ok) throw new Error(result.error || 'No se pudo cambiar la contraseña.');
+    location.replace('/home.html');
   } catch (error) { notice.textContent = error.message; }
 });
 </script>

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Inicio</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 1rem; }
+    main { width: min(100%, 46rem); padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    header, nav { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1 { margin: 0; color: #38d1c5; font-size: 1.6rem; }
+    p { color: #a9bfc2; line-height: 1.5; }
+    #user { color: #48cfc4; font-family: monospace; }
+    nav { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); margin-top: 1.5rem; }
+    nav a { min-height: 5rem; display: flex; align-items: center; padding: 1rem; border: 1px solid #28545b; border-radius: .6rem; color: #e5f2f2; background: #10272c; font-weight: 650; text-decoration: none; }
+    nav a:hover, nav a:focus-visible { border-color: #38d1c5; background: #15343a; }
+    button { margin-top: 1.5rem; padding: .65rem 1rem; border: 1px solid #28545b; border-radius: .45rem; background: transparent; color: #b8d0d2; font: inherit; cursor: pointer; }
+    #notice { color: #ff9b8f; }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>EA7URS Remote</h1><span id="user"></span></header>
+  <p>Elige qué quieres hacer.</p>
+  <nav aria-label="Opciones de la cuenta">
+    <a id="adminLink" href="/admin.html" hidden>Administración de usuarios</a>
+    <a href="/profile.html">Administrar perfil</a>
+    <a href="/index.html">Ir a la radio</a>
+  </nav>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <button id="logout" type="button">Cerrar sesión</button>
+</main>
+<script>
+fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => {
+  if (!response.ok) { location.replace('/login.html'); return; }
+  const user = await response.json();
+  document.getElementById('user').textContent = user.userId;
+  document.getElementById('adminLink').hidden = !user.isAdmin;
+}).catch(() => location.replace('/login.html'));
+document.getElementById('logout').addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/v1/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    if (!response.ok) throw new Error('No se pudo cerrar la sesión.');
+    location.replace('/login.html');
+  } catch (error) {
+    document.getElementById('notice').textContent = error.message;
+  }
+});
+</script>
+</body>
+</html>

@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EA7URS Remote · User administration</title>
+  <title>EA7URS Remote · Administración de usuarios</title>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
     * { box-sizing: border-box; }
@@ -26,17 +26,17 @@
 <body>
 <main>
   <header>
-    <h1>User administration</h1>
-    <nav><a href="/index.html">Radio</a> · <button id="logout" class="secondary" type="button">Sign out</button></nav>
+    <h1>Administración de usuarios</h1>
+    <nav><a href="/home.html">Inicio</a> · <a href="/index.html">Ir a la radio</a> · <button id="logout" class="secondary" type="button">Cerrar sesión</button></nav>
   </header>
   <p id="notice" role="status" aria-live="polite"></p>
-  <h2>Create user</h2>
+  <h2>Crear usuario</h2>
   <form id="createForm">
-    <label>User ID<input id="newUserId" required maxlength="32" autocomplete="off"></label>
-    <label>Temporary password<input id="newUserPassword" type="password" required minlength="12" autocomplete="new-password"></label>
-    <button type="submit">Create user</button>
+    <label>Identificador<input id="newUserId" required maxlength="32" autocomplete="off"></label>
+    <label>Contraseña temporal<input id="newUserPassword" type="password" required minlength="12" autocomplete="new-password"></label>
+    <button type="submit">Crear usuario</button>
   </form>
-  <h2>Users</h2>
+  <h2>Usuarios</h2>
   <div id="users" aria-live="polite"></div>
 </main>
 <script>
@@ -44,8 +44,8 @@ const notice = document.getElementById('notice');
 async function api(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
   const result = await response.json().catch(() => ({}));
-  if (response.status === 401) { location.replace('/login.html'); throw new Error('Please sign in.'); }
-  if (!response.ok) throw new Error(result.error || 'Request failed.');
+  if (response.status === 401) { location.replace('/login.html'); throw new Error('Inicia sesión para continuar.'); }
+  if (!response.ok) throw new Error(result.error || 'La solicitud ha fallado.');
   return result;
 }
 async function loadUsers() {
@@ -56,20 +56,20 @@ async function loadUsers() {
     const row = document.createElement('div');
     row.className = 'user-row';
     const label = document.createElement('span');
-    label.textContent = user.userId + (user.mustChangePassword ? ' · password change required' : '');
+    label.textContent = user.userId + (user.mustChangePassword ? ' · debe cambiar la contraseña' : '');
     const role = document.createElement('span');
     role.className = 'role';
-    role.textContent = user.isAdmin ? 'Admin' : 'User';
+    role.textContent = user.isAdmin ? 'Administrador' : 'Usuario';
     row.append(label, role);
     if (!user.isAdmin) {
       const promote = document.createElement('button');
       promote.type = 'button';
-      promote.textContent = 'Promote to admin';
+      promote.textContent = 'Promover a administrador';
       promote.addEventListener('click', async () => {
         try {
           await api('/api/v1/admin/users/' + encodeURIComponent(user.userId) + '/promote', { method: 'POST' });
           await loadUsers();
-          notice.textContent = user.userId + ' is now an admin.';
+          notice.textContent = user.userId + ' ahora es administrador.';
         } catch (error) { notice.textContent = error.message; }
       });
       row.append(promote);
@@ -78,7 +78,7 @@ async function loadUsers() {
   }
 }
 api('/api/v1/auth/me').then(user => {
-  if (!user.isAdmin) location.replace('/index.html');
+  if (!user.isAdmin) location.replace('/home.html');
   else loadUsers().catch(error => { notice.textContent = error.message; });
 }).catch(error => { notice.textContent = error.message; });
 document.getElementById('createForm').addEventListener('submit', async event => {
@@ -92,7 +92,7 @@ document.getElementById('createForm').addEventListener('submit', async event => 
     });
     event.target.reset();
     await loadUsers();
-    notice.textContent = 'Created user ' + result.userId + '.';
+    notice.textContent = 'Se ha creado el usuario ' + result.userId + '.';
   } catch (error) { notice.textContent = error.message; }
 });
 document.getElementById('logout').addEventListener('click', async () => {
