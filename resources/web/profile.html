@@ -17,6 +17,10 @@
     input { width: 100%; padding: .75rem; border: 1px solid #28545b; border-radius: .45rem; background: #071114; color: #fff; font: inherit; }
     button { width: 100%; margin-top: 1.25rem; padding: .8rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
     #notice { min-height: 1.4rem; margin-top: .8rem; color: #ff9b8f; }
+    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-top: 1rem; }
+    .quota-card { padding: 1rem; border: 1px solid #17434b; border-radius: .65rem; background: #09171b; }
+    .quota-card h3 { margin: 0 0 .65rem; color: #38d1c5; }
+    .quota-card p { margin: .35rem 0; }
   </style>
 </head>
 <body>
@@ -44,6 +48,11 @@
     <p>Perfil operativo: <strong id="operationalProfile"></strong></p>
     <button type="submit">Guardar datos del perfil</button>
   </form>
+  <section aria-labelledby="usageTitle">
+    <h2 id="usageTitle">Tiempos de uso autorizados</h2>
+    <p id="usageProfileName">Consultando los límites de uso…</p>
+    <div id="usagePeriods" class="quota-grid" aria-live="polite"></div>
+  </section>
   <hr>
   <form id="passwordForm">
     <label for="currentPassword">Contraseña actual</label>
@@ -58,6 +67,38 @@
 </main>
 <script>
 const notice = document.getElementById('notice');
+const periodNames = { daily: 'Diario', weekly: 'Semanal', monthly: 'Mensual' };
+function formatDuration(seconds) {
+  if (seconds == null) return 'Sin límite';
+  let remaining = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(remaining / 3600); remaining %= 3600;
+  const minutes = Math.floor(remaining / 60); const secs = remaining % 60;
+  const parts = [];
+  if (hours) parts.push(hours + ' h');
+  if (minutes) parts.push(minutes + ' min');
+  if (secs && !hours) parts.push(secs + ' s');
+  return parts.length ? parts.join(' ') : '0 min';
+}
+function renderUsage(usage, profileName) {
+  document.getElementById('usageProfileName').textContent = 'Perfil de tiempo: ' + (profileName || usage.profileName || 'Sin límite');
+  const target = document.getElementById('usagePeriods'); target.replaceChildren();
+  const available = Object.keys(periodNames).filter(period => usage[period]);
+  if (!available.length) {
+    const message = document.createElement('p'); message.textContent = 'No tienes límites de uso asignados.'; target.append(message); return;
+  }
+  for (const period of available) {
+    const item = usage[period]; const card = document.createElement('article'); card.className = 'quota-card';
+    const title = document.createElement('h3'); title.textContent = periodNames[period]; card.append(title);
+    for (const [label, value] of [
+      ['Límite', item.limitMinutes == null ? 'Sin límite' : formatDuration(item.limitMinutes * 60)],
+      ['Usado', formatDuration(item.usedSeconds)],
+      ['Restante', formatDuration(item.remainingSeconds)]
+    ]) {
+      const line = document.createElement('p'); line.textContent = label + ': ' + value; card.append(line);
+    }
+    target.append(card);
+  }
+}
 fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => {
   if (!response.ok) { location.replace('/login.html'); return; }
   const user = await response.json();
@@ -70,6 +111,7 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   }
   document.getElementById('operationalProfile').textContent = profile.operationalProfile === 'capture'
     ? 'Usuario de captación (sin transmisión)' : 'Usuario con licencia';
+  renderUsage(user.usage || {}, user.usageProfileName);
 }).catch(() => location.replace('/login.html'));
 document.getElementById('profileForm').addEventListener('submit', async event => {
   event.preventDefault();

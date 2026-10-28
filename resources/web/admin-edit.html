@@ -18,6 +18,11 @@
     button { padding: .7rem 1rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
     button.secondary { border: 1px solid #28545b; background: transparent; color: #b8d0d2; }
     #notice { min-height: 1.4rem; margin: .8rem 0; color: #ff9b8f; }
+    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+    .quota-card { padding: 1rem; border: 1px solid #17434b; border-radius: .65rem; background: #09171b; }
+    .quota-card h3 { margin: 0 0 .65rem; color: #38d1c5; }
+    .quota-card p { margin: .35rem 0; color: #b8d0d2; }
+    .quota-card button { margin-top: .6rem; }
     @media (max-width: 480px) { header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
@@ -38,11 +43,62 @@
     <label>Tiempos de uso autorizados<select name="usageProfileId" id="usageProfileId"><option value="">Sin límite</option></select></label>
     <button type="submit">Guardar cambios</button>
   </form>
+  <section id="usageSection" aria-labelledby="usageTitle" hidden>
+    <h2 id="usageTitle">Tiempos de uso autorizados</h2>
+    <p id="usageProfileName"></p>
+    <div id="usagePeriods" class="quota-grid" aria-live="polite"></div>
+  </section>
 </main>
 <script>
 const notice = document.getElementById('notice');
 const params = new URLSearchParams(location.search);
-const userId = params.get('userId');
+let selectedUserId = params.get('userId');
+const periodNames = { daily: 'Diario', weekly: 'Semanal', monthly: 'Mensual' };
+function formatDuration(seconds) {
+  if (seconds == null) return 'Sin límite';
+  let remaining = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(remaining / 3600); remaining %= 3600;
+  const minutes = Math.floor(remaining / 60); const secs = remaining % 60;
+  const parts = [];
+  if (hours) parts.push(hours + ' h');
+  if (minutes) parts.push(minutes + ' min');
+  if (secs && !hours) parts.push(secs + ' s');
+  return parts.length ? parts.join(' ') : '0 min';
+}
+function renderUsage(usage) {
+  document.getElementById('usageProfileName').textContent = 'Perfil asignado: ' + (usage.profileName || 'Sin límite');
+  const target = document.getElementById('usagePeriods'); target.replaceChildren();
+  const available = Object.keys(periodNames).filter(period => usage[period]);
+  if (!available.length) {
+    const message = document.createElement('p'); message.className = 'muted'; message.textContent = 'Este usuario no tiene límites de uso asignados.'; target.append(message); return;
+  }
+  for (const period of available) {
+    const item = usage[period]; const card = document.createElement('article'); card.className = 'quota-card';
+    const title = document.createElement('h3'); title.textContent = periodNames[period]; card.append(title);
+    for (const [label, value] of [
+      ['Límite', item.limitMinutes == null ? 'Sin límite' : formatDuration(item.limitMinutes * 60)],
+      ['Usado', formatDuration(item.usedSeconds)],
+      ['Restante', formatDuration(item.remainingSeconds)]
+    ]) {
+      const line = document.createElement('p'); line.textContent = label + ': ' + value; card.append(line);
+    }
+    if (item.limitMinutes != null) {
+      const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reiniciar límite ' + periodNames[period].toLowerCase();
+      reset.addEventListener('click', async () => {
+        if (!window.confirm('¿Reiniciar el uso ' + periodNames[period].toLowerCase() + ' de ' + selectedUserId + '? Los otros periodos no cambiarán.')) return;
+        reset.disabled = true; notice.textContent = '';
+        try {
+          const result = await api('/api/v1/admin/users/' + encodeURIComponent(selectedUserId) + '/usage-reset', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ period })
+          });
+          renderUsage(result.usage); notice.textContent = 'Se ha reiniciado el límite ' + periodNames[period].toLowerCase() + '.';
+        } catch (error) { notice.textContent = error.message; reset.disabled = false; }
+      });
+      card.append(reset);
+    }
+    target.append(card);
+  }
+}
 async function api(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
   const result = await response.json().catch(() => ({}));
@@ -52,10 +108,13 @@ async function api(url, options = {}) {
 }
 api('/api/v1/auth/me').then(async user => {
   if (!user.isAdmin) { location.replace('/home.html'); return; }
-  if (!userId) throw new Error('Falta el indicativo del usuario.');
+  if (!selectedUserId) throw new Error('Falta el indicativo del usuario.');
   const result = await api('/api/v1/admin/users');
-  const selected = result.users.find(item => item.userId === userId);
+  const selected = result.users.find(item => item.userId === selectedUserId);
   if (!selected) throw new Error('No se ha encontrado ese usuario.');
+  const usageResult = await api('/api/v1/admin/users/' + encodeURIComponent(selectedUserId) + '/usage');
+  renderUsage(usageResult.usage);
+  document.getElementById('usageSection').hidden = false;
   const profiles = await api('/api/v1/admin/usage-profiles');
   for (const profile of profiles.profiles) {
     const option = document.createElement('option'); option.value = profile.profileId; option.textContent = profile.name;
@@ -78,9 +137,12 @@ document.getElementById('editForm').addEventListener('submit', async event => {
     const result = await api('/api/v1/admin/users/' + encodeURIComponent(form.dataset.originalId), {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
     });
+    selectedUserId = result.userId;
     form.dataset.originalId = result.userId;
     notice.textContent = 'Se ha actualizado ' + result.userId + '.';
     history.replaceState(null, '', '/admin-edit.html?userId=' + encodeURIComponent(result.userId));
+    const usageResult = await api('/api/v1/admin/users/' + encodeURIComponent(selectedUserId) + '/usage');
+    renderUsage(usageResult.usage);
   } catch (error) { notice.textContent = error.message; }
 });
 document.getElementById('logout').addEventListener('click', async () => {
