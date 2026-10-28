@@ -270,6 +270,7 @@ private:
     void disableFreeDV();
     bool isFreeDVCompatibleMode(rigMode_t mk) const;
     void sendCurrentState(QWebSocket *client);
+    void checkRadioUsageLimits();
     QString modeToString(modeInfo m);
     // JSON for a cached rig value, or null when the rig had nothing to report
     // (blank memory channel): Hz == 0 / a default modeInfo / filter 0xff.
@@ -292,7 +293,9 @@ private:
     QWebSocketServer *wsServer = nullptr;
     QList<QWebSocket *> wsClients;
     QHash<QWebSocket *, QString> wsUserIds_;
+    QHash<QWebSocket *, QString> wsUsageSessionIds_;
     QHash<QWebSocket *, qint64> wsSessionExpiries_;
+    QTimer *usageQuotaTimer_ = nullptr;
     QHash<QString, QList<qint64>> failedLoginTimes_;
     UserDatabase userDatabase_;
     cachingQueue *queue = nullptr;

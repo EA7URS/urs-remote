@@ -199,6 +199,8 @@ webServer::webServer(QObject *parent) :
 webServer::~webServer()
 {
     wsjtxSendClose();
+    for (auto it = wsUsageSessionIds_.cbegin(); it != wsUsageSessionIds_.cend(); ++it)
+        userDatabase_.endUsageSession(it.value());
     // A digital over cut short by the shutdown: put the compressor back.
     // Same dispatch-before-close guarantee as the DATA MOD OFF restore below.
     releaseCompressorHold();
@@ -879,7 +881,7 @@ void webServer::onHttpReadyRead()
             path = "/login.html";
     }
     const bool adminPage = path == "/admin.html" || path == "/admin-create.html"
-            || path == "/admin-edit.html";
+            || path == "/admin-edit.html" || path == "/usage-profiles.html";
     if (adminPage) {
         if (!pageUser.authenticated || pageUser.mustChangePassword) {
             path = "/login.html";
@@ -1063,6 +1065,7 @@ void webServer::sendRestResponse(QTcpSocket *socket, int statusCode, const QJson
     QString statusText;
     switch (statusCode) {
     case 200: statusText = "OK"; break;
+    case 201: statusText = "Created"; break;
     case 202: statusText = "Accepted"; break;
     case 400: statusText = "Bad Request"; break;
     case 401: statusText = "Unauthorized"; break;
@@ -1160,6 +1163,8 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         sendRestResponse(socket, 200,
                          QJsonObject{{"userId", user.userId}, {"isAdmin", user.isAdmin},
                                      {"operationalProfile", user.operationalProfile},
+                                     {"usageProfileId", user.usageProfileId > 0 ? QJsonValue(user.usageProfileId) : QJsonValue(QJsonValue::Null)},
+                                     {"usageProfileName", user.usageProfileName},
                                      {"mustChangePassword", user.mustChangePassword}},
                          sessionSetCookie(token, tls, 8 * 60 * 60));
         return;
@@ -1176,6 +1181,9 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                                          {"isAdmin", currentUser.isAdmin},
                                          {"operationalProfile", currentUser.operationalProfile},
                                          {"canTransmit", currentUser.operationalProfile == QLatin1String("licensed")},
+                                         {"usageProfileId", currentUser.usageProfileId > 0 ? QJsonValue(currentUser.usageProfileId) : QJsonValue(QJsonValue::Null)},
+                                         {"usageProfileName", currentUser.usageProfileName.isEmpty() ? QStringLiteral("Sin límite") : currentUser.usageProfileName},
+                                         {"usage", userDatabase_.usageStatus(currentUser.userId)},
                                          {"mustChangePassword", currentUser.mustChangePassword},
                                          {"profile", userDatabase_.profile(currentUser.userId)}});
         }
@@ -1292,6 +1300,51 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
             return;
         }
+        if (p == "/api/v1/admin/usage-profiles") {
+            if (method == "GET") {
+                sendRestResponse(socket, 200, QJsonObject{{"profiles", userDatabase_.usageProfiles()}});
+            } else if (method == "POST") {
+                qint64 profileId = 0;
+                QString error;
+                if (!userDatabase_.createUsageProfile(parseBody(), &profileId, &error)) {
+                    sendRestResponse(socket, 400, QJsonObject{{"error", error}});
+                    return;
+                }
+                sendRestResponse(socket, 201, QJsonObject{{"profileId", profileId}});
+            } else {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            }
+            return;
+        }
+        const QString usageProfilePrefix = QStringLiteral("/api/v1/admin/usage-profiles/");
+        if (p.startsWith(usageProfilePrefix)) {
+            bool idOk = false;
+            const qint64 profileId = p.mid(usageProfilePrefix.size()).toLongLong(&idOk);
+            if (!idOk || profileId <= 0) {
+                sendRestResponse(socket, 400, QJsonObject{{"error", "Invalid usage profile ID."}});
+                return;
+            }
+            QString error;
+            if (method == "PUT") {
+                if (!userDatabase_.updateUsageProfile(profileId, parseBody(), &error)) {
+                    sendRestResponse(socket, error == QLatin1String("No se encontró el perfil.") ? 404 : 400,
+                                     QJsonObject{{"error", error}});
+                    return;
+                }
+                sendRestResponse(socket, 200, QJsonObject{{"profileId", profileId}});
+            } else if (method == "DELETE") {
+                if (!userDatabase_.deleteUsageProfile(profileId, &error)) {
+                    const int status = error == QLatin1String("No se puede eliminar un perfil asignado a usuarios.")
+                            ? 409 : 404;
+                    sendRestResponse(socket, status, QJsonObject{{"error", error}});
+                    return;
+                }
+                sendRestResponse(socket, 200, QJsonObject{{"profileId", profileId}});
+            } else {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            }
+            return;
+        }
         if (p == "/api/v1/admin/users") {
             if (method == "GET") {
                 sendRestResponse(socket, 200, QJsonObject{{"users", userDatabase_.users()}});
@@ -1352,6 +1405,16 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
     if (currentUser.mustChangePassword) {
         sendRestResponse(socket, 403, QJsonObject{{"error", "Change the initial password before using the radio."}});
         return;
+    }
+
+    if (p.startsWith("/api/v1/radio/")) {
+        const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
+        if (!usage.value(QStringLiteral("allowed")).toBool()) {
+            sendRestResponse(socket, 403,
+                             QJsonObject{{"code", "usage_limit_exceeded"},
+                                         {"error", usage.value(QStringLiteral("message")).toString()}});
+            return;
+        }
     }
 
     // --- Station identity: one callsign + grid for the whole server ---
@@ -2163,6 +2226,10 @@ void webServer::onWsNewConnection()
         return;
     }
 
+    QJsonObject usage;
+    QString usageError;
+    const QString usageSession = userDatabase_.startUsageSession(user.userId, &usage, &usageError);
+
     connect(pSocket, &QWebSocket::textMessageReceived, this, &webServer::onWsTextMessage);
     connect(pSocket, &QWebSocket::binaryMessageReceived, this, &webServer::onWsBinaryMessage);
     connect(pSocket, &QWebSocket::disconnected, this, &webServer::onWsDisconnected);
@@ -2173,6 +2240,23 @@ void webServer::onWsNewConnection()
     browserCount_ = wsClients.size();
     qInfo() << "Web client connected:" << user.userId << pSocket->peerAddress().toString();
 
+    if (usageSession.isEmpty()) {
+        const QString message = usage.value(QStringLiteral("message")).toString().isEmpty()
+                ? (usageError.isEmpty() ? QStringLiteral("No se ha podido comprobar el tiempo autorizado. Inténtalo de nuevo.")
+                                        : usageError)
+                : usage.value(QStringLiteral("message")).toString();
+        sendJsonTo(pSocket, QJsonObject{{"type", "usageLimitDenied"}, {"message", message}});
+        pSocket->close();
+        return;
+    }
+    wsUsageSessionIds_.insert(pSocket, usageSession);
+    if (!usageQuotaTimer_) {
+        usageQuotaTimer_ = new QTimer(this);
+        usageQuotaTimer_->setInterval(1000);
+        connect(usageQuotaTimer_, &QTimer::timeout, this, &webServer::checkRadioUsageLimits);
+    }
+    if (!usageQuotaTimer_->isActive()) usageQuotaTimer_->start();
+
     // Send current state to new client
     sendCurrentState(pSocket);
 }
@@ -2182,6 +2266,13 @@ void webServer::onWsTextMessage(QString message)
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
     if (!pClient || !wsClients.contains(pClient)) return;
     if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+        pClient->close();
+        return;
+    }
+    const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
+    if (!usage.value(QStringLiteral("allowed")).toBool()) {
+        sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
+                                        {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();
         return;
     }
@@ -2226,6 +2317,7 @@ void webServer::onWsDisconnected()
             micActiveClient = nullptr;
             qInfo() << "Web: Restored DATA MOD OFF setting (client disconnected)";
         }
+        userDatabase_.endUsageSession(wsUsageSessionIds_.take(pClient));
         // Stop FreeDV/RADE TX drain to prevent ALSA underruns
         if (freedvTxActive) {
             freedvTxBuffer.clear();
@@ -2249,6 +2341,7 @@ void webServer::onWsDisconnected()
         wsClients.removeAll(pClient);
         wsUserIds_.remove(pClient);
         wsSessionExpiries_.remove(pClient);
+        if (wsClients.isEmpty() && usageQuotaTimer_) usageQuotaTimer_->stop();
         browserCount_ = wsClients.size();
         pClient->deleteLater();
     }
@@ -2263,11 +2356,31 @@ void webServer::closeUserWebSockets(const QString &userId)
     }
 }
 
+void webServer::checkRadioUsageLimits()
+{
+    const QList<QWebSocket *> clients = wsClients;
+    for (QWebSocket *client : clients) {
+        if (!wsClients.contains(client)) continue;
+        const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(client));
+        if (usage.value(QStringLiteral("allowed")).toBool()) continue;
+        sendJsonTo(client, QJsonObject{{"type", "usageLimitDenied"},
+                                       {"message", usage.value(QStringLiteral("message")).toString()}});
+        client->close();
+    }
+}
+
 void webServer::onWsBinaryMessage(QByteArray message)
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
     if (!pClient || !wsClients.contains(pClient)) return;
     if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+        pClient->close();
+        return;
+    }
+    const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
+    if (!usage.value(QStringLiteral("allowed")).toBool()) {
+        sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
+                                        {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();
         return;
     }
@@ -4288,6 +4401,7 @@ void webServer::sendCurrentState(QWebSocket *client)
     QJsonObject info = buildInfoJson();
     info["type"] = "rigInfo";
     info["canTransmit"] = userDatabase_.canTransmit(wsUserIds_.value(client));
+    info["usage"] = userDatabase_.usageStatus(wsUserIds_.value(client));
     if (!audioConfigured && !audioErrorReason.isEmpty()) {
         info["audioError"] = audioErrorReason;
     }
