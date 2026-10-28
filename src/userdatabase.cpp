@@ -2,6 +2,7 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDate>
 #include <QFile>
 #include <QJsonObject>
 #include <QRandomGenerator>
@@ -9,7 +10,10 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSet>
+#include <QTime>
+#include <QUuid>
 #include <QVariant>
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -78,6 +82,29 @@ bool constantTimeEqual(const QByteArray &left, const QByteArray &right)
 QString queryError(const QSqlQuery &query)
 {
     return query.lastError().text();
+}
+
+bool validatedUsageLimit(const QJsonObject &profile, const QString &field,
+                         qint64 maximumMinutes, qint64 *minutes, QString *error)
+{
+    const QJsonValue value = profile.value(field);
+    if (value.isUndefined() || value.isNull()
+            || (value.isString() && value.toString().trimmed().isEmpty())) {
+        if (minutes) *minutes = -1;
+        return true;
+    }
+    if (!value.isDouble()) {
+        if (error) *error = QStringLiteral("Los límites deben ser cantidades de minutos o quedar vacíos.");
+        return false;
+    }
+    const double number = value.toDouble();
+    if (!std::isfinite(number) || std::floor(number) != number || number < 1
+            || number > maximumMinutes) {
+        if (error) *error = QStringLiteral("Uno de los límites de tiempo no está dentro del intervalo permitido.");
+        return false;
+    }
+    if (minutes) *minutes = static_cast<qint64>(number);
+    return true;
 }
 
 bool validProfile(const QJsonObject &profile, bool includeEmail, QString *error)
@@ -168,12 +195,25 @@ bool UserDatabase::createSchema(QString *error)
 {
     QSqlQuery query(db_);
     if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS usage_profiles ("
+            "profile_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "name TEXT NOT NULL COLLATE NOCASE UNIQUE, "
+            "daily_limit_minutes INTEGER, "
+            "weekly_limit_minutes INTEGER, "
+            "monthly_limit_minutes INTEGER, "
+            "created_at INTEGER NOT NULL, "
+            "updated_at INTEGER NOT NULL)"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
+    if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS users ("
             "user_id TEXT PRIMARY KEY COLLATE NOCASE, "
             "password_hash TEXT NOT NULL, "
             "is_admin INTEGER NOT NULL DEFAULT 0, "
             "must_change_password INTEGER NOT NULL DEFAULT 0, "
             "operational_profile TEXT NOT NULL DEFAULT 'licensed', "
+            "usage_profile_id INTEGER REFERENCES usage_profiles(profile_id) ON DELETE SET NULL, "
             "first_name TEXT NOT NULL DEFAULT '', "
             "last_name TEXT NOT NULL DEFAULT '', "
             "email TEXT NOT NULL DEFAULT '', "
@@ -193,8 +233,23 @@ bool UserDatabase::createSchema(QString *error)
         if (error) *error = queryError(query);
         return false;
     }
+    if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS radio_usage_sessions ("
+            "session_id TEXT PRIMARY KEY, "
+            "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, "
+            "started_at INTEGER NOT NULL, "
+            "ended_at INTEGER)"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id)"));
-    return migrateSchema(error);
+    query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_usage_user_start ON radio_usage_sessions(user_id, started_at)"));
+    if (!migrateSchema(error)) return false;
+    if (!query.exec(QStringLiteral("UPDATE radio_usage_sessions SET ended_at = started_at WHERE ended_at IS NULL"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
+    return true;
 }
 
 bool UserDatabase::migrateSchema(QString *error)
@@ -210,6 +265,7 @@ bool UserDatabase::migrateSchema(QString *error)
 
     const QList<QPair<QString, QString>> additions = {
         {QStringLiteral("operational_profile"), QStringLiteral("TEXT NOT NULL DEFAULT 'licensed'")},
+        {QStringLiteral("usage_profile_id"), QStringLiteral("INTEGER REFERENCES usage_profiles(profile_id) ON DELETE SET NULL")},
         {QStringLiteral("first_name"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
         {QStringLiteral("last_name"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
         {QStringLiteral("email"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
@@ -332,7 +388,9 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
 {
     const QString id = normalizedUserId(userId);
     QSqlQuery query(db_);
-    query.prepare(QStringLiteral("SELECT user_id, password_hash, is_admin, must_change_password, operational_profile "
+    query.prepare(QStringLiteral("SELECT user_id, password_hash, is_admin, must_change_password, operational_profile, "
+                                 "usage_profile_id, COALESCE((SELECT name FROM usage_profiles "
+                                 "WHERE profile_id = users.usage_profile_id), '') "
                                  "FROM users WHERE user_id = ?"));
     query.addBindValue(id);
     if (!query.exec()) return false;
@@ -350,6 +408,8 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
         user->isAdmin = query.value(2).toInt() != 0;
         user->mustChangePassword = query.value(3).toInt() != 0;
         user->operationalProfile = query.value(4).toString();
+        user->usageProfileId = query.value(5).toLongLong();
+        user->usageProfileName = query.value(6).toString();
         user->authenticated = true;
     }
     return true;
@@ -387,8 +447,10 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     if (token.isEmpty()) return user;
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
-        "SELECT u.user_id, u.is_admin, u.must_change_password, s.expires_at, u.operational_profile "
+        "SELECT u.user_id, u.is_admin, u.must_change_password, s.expires_at, u.operational_profile, "
+        "u.usage_profile_id, COALESCE(p.name, '') "
         "FROM sessions s JOIN users u ON u.user_id = s.user_id "
+        "LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
         "WHERE s.token_hash = ? AND s.expires_at > ?"));
     query.addBindValue(tokenHash(token));
     query.addBindValue(QDateTime::currentSecsSinceEpoch());
@@ -398,6 +460,8 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     user.mustChangePassword = query.value(2).toInt() != 0;
     user.sessionExpiresAt = query.value(3).toLongLong();
     user.operationalProfile = query.value(4).toString();
+    user.usageProfileId = query.value(5).toLongLong();
+    user.usageProfileName = query.value(6).toString();
     user.authenticated = true;
     return user;
 }
@@ -420,6 +484,9 @@ bool UserDatabase::createUser(const QJsonObject &profileData, const QString &pas
                               bool makeAdmin, QString *error)
 {
     if (!validProfile(profileData, true, error)) return false;
+    qint64 usageProfileId = 0;
+    if (!validateUsageAssignment(profileData.value(QStringLiteral("usageProfileId")),
+                                 &usageProfileId, error)) return false;
     const QString id = normalizedUserId(profileData.value(QStringLiteral("userId")).toString());
     if (!validPassword(password)) {
         if (error) *error = QStringLiteral("Password must be at least 12 characters and no more than 256 UTF-8 bytes.");
@@ -427,14 +494,15 @@ bool UserDatabase::createUser(const QJsonObject &profileData, const QString &pas
     }
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
-        "INSERT INTO users(user_id, password_hash, is_admin, must_change_password, operational_profile, "
+        "INSERT INTO users(user_id, password_hash, is_admin, must_change_password, operational_profile, usage_profile_id, "
         "first_name, last_name, email, street, city, postal_code, province, created_at) "
-        "VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        "VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(id);
     query.addBindValue(passwordHash(password));
     query.addBindValue(makeAdmin ? 1 : 0);
     const QString role = profileData.value(QStringLiteral("operationalProfile")).toString();
     query.addBindValue(role.isEmpty() ? QStringLiteral("licensed") : role);
+    query.addBindValue(usageProfileId > 0 ? QVariant(usageProfileId) : QVariant());
     query.addBindValue(profileData.value(QStringLiteral("firstName")).toString().trimmed());
     query.addBindValue(profileData.value(QStringLiteral("lastName")).toString().trimmed());
     query.addBindValue(profileData.value(QStringLiteral("email")).toString().trimmed());
@@ -468,9 +536,11 @@ QJsonArray UserDatabase::users() const
 {
     QJsonArray result;
     QSqlQuery query(db_);
-    if (!query.exec(QStringLiteral("SELECT user_id, is_admin, must_change_password, operational_profile, "
-                                   "first_name, last_name, email, street, city, postal_code, province "
-                                   "FROM users ORDER BY user_id COLLATE NOCASE")))
+    if (!query.exec(QStringLiteral("SELECT u.user_id, u.is_admin, u.must_change_password, u.operational_profile, "
+                                   "u.first_name, u.last_name, u.email, u.street, u.city, u.postal_code, u.province, "
+                                   "u.usage_profile_id, COALESCE(p.name, '') "
+                                   "FROM users u LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
+                                   "ORDER BY u.user_id COLLATE NOCASE")))
         return result;
     while (query.next()) {
         result.append(QJsonObject{{"userId", query.value(0).toString()},
@@ -484,6 +554,11 @@ QJsonArray UserDatabase::users() const
                                   {"city", query.value(8).toString()},
                                   {"postalCode", query.value(9).toString()},
                                   {"province", query.value(10).toString()}});
+        QJsonObject user = result.last().toObject();
+        user.insert(QStringLiteral("usageProfileId"), query.value(11).isNull()
+                    ? QJsonValue(QJsonValue::Null) : QJsonValue(query.value(11).toLongLong()));
+        user.insert(QStringLiteral("usageProfileName"), query.value(12).toString());
+        result.replace(result.size() - 1, user);
     }
     return result;
 }
@@ -491,8 +566,10 @@ QJsonArray UserDatabase::users() const
 QJsonObject UserDatabase::profile(const QString &userId) const
 {
     QSqlQuery query(db_);
-    query.prepare(QStringLiteral("SELECT user_id, operational_profile, first_name, last_name, email, "
-                                 "street, city, postal_code, province FROM users WHERE user_id = ?"));
+    query.prepare(QStringLiteral("SELECT u.user_id, u.operational_profile, u.first_name, u.last_name, u.email, "
+                                 "u.street, u.city, u.postal_code, u.province, u.usage_profile_id, COALESCE(p.name, '') "
+                                 "FROM users u LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
+                                 "WHERE u.user_id = ?"));
     query.addBindValue(normalizedUserId(userId));
     if (!query.exec() || !query.next()) return QJsonObject();
     return QJsonObject{{"userId", query.value(0).toString()},
@@ -503,7 +580,10 @@ QJsonObject UserDatabase::profile(const QString &userId) const
                        {"street", query.value(5).toString()},
                        {"city", query.value(6).toString()},
                        {"postalCode", query.value(7).toString()},
-                       {"province", query.value(8).toString()}};
+                       {"province", query.value(8).toString()},
+                       {"usageProfileId", query.value(9).isNull() ? QJsonValue(QJsonValue::Null)
+                                                                    : QJsonValue(query.value(9).toLongLong())},
+                       {"usageProfileName", query.value(10).toString()}};
 }
 
 bool UserDatabase::updateOwnProfile(const QString &userId, const QJsonObject &profileData,
@@ -529,6 +609,10 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
         if (error) *error = QStringLiteral("Selecciona un perfil operativo.");
         return false;
     }
+    qint64 usageProfileId = 0;
+    const bool updateUsageProfile = administrator && profileData.contains(QStringLiteral("usageProfileId"));
+    if (updateUsageProfile && !validateUsageAssignment(profileData.value(QStringLiteral("usageProfileId")),
+                                                       &usageProfileId, error)) return false;
     if (!db_.transaction()) {
         if (error) *error = db_.lastError().text();
         return false;
@@ -538,6 +622,8 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
                                  "street = ?, city = ?, postal_code = ?, province = ?");
     if (administrator)
         sql += QStringLiteral(", email = ?, operational_profile = ?");
+    if (updateUsageProfile)
+        sql += QStringLiteral(", usage_profile_id = ?");
     sql += QStringLiteral(" WHERE user_id = ?");
     update.prepare(sql);
     update.addBindValue(newId);
@@ -551,6 +637,8 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
         update.addBindValue(profileData.value(QStringLiteral("email")).toString().trimmed());
         update.addBindValue(role);
     }
+    if (updateUsageProfile)
+        update.addBindValue(usageProfileId > 0 ? QVariant(usageProfileId) : QVariant());
     update.addBindValue(oldId);
     if (!update.exec() || update.numRowsAffected() != 1) {
         const QString dbError = queryError(update);
@@ -567,6 +655,274 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
     }
     if (newUserId) *newUserId = newId;
     return true;
+}
+
+bool UserDatabase::validateUsageAssignment(const QJsonValue &profileId, qint64 *id,
+                                           QString *error) const
+{
+    if (profileId.isUndefined() || profileId.isNull()
+            || (profileId.isString() && profileId.toString().trimmed().isEmpty())) {
+        if (id) *id = 0;
+        return true;
+    }
+    bool ok = false;
+    const qint64 value = profileId.isString() ? profileId.toString().toLongLong(&ok)
+                                               : profileId.toVariant().toLongLong(&ok);
+    if (!ok || value <= 0) {
+        if (error) *error = QStringLiteral("Selecciona un perfil de tiempos válido.");
+        return false;
+    }
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT 1 FROM usage_profiles WHERE profile_id = ?"));
+    query.addBindValue(value);
+    if (!query.exec() || !query.next()) {
+        if (error) *error = QStringLiteral("El perfil de tiempos seleccionado no existe.");
+        return false;
+    }
+    if (id) *id = value;
+    return true;
+}
+
+QJsonArray UserDatabase::usageProfiles() const
+{
+    QJsonArray result;
+    QSqlQuery query(db_);
+    if (!query.exec(QStringLiteral("SELECT profile_id, name, daily_limit_minutes, weekly_limit_minutes, "
+                                   "monthly_limit_minutes FROM usage_profiles ORDER BY name COLLATE NOCASE")))
+        return result;
+    while (query.next()) {
+        QJsonObject profile{{"profileId", query.value(0).toLongLong()},
+                            {"name", query.value(1).toString()}};
+        const QStringList fields = {QStringLiteral("dailyLimitMinutes"),
+                                    QStringLiteral("weeklyLimitMinutes"),
+                                    QStringLiteral("monthlyLimitMinutes")};
+        for (int i = 0; i < fields.size(); ++i) {
+            profile.insert(fields.at(i), query.value(i + 2).isNull()
+                           ? QJsonValue(QJsonValue::Null)
+                           : QJsonValue(query.value(i + 2).toLongLong()));
+        }
+        result.append(profile);
+    }
+    return result;
+}
+
+bool UserDatabase::createUsageProfile(const QJsonObject &profile, qint64 *profileId,
+                                      QString *error)
+{
+    const QString name = profile.value(QStringLiteral("name")).toString().trimmed();
+    if (name.isEmpty() || name.size() > 80) {
+        if (error) *error = QStringLiteral("El nombre del perfil es obligatorio y no puede superar 80 caracteres.");
+        return false;
+    }
+    qint64 daily = -1, weekly = -1, monthly = -1;
+    if (!validatedUsageLimit(profile, QStringLiteral("dailyLimitMinutes"), 1440, &daily, error)
+            || !validatedUsageLimit(profile, QStringLiteral("weeklyLimitMinutes"), 10080, &weekly, error)
+            || !validatedUsageLimit(profile, QStringLiteral("monthlyLimitMinutes"), 44640, &monthly, error))
+        return false;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("INSERT INTO usage_profiles(name, daily_limit_minutes, weekly_limit_minutes, "
+                                 "monthly_limit_minutes, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)"));
+    query.addBindValue(name);
+    query.addBindValue(daily >= 0 ? QVariant(daily) : QVariant());
+    query.addBindValue(weekly >= 0 ? QVariant(weekly) : QVariant());
+    query.addBindValue(monthly >= 0 ? QVariant(monthly) : QVariant());
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    query.addBindValue(now);
+    query.addBindValue(now);
+    if (!query.exec()) {
+        if (error) *error = query.lastError().text().contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)
+                ? QStringLiteral("Ya existe un perfil con ese nombre.") : queryError(query);
+        return false;
+    }
+    if (profileId) *profileId = query.lastInsertId().toLongLong();
+    return true;
+}
+
+bool UserDatabase::updateUsageProfile(qint64 profileId, const QJsonObject &profile,
+                                      QString *error)
+{
+    const QString name = profile.value(QStringLiteral("name")).toString().trimmed();
+    if (profileId <= 0 || name.isEmpty() || name.size() > 80) {
+        if (error) *error = QStringLiteral("El nombre del perfil es obligatorio y no puede superar 80 caracteres.");
+        return false;
+    }
+    qint64 daily = -1, weekly = -1, monthly = -1;
+    if (!validatedUsageLimit(profile, QStringLiteral("dailyLimitMinutes"), 1440, &daily, error)
+            || !validatedUsageLimit(profile, QStringLiteral("weeklyLimitMinutes"), 10080, &weekly, error)
+            || !validatedUsageLimit(profile, QStringLiteral("monthlyLimitMinutes"), 44640, &monthly, error))
+        return false;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("UPDATE usage_profiles SET name = ?, daily_limit_minutes = ?, "
+                                 "weekly_limit_minutes = ?, monthly_limit_minutes = ?, updated_at = ? "
+                                 "WHERE profile_id = ?"));
+    query.addBindValue(name);
+    query.addBindValue(daily >= 0 ? QVariant(daily) : QVariant());
+    query.addBindValue(weekly >= 0 ? QVariant(weekly) : QVariant());
+    query.addBindValue(monthly >= 0 ? QVariant(monthly) : QVariant());
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    query.addBindValue(profileId);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        if (error) *error = query.lastError().text().contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)
+                ? QStringLiteral("Ya existe un perfil con ese nombre.")
+                : (query.lastError().text().isEmpty() ? QStringLiteral("No se encontró el perfil.") : queryError(query));
+        return false;
+    }
+    return true;
+}
+
+bool UserDatabase::deleteUsageProfile(qint64 profileId, QString *error)
+{
+    QSqlQuery assigned(db_);
+    assigned.prepare(QStringLiteral("SELECT 1 FROM users WHERE usage_profile_id = ? LIMIT 1"));
+    assigned.addBindValue(profileId);
+    if (!assigned.exec()) {
+        if (error) *error = queryError(assigned);
+        return false;
+    }
+    if (assigned.next()) {
+        if (error) *error = QStringLiteral("No se puede eliminar un perfil asignado a usuarios.");
+        return false;
+    }
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("DELETE FROM usage_profiles WHERE profile_id = ?"));
+    query.addBindValue(profileId);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        if (error) *error = queryError(query).isEmpty() ? QStringLiteral("No se encontró el perfil.") : queryError(query);
+        return false;
+    }
+    return true;
+}
+
+qint64 UserDatabase::usageSeconds(const QString &userId, qint64 periodStart,
+                                  qint64 periodEnd, qint64 now) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT started_at, ended_at FROM radio_usage_sessions "
+                                 "WHERE user_id = ? AND started_at < ? "
+                                 "AND (ended_at IS NULL OR ended_at > ?)"));
+    query.addBindValue(normalizedUserId(userId));
+    query.addBindValue(periodEnd);
+    query.addBindValue(periodStart);
+    if (!query.exec()) return -1;
+    qint64 total = 0;
+    while (query.next()) {
+        const qint64 start = qMax(periodStart, query.value(0).toLongLong());
+        const qint64 end = qMin(periodEnd, query.value(1).isNull() ? now : query.value(1).toLongLong());
+        if (end > start) total += end - start;
+    }
+    return total;
+}
+
+QJsonObject UserDatabase::usageStatus(const QString &userId) const
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    QJsonObject status{{"allowed", true}, {"profileId", QJsonValue(QJsonValue::Null)},
+                       {"profileName", QStringLiteral("Sin límite")}};
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT p.profile_id, p.name, p.daily_limit_minutes, "
+                                 "p.weekly_limit_minutes, p.monthly_limit_minutes "
+                                 "FROM users u LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
+                                 "WHERE u.user_id = ?"));
+    query.addBindValue(normalizedUserId(userId));
+    if (!query.exec() || !query.next()) {
+        status.insert(QStringLiteral("allowed"), false);
+        status.insert(QStringLiteral("message"), QStringLiteral("No se ha encontrado la cuenta de usuario."));
+        return status;
+    }
+    if (query.value(0).isNull()) return status;
+
+    const QString profileName = query.value(1).toString();
+    status.insert(QStringLiteral("profileId"), query.value(0).toLongLong());
+    status.insert(QStringLiteral("profileName"), profileName);
+    const QDateTime localNow = QDateTime::fromSecsSinceEpoch(now, Qt::LocalTime);
+    const QDate date = localNow.date();
+    const QDate weekStart = date.addDays(1 - date.dayOfWeek());
+    const QList<QPair<QString, QDate>> starts = {
+        {QStringLiteral("daily"), date},
+        {QStringLiteral("weekly"), weekStart},
+        {QStringLiteral("monthly"), QDate(date.year(), date.month(), 1)}
+    };
+    const QStringList limitFields = {QStringLiteral("dailyLimitMinutes"),
+                                     QStringLiteral("weeklyLimitMinutes"),
+                                     QStringLiteral("monthlyLimitMinutes")};
+    const QStringList titles = {QStringLiteral("diario"), QStringLiteral("semanal"), QStringLiteral("mensual")};
+    const qint64 limits[] = {query.value(2).isNull() ? -1 : query.value(2).toLongLong() * 60,
+                             query.value(3).isNull() ? -1 : query.value(3).toLongLong() * 60,
+                             query.value(4).isNull() ? -1 : query.value(4).toLongLong() * 60};
+    for (int i = 0; i < starts.size(); ++i) {
+        const QDateTime periodStart(starts.at(i).second, QTime(0, 0), Qt::LocalTime);
+        QDate nextDate = starts.at(i).second;
+        if (i == 0) nextDate = nextDate.addDays(1);
+        else if (i == 1) nextDate = nextDate.addDays(7);
+        else nextDate = nextDate.addMonths(1);
+        const QDateTime periodEnd(nextDate, QTime(0, 0), Qt::LocalTime);
+        const qint64 used = usageSeconds(userId, periodStart.toSecsSinceEpoch(),
+                                         periodEnd.toSecsSinceEpoch(), now);
+        if (used < 0) {
+            status.insert(QStringLiteral("allowed"), false);
+            status.insert(QStringLiteral("message"), QStringLiteral("No se puede comprobar el tiempo autorizado. Inténtalo de nuevo.") );
+            break;
+        }
+        const qint64 limit = limits[i];
+        QJsonObject period{{"limitMinutes", limit < 0 ? QJsonValue(QJsonValue::Null)
+                                                       : QJsonValue(limit / 60)},
+                           {"usedSeconds", used},
+                           {"remainingSeconds", limit < 0 ? QJsonValue(QJsonValue::Null)
+                                                           : QJsonValue(qMax<qint64>(0, limit - used))}};
+        status.insert(starts.at(i).first, period);
+        if (limit >= 0 && used >= limit && status.value(QStringLiteral("allowed")).toBool()) {
+            status.insert(QStringLiteral("allowed"), false);
+            status.insert(QStringLiteral("message"),
+                           QStringLiteral("Has agotado el tiempo autorizado %1 del perfil «%2».")
+                           .arg(titles.at(i), profileName));
+        }
+    }
+    return status;
+}
+
+QString UserDatabase::startUsageSession(const QString &userId, QJsonObject *status,
+                                       QString *error)
+{
+    if (!db_.transaction()) {
+        if (error) *error = db_.lastError().text();
+        return QString();
+    }
+    QJsonObject current = usageStatus(userId);
+    if (!current.value(QStringLiteral("allowed")).toBool()) {
+        if (status) *status = current;
+        db_.rollback();
+        if (error) *error = current.value(QStringLiteral("message")).toString();
+        return QString();
+    }
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("INSERT INTO radio_usage_sessions(session_id, user_id, started_at, ended_at) "
+                                 "VALUES(?, ?, ?, NULL)"));
+    query.addBindValue(id);
+    query.addBindValue(normalizedUserId(userId));
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    if (!query.exec() || !db_.commit()) {
+        if (error) *error = queryError(query).isEmpty() ? db_.lastError().text() : queryError(query);
+        db_.rollback();
+        return QString();
+    }
+    QSqlQuery cleanup(db_);
+    cleanup.prepare(QStringLiteral("DELETE FROM radio_usage_sessions WHERE ended_at IS NOT NULL AND ended_at < ?"));
+    cleanup.addBindValue(QDateTime::currentSecsSinceEpoch() - 90 * 24 * 60 * 60);
+    cleanup.exec();
+    if (status) *status = usageStatus(userId);
+    return id;
+}
+
+void UserDatabase::endUsageSession(const QString &sessionId)
+{
+    if (sessionId.isEmpty()) return;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("UPDATE radio_usage_sessions SET ended_at = ? "
+                                 "WHERE session_id = ? AND ended_at IS NULL"));
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    query.addBindValue(sessionId);
+    query.exec();
 }
 
 bool UserDatabase::canTransmit(const QString &userId) const

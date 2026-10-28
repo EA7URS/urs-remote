@@ -9,6 +9,8 @@
 struct AuthUser {
     QString userId;
     QString operationalProfile = QStringLiteral("licensed");
+    qint64 usageProfileId = 0;
+    QString usageProfileName;
     bool isAdmin = false;
     bool mustChangePassword = false;
     qint64 sessionExpiresAt = 0;
@@ -40,6 +42,16 @@ public:
                           QString *newUserId, QString *error = nullptr);
     bool updateAdminUser(const QString &userId, const QJsonObject &profile,
                          QString *newUserId, QString *error = nullptr);
+    QJsonArray usageProfiles() const;
+    bool createUsageProfile(const QJsonObject &profile, qint64 *profileId,
+                            QString *error = nullptr);
+    bool updateUsageProfile(qint64 profileId, const QJsonObject &profile,
+                            QString *error = nullptr);
+    bool deleteUsageProfile(qint64 profileId, QString *error = nullptr);
+    QJsonObject usageStatus(const QString &userId) const;
+    QString startUsageSession(const QString &userId, QJsonObject *status,
+                              QString *error = nullptr);
+    void endUsageSession(const QString &sessionId);
     bool canTransmit(const QString &userId) const;
     void revokeSessions(const QString &userId);
 
@@ -55,6 +67,10 @@ private:
     static QByteArray tokenHash(const QString &token);
     bool updateProfile(const QString &userId, const QJsonObject &profile,
                        bool administrator, QString *newUserId, QString *error);
+    bool validateUsageAssignment(const QJsonValue &profileId, qint64 *id,
+                                 QString *error) const;
+    qint64 usageSeconds(const QString &userId, qint64 periodStart,
+                        qint64 periodEnd, qint64 now) const;
 
     QSqlDatabase db_;
     QString connectionName_;

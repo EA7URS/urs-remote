@@ -23,7 +23,7 @@
 </head>
 <body>
 <main>
-  <header><h1>Crear usuario</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/admin.html">Volver al listado</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav></header>
+  <header><h1>Crear usuario</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/usage-profiles.html">Perfiles de tiempo</a><a href="/admin.html">Volver al listado</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav></header>
   <p id="notice" role="status" aria-live="polite"></p>
   <form id="createForm">
     <label>Indicativo / ID<input id="newUserId" required maxlength="32" autocomplete="off"></label>
@@ -36,6 +36,7 @@
     <label>Código postal (opcional)<input name="postalCode" maxlength="120"></label>
     <label>Provincia (opcional)<input name="province" maxlength="120"></label>
     <label>Perfil operativo<select name="operationalProfile"><option value="licensed">Usuario con licencia</option><option value="capture">Usuario de captación</option></select></label>
+    <label>Tiempos de uso autorizados<select id="usageProfileId" name="usageProfileId"><option value="">Sin límite</option></select></label>
     <button type="submit">Crear usuario</button>
   </form>
 </main>
@@ -48,14 +49,23 @@ async function api(url, options = {}) {
   if (!response.ok) throw new Error(result.error || 'La solicitud ha fallado.');
   return result;
 }
-api('/api/v1/auth/me').then(user => { if (!user.isAdmin) location.replace('/home.html'); })
+api('/api/v1/auth/me').then(async user => {
+  if (!user.isAdmin) { location.replace('/home.html'); return; }
+  const result = await api('/api/v1/admin/usage-profiles');
+  for (const profile of result.profiles) {
+    const option = document.createElement('option'); option.value = profile.profileId; option.textContent = profile.name;
+    document.getElementById('usageProfileId').append(option);
+  }
+})
   .catch(error => { notice.textContent = error.message; });
 document.getElementById('createForm').addEventListener('submit', async event => {
   event.preventDefault(); notice.textContent = '';
   try {
     const form = event.target;
     const result = await api('/api/v1/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...Object.fromEntries(new FormData(form).entries()), userId: document.getElementById('newUserId').value, password: document.getElementById('newUserPassword').value }) });
+      body: JSON.stringify({ ...Object.fromEntries(new FormData(form).entries()),
+        usageProfileId: document.getElementById('usageProfileId').value ? Number(document.getElementById('usageProfileId').value) : null,
+        userId: document.getElementById('newUserId').value, password: document.getElementById('newUserPassword').value }) });
     location.replace('/admin-edit.html?userId=' + encodeURIComponent(result.userId) + '&created=1');
   } catch (error) { notice.textContent = error.message; }
 });

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Tiempos de uso autorizados</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: start center; padding: 1rem; }
+    main { width: min(100%, 56rem); margin: 2rem auto; padding: 1.5rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    header, nav, .profile-row, .limit { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1 { margin: 0; color: #38d1c5; font-size: 1.5rem; }
+    h2 { margin-top: 2rem; font-size: 1.1rem; }
+    a { color: #48cfc4; }
+    nav { flex-wrap: wrap; }
+    .profile-row { padding: .9rem 0; border-bottom: 1px solid #17434b; }
+    .profile-info { display: grid; gap: .3rem; }
+    .profile-name { color: #48cfc4; font-weight: 700; }
+    .muted { color: #a9bfc2; font-size: .9rem; }
+    form { display: grid; gap: .9rem; margin-top: 1rem; }
+    label { display: grid; gap: .35rem; color: #b8d0d2; }
+    input, select { width: 100%; padding: .7rem; border: 1px solid #28545b; border-radius: .45rem; background: #071114; color: #fff; font: inherit; }
+    .limit { justify-content: flex-start; }
+    .limit label { flex: 1; }
+    .limit-unit { width: 9rem; align-self: end; }
+    button { padding: .65rem .9rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
+    button.secondary { border: 1px solid #28545b; background: transparent; color: #b8d0d2; }
+    button.danger { border: 1px solid #853f3b; background: #321b1b; color: #ffb2a8; }
+    #notice { min-height: 1.4rem; margin: .8rem 0; color: #ff9b8f; }
+    .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+    @media (max-width: 560px) { header, .profile-row { align-items: flex-start; flex-direction: column; } .limit { align-items: flex-start; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Tiempos de uso autorizados</h1>
+    <nav aria-label="Navegación"><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/admin.html">Administrar usuarios</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav>
+  </header>
+  <p class="muted">Los límites cuentan el tiempo conectado al control de radio. Los periodos diario, semanal y mensual siguen el calendario local del servidor. Deja un límite vacío para permitir uso ilimitado en ese periodo.</p>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <section aria-labelledby="profilesTitle">
+    <h2 id="profilesTitle">Perfiles existentes</h2>
+    <div id="profiles" aria-live="polite"></div>
+  </section>
+  <section aria-labelledby="formTitle">
+    <h2 id="formTitle">Crear perfil</h2>
+    <form id="profileForm">
+      <label>Nombre del perfil<input id="profileName" name="name" required maxlength="80"></label>
+      <div class="limit"><label>Límite diario<input id="dailyValue" type="number" min="1" max="1440" step="1" inputmode="numeric"></label><label class="limit-unit">Unidad<select id="dailyUnit"><option value="minutes">Minutos</option><option value="hours">Horas</option></select></label></div>
+      <div class="limit"><label>Límite semanal<input id="weeklyValue" type="number" min="1" max="10080" step="1" inputmode="numeric"></label><label class="limit-unit">Unidad<select id="weeklyUnit"><option value="minutes">Minutos</option><option value="hours">Horas</option></select></label></div>
+      <div class="limit"><label>Límite mensual<input id="monthlyValue" type="number" min="1" max="44640" step="1" inputmode="numeric"></label><label class="limit-unit">Unidad<select id="monthlyUnit"><option value="minutes">Minutos</option><option value="hours">Horas</option></select></label></div>
+      <div class="actions"><button id="saveButton" type="submit">Crear perfil</button><button id="cancelButton" class="secondary" type="button" hidden>Cancelar edición</button></div>
+    </form>
+  </section>
+</main>
+<script>
+const notice = document.getElementById('notice');
+const form = document.getElementById('profileForm');
+let editingId = null;
+async function api(url, options = {}) {
+  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  const result = await response.json().catch(() => ({}));
+  if (response.status === 401) { location.replace('/login.html'); throw new Error('Inicia sesión para continuar.'); }
+  if (!response.ok) throw new Error(result.error || 'La solicitud ha fallado.');
+  return result;
+}
+function formatLimit(minutes) {
+  if (minutes == null) return 'Sin límite';
+  if (minutes % 60 === 0) return (minutes / 60) + ' h';
+  return minutes + ' min';
+}
+function readLimit(period) {
+  const value = document.getElementById(period + 'Value').value;
+  if (value === '') return null;
+  const numeric = Number(value);
+  return document.getElementById(period + 'Unit').value === 'hours' ? numeric * 60 : numeric;
+}
+function setLimit(period, minutes) {
+  const input = document.getElementById(period + 'Value');
+  const unit = document.getElementById(period + 'Unit');
+  if (minutes == null) { input.value = ''; unit.value = 'minutes'; return; }
+  if (minutes % 60 === 0) { input.value = String(minutes / 60); unit.value = 'hours'; }
+  else { input.value = String(minutes); unit.value = 'minutes'; }
+}
+function resetForm() {
+  editingId = null; form.reset();
+  document.getElementById('formTitle').textContent = 'Crear perfil';
+  document.getElementById('saveButton').textContent = 'Crear perfil';
+  document.getElementById('cancelButton').hidden = true;
+}
+function editProfile(profile) {
+  editingId = profile.profileId;
+  document.getElementById('profileName').value = profile.name;
+  setLimit('daily', profile.dailyLimitMinutes);
+  setLimit('weekly', profile.weeklyLimitMinutes);
+  setLimit('monthly', profile.monthlyLimitMinutes);
+  document.getElementById('formTitle').textContent = 'Editar perfil';
+  document.getElementById('saveButton').textContent = 'Guardar cambios';
+  document.getElementById('cancelButton').hidden = false;
+  form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+async function loadProfiles() {
+  const { profiles } = await api('/api/v1/admin/usage-profiles');
+  const target = document.getElementById('profiles'); target.replaceChildren();
+  if (!profiles.length) {
+    const empty = document.createElement('p'); empty.className = 'muted'; empty.textContent = 'Todavía no hay perfiles de tiempo.'; target.append(empty); return;
+  }
+  for (const profile of profiles) {
+    const row = document.createElement('article'); row.className = 'profile-row';
+    const info = document.createElement('div'); info.className = 'profile-info';
+    const name = document.createElement('span'); name.className = 'profile-name'; name.textContent = profile.name;
+    const limits = document.createElement('span'); limits.className = 'muted';
+    limits.textContent = 'Diario: ' + formatLimit(profile.dailyLimitMinutes) + ' · Semanal: ' + formatLimit(profile.weeklyLimitMinutes) + ' · Mensual: ' + formatLimit(profile.monthlyLimitMinutes);
+    info.append(name, limits);
+    const actions = document.createElement('div'); actions.className = 'actions';
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'secondary'; edit.textContent = 'Editar'; edit.addEventListener('click', () => editProfile(profile));
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger'; remove.textContent = 'Eliminar';
+    remove.addEventListener('click', async () => {
+      if (!window.confirm('¿Eliminar el perfil «' + profile.name + '»?')) return;
+      try { await api('/api/v1/admin/usage-profiles/' + profile.profileId, { method: 'DELETE' }); await loadProfiles(); notice.textContent = 'Se ha eliminado el perfil.'; if (editingId === profile.profileId) resetForm(); }
+      catch (error) { notice.textContent = error.message; }
+    });
+    actions.append(edit, remove); row.append(info, actions); target.append(row);
+  }
+}
+api('/api/v1/auth/me').then(user => {
+  if (!user.isAdmin) { location.replace('/home.html'); return; }
+  return loadProfiles();
+}).catch(error => { notice.textContent = error.message; });
+form.addEventListener('submit', async event => {
+  event.preventDefault(); notice.textContent = '';
+  const payload = { name: document.getElementById('profileName').value,
+    dailyLimitMinutes: readLimit('daily'), weeklyLimitMinutes: readLimit('weekly'), monthlyLimitMinutes: readLimit('monthly') };
+  try {
+    if (editingId == null) await api('/api/v1/admin/usage-profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    else await api('/api/v1/admin/usage-profiles/' + editingId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    resetForm(); await loadProfiles(); notice.textContent = 'Se han guardado los datos del perfil.';
+  } catch (error) { notice.textContent = error.message; }
+});
+document.getElementById('cancelButton').addEventListener('click', resetForm);
+document.getElementById('logout').addEventListener('click', async () => {
+  try { await api('/api/v1/auth/logout', { method: 'POST' }); } finally { location.replace('/login.html'); }
+});
+</script>
+</body>
+</html>

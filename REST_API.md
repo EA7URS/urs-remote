@@ -37,13 +37,17 @@ same origin as the application.
 | Method | Endpoint | Action |
 |---|---|---|
 | `POST` | `/api/v1/auth/login` | Sign in with `userId` and `password` |
-| `GET` | `/api/v1/auth/me` | Return the current account, operational profile, and personal profile |
+| `GET` | `/api/v1/auth/me` | Return the current account, operational profile, usage profile and current usage totals |
 | `PUT` | `/api/v1/auth/profile` | Update the current user's ID, name, and address; email and operational profile are read-only |
 | `POST` | `/api/v1/auth/logout` | End the current session |
 | `POST` | `/api/v1/auth/password` | Change the current user's password |
 | `GET` | `/api/v1/admin/users` | List account profiles (administrator only) |
 | `POST` | `/api/v1/admin/users` | Create an account with its profile (administrator only) |
 | `PUT` | `/api/v1/admin/users/{userId}` | Update any account profile, email, ID, and operational profile (administrator only) |
+| `GET` | `/api/v1/admin/usage-profiles` | List authorized usage-time profiles (administrator only) |
+| `POST` | `/api/v1/admin/usage-profiles` | Create a usage-time profile (administrator only) |
+| `PUT` | `/api/v1/admin/usage-profiles/{profileId}` | Update a usage-time profile (administrator only) |
+| `DELETE` | `/api/v1/admin/usage-profiles/{profileId}` | Delete an unassigned usage-time profile (administrator only) |
 
 An operational profile is either `licensed` (transmission permitted) or
 `capture` (receive and non-transmitting controls only). An unauthorized
@@ -51,6 +55,16 @@ transmit request returns `403` with `{"code":"transmit_denied"}`. WebSocket
 transmit requests receive a `transmitDenied` message. The unauthenticated
 Hamlib `rigctld` protocol cannot identify an account, so its PTT-on, CW send,
 and tuner-on requests are rejected; PTT-off and CW stop remain available.
+
+Usage-time profiles are a separate setting assigned with `usageProfileId` on
+administrator user create/update requests. Each profile has nullable
+`dailyLimitMinutes`, `weeklyLimitMinutes`, and `monthlyLimitMinutes` values;
+null means no limit for that period. User control-session time is counted while
+the authenticated WebSocket to the radio control page is connected. Daily,
+Monday-to-Sunday weekly, and calendar-month boundaries use the server's local
+time zone. After a quota is exhausted, WebSocket and authenticated radio REST
+requests are denied until the corresponding period resets. Accounts with no
+assigned usage profile remain unlimited.
 
 ---
 
