@@ -2,24 +2,26 @@
 
 ## Project Structure & Module Organization
 
-The current checkout at `urs-remote` contains no source files or project directories yet. Keep application code, tests, and assets in clearly named top-level directories as they are introduced (for example, `src/`, `tests/`, and `assets/`). Update this guide when the actual layout is established; avoid documenting paths that do not exist.
+This project uses [wfweb](https://github.com/adecarolis/wfweb) as its software base; retain its GPL-3.0 license and third-party notices. The Qt/C and C++ server is in `src/`, public headers in `include/`, radio definitions in `rigs/`, and browser UI and assets in `resources/web/`. Tests are in `tests/`; supporting code is in `launcher/`, `scripts/`, `tools/`, and `docker/`. Initialize required dependencies with `git submodule update --init`.
 
 ## Build, Test, and Development Commands
 
-No build system, runtime, or test framework is configured in this checkout. When adding one, document the canonical setup, run, and test commands here (and provide a `Makefile`, task runner, or package scripts where appropriate). Contributors should run the project's documented checks before submitting changes; do not assume commands such as `npm test` apply until the matching configuration exists.
+Follow platform prerequisites in `BUILDING.md`. On Linux, build the server with `qmake wfweb.pro && make -j$(nproc)`. Install Python test dependencies with `python3 -m pip install -r tests/requirements.txt`, then run `python3 -m pytest tests/ -v`. The repository also documents Docker and platform-specific builds in `DOCKER.md` and `BUILDING.md`.
 
 ## Coding Style & Naming Conventions
 
-No language-specific style or formatter is established yet. Follow the conventions of the chosen language and use its standard formatter and linter once configured. Use descriptive, consistent names for modules and tests, and keep related implementation and test files easy to locate together.
+Match the existing Qt/C++, JavaScript, and Python conventions in nearby files. No repository-wide formatter is configured; keep changes focused and preserve established naming and indentation patterns. Keep tests under `tests/` and use descriptive `test_*.py` names for Python tests.
 
-## Testing Guidelines
+## Issues & Work Tracking
 
-There are currently no tests or coverage requirements. Add tests alongside each feature, using the selected framework's normal file naming pattern, and document how to run them here when the framework is chosen.
+Write every issue and child issue as a user story, such as “As a [user], I want [capability], so that [benefit].” Keep scope clear. In the description, include the original request verbatim under **Original prompt**, context, acceptance criteria, and an unchecked task checklist. Check items off as work progresses. Split independently trackable work into child issues and link them to the parent with GitHub’s sub-issue relationship.
+
+Record all Codex work—progress, decisions, blockers, completed work, and validation—in issue comments. Keep comments chronological and link commits or pull requests. Before closing, finish the checklist and comment with a result summary. Label and categorize every issue and child issue, reusing fitting repository labels; use work-type and relevant-area labels, and set priority or milestone when applicable.
 
 ## Commit & Pull Request Guidelines
 
-Git history is unavailable in this directory, so no repository-specific commit convention can be confirmed. Use concise imperative commit subjects (for example, `Add connection retry handling`) until project conventions are established. Pull requests should explain the change and its motivation, list relevant validation commands and results, and link related issues. Include screenshots only for changes with a visual interface.
+Commit and push each reasonable, coherent slice of work for an issue. Use explicit imperative messages that describe the change and reference the issue (for example, `Add retry handling (#12)`). Pull requests should explain the change, report validation, and link related issues. Include screenshots for visual changes.
 
 ## Configuration & Security
 
-Do not commit credentials, private keys, or machine-specific configuration. Provide safe example configuration and document required environment variables when the application is introduced.
+Keep credentials and local configuration out of Git. Follow the upstream GPL-3.0 terms and preserve copyright and third-party notices when modifying or redistributing software.
