@@ -187,8 +187,8 @@ The REST port is always web port + 1.
 
 The image points Qt's configuration and data roots at a single `/data`
 directory, so one volume persists everything: the settings file
-(`/data/wfweb/wfweb.conf`), the TLS certificate and the ADIF logbook (both
-under `/data/wfweb/wfweb/`).
+(`/data/wfweb/wfweb.conf`), TLS certificate, SQLite user database and ADIF
+logbook (under `/data/wfweb/wfweb/`).
 
 ```bash
 docker run --rm -it \

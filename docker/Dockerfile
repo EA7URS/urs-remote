@@ -7,7 +7,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git \
-    qt5-qmake qtbase5-dev libqt5serialport5-dev \
+    qt5-qmake qtbase5-dev libqt5serialport5-dev libqt5sql5-sqlite \
     qtmultimedia5-dev libqt5websockets5-dev \
     libqt5gamepad5-dev libqt5printsupport5 \
     libopus-dev libeigen3-dev \
@@ -46,7 +46,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     libqt5core5t64 libqt5gui5t64 libqt5widgets5t64 \
-    libqt5network5t64 libqt5serialport5 libqt5multimedia5 \
+    libqt5network5t64 libqt5serialport5 libqt5sql5-sqlite libqt5multimedia5 \
     libqt5websockets5 libqt5gamepad5 libqt5printsupport5t64 \
     libqt5multimedia5-plugins libasound2-data \
     libopus0 libportaudio2 libpulse0 libhidapi-libusb0 \
@@ -62,7 +62,7 @@ COPY --from=builder /install/usr/lib/librade* /usr/lib/
 COPY --from=builder /src/LICENSE /src/THIRD_PARTY_LICENSES /usr/share/doc/wfweb/
 RUN ldconfig
 
-# Settings, TLS certificate and the ADIF logbook all live under /data: mount
+# Settings, TLS certificate, SQLite users and the ADIF logbook all live under /data: mount
 # a volume there (see DOCKER.md).  Deliberately no VOLUME instruction: that
 # would give an unmounted /data a hidden anonymous volume that `docker run
 # --rm` deletes on exit, and wfweb could no longer tell the operator that

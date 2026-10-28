@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Sign in</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 1rem; }
+    main { width: min(100%, 27rem); padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    h1 { margin: 0 0 .4rem; color: #38d1c5; font-size: 1.6rem; }
+    p { color: #a9bfc2; line-height: 1.5; }
+    label { display: block; margin: 1rem 0 .35rem; color: #b8d0d2; }
+    input { width: 100%; padding: .75rem; border: 1px solid #28545b; border-radius: .45rem; background: #071114; color: #fff; font: inherit; }
+    button { width: 100%; margin-top: 1.25rem; padding: .8rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
+    button:hover { background: #37d1c5; }
+    .hint { padding: .75rem; border-left: 3px solid #d6a844; background: #2a261a; color: #f2dfa9; font-size: .9rem; }
+    #notice { min-height: 1.4rem; margin-top: .8rem; color: #ff9b8f; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>EA7URS Remote</h1>
+  <p>Sign in to access the IC-7610 control panel.</p>
+  <p class="hint">Fresh test database: user ID <strong>EA7URS</strong>, password <strong>EA7URS</strong>. You must choose a new password before opening radio controls.</p>
+  <form id="loginForm">
+    <label for="userId">User ID</label>
+    <input id="userId" name="userId" autocomplete="username" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <form id="changeForm" hidden>
+    <label for="currentPassword">Current password</label>
+    <input id="currentPassword" type="password" autocomplete="current-password" required>
+    <label for="newPassword">New password (12 characters minimum)</label>
+    <input id="newPassword" type="password" autocomplete="new-password" minlength="12" required>
+    <label for="confirmPassword">Confirm new password</label>
+    <input id="confirmPassword" type="password" autocomplete="new-password" minlength="12" required>
+    <button type="submit">Change password and continue</button>
+  </form>
+  <div id="notice" role="status" aria-live="polite"></div>
+</main>
+<script>
+const loginForm = document.getElementById('loginForm');
+const changeForm = document.getElementById('changeForm');
+const notice = document.getElementById('notice');
+const jsonRequest = (url, body) => fetch(url, {
+  method: 'POST', credentials: 'same-origin',
+  headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+});
+function showPasswordChange() {
+  loginForm.hidden = true;
+  changeForm.hidden = false;
+  document.getElementById('currentPassword').focus();
+  notice.textContent = 'Choose a private password before using the radio.';
+}
+fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => {
+  if (!response.ok) return;
+  const user = await response.json();
+  if (user.mustChangePassword) showPasswordChange();
+  else location.replace('/index.html');
+}).catch(() => {});
+loginForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  notice.textContent = '';
+  try {
+    const response = await jsonRequest('/api/v1/auth/login', {
+      userId: document.getElementById('userId').value,
+      password: document.getElementById('password').value
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Sign in failed.');
+    if (result.mustChangePassword) {
+      document.getElementById('currentPassword').value = document.getElementById('password').value;
+      showPasswordChange();
+    } else location.replace('/index.html');
+  } catch (error) { notice.textContent = error.message; }
+});
+changeForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  notice.textContent = '';
+  const next = document.getElementById('newPassword').value;
+  if (next !== document.getElementById('confirmPassword').value) {
+    notice.textContent = 'The new passwords do not match.';
+    return;
+  }
+  try {
+    const response = await jsonRequest('/api/v1/auth/password', {
+      currentPassword: document.getElementById('currentPassword').value,
+      newPassword: next
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Password change failed.');
+    location.replace('/index.html');
+  } catch (error) { notice.textContent = error.message; }
+});
+</script>
+</body>
+</html>

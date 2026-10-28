@@ -75,7 +75,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev libqt5sql5-sqlite \
             qtmultimedia5-dev libqt5websockets5-dev \
             libopus-dev libeigen3-dev \
             portaudio19-dev librtaudio-dev \
@@ -132,7 +132,7 @@ jobs:
           Depends: openssl, libqt5core5t64, libqt5gui5t64,
            libqt5network5t64, libqt5serialport5, libqt5multimedia5,
            libqt5multimedia5-plugins,
-           libqt5websockets5,
+           libqt5websockets5, libqt5sql5-sqlite,
            libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
            libudev1, librtaudio6, libcodec2-1.2
           Section: hamradio
@@ -197,7 +197,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get install -y \
-            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev libqt5sql5-sqlite \
             qtmultimedia5-dev libqt5websockets5-dev \
             libopus-dev libeigen3-dev \
             portaudio19-dev librtaudio-dev \
@@ -253,7 +253,7 @@ jobs:
           Depends: openssl, libqt5core5a, libqt5gui5,
            libqt5network5, libqt5serialport5, libqt5multimedia5,
            libqt5multimedia5-plugins,
-           libqt5websockets5,
+           libqt5websockets5, libqt5sql5-sqlite,
            libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
            libudev1, librtaudio6, libcodec2-1.0
           Section: hamradio
@@ -318,7 +318,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get install -y \
-            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev libqt5sql5-sqlite \
             qtmultimedia5-dev libqt5websockets5-dev \
             libopus-dev libeigen3-dev \
             portaudio19-dev librtaudio-dev \
@@ -374,7 +374,7 @@ jobs:
           Depends: openssl, libqt5core5t64, libqt5gui5t64,
            libqt5network5t64, libqt5serialport5, libqt5multimedia5,
            libqt5multimedia5-plugins,
-           libqt5websockets5,
+           libqt5websockets5, libqt5sql5-sqlite,
            libopus0, libportaudio2, libpulse0, libhidapi-libusb0,
            libudev1, librtaudio7, libcodec2-1.2
           Section: hamradio
@@ -445,7 +445,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get install -y \
-            qt5-qmake qtbase5-dev libqt5serialport5-dev \
+            qt5-qmake qtbase5-dev libqt5serialport5-dev libqt5sql5-sqlite \
             qtmultimedia5-dev libqt5websockets5-dev \
             libqt5multimedia5-plugins \
             libopus-dev libeigen3-dev \

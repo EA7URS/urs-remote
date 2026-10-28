@@ -99,6 +99,12 @@ If you'd rather not depend on a third-party host, build the static bundle yourse
 
 In every case, once wfweb is running you open `https://<host>:8080` in your browser and accept the self-signed certificate warning.
 
+### Sign-in and user accounts
+
+The web control panel, REST radio API, and WebSocket control channel require a login. On a fresh local database, sign in with user ID `EA7URS` and password `EA7URS`, then choose a new password before opening the radio controls. The database stores password hashes, not plaintext passwords. The initial admin can create user accounts and promote them to admin at `/admin.html`; new users must also replace their temporary password before radio access.
+
+Users and sessions are stored in a local SQLite database under Qt's application-data directory (under `/data` in the Docker image). Keep the `/data` volume persistent. Login over HTTP is allowed only from localhost; use the HTTPS web port for other clients.
+
 ### 1. Native build — USB radio
 
 Download a pre-built binary from [GitHub Releases](../../releases) for your platform (see [Downloads](#downloads) — on Linux, a `.deb` for Debian/Ubuntu or an `.AppImage` for any other distro), plug in your radio, and run:
@@ -363,8 +369,8 @@ All settings can be passed as CLI flags. Run `wfweb --help` for the full list.
 | `-b --background` | Run as daemon (Linux/macOS) | foreground |
 | `-c --clearconfig CONFIRM` | Reset all saved settings and exit | — |
 | `-d --debug [file]` | Enable verbose debug logging (optionally to file) | off |
-| `--rigctld-port <port>` | Enable Hamlib rigctld TCP server (server build) | disabled |
-| `--rigctld-bind-all` | Bind rigctld to all interfaces instead of localhost | localhost only |
+| `--rigctld-port <port>` | Configure Hamlib rigctld port (listener is disabled with web login) | disabled |
+| `--rigctld-bind-all` | Configure rigctld binding (listener is disabled with web login) | localhost only |
 | `--no-rigctld` | Disable rigctld even if enabled in settings | — |
 | `-n --name <tag>` | Name shown in the web UI top bar and browser tab (handy with several instances) | rig model || `--logbook <file>` | ADIF logbook the server keeps (see REST_API.md) | `<data dir>/logbook.adi` |
 | `--remote-log <host[:port]>` | Send every logged QSO to an external logging program (GridTracker, JTAlert, Log4OM… via the WSJT-X UDP protocol) | off |
@@ -421,13 +427,7 @@ Without the filename argument, `--debug` writes to the default log location (`/t
 
 ### Hamlib rigctld (server build)
 
-The Server build can expose a Hamlib `rigctld` TCP interface so external tools — WSJT-X, fldigi, gpredict, POTACAT, and anything else that speaks the Hamlib net protocol — can drive the rig. Pat (Winlink) works through it as well. It's disabled by default; enable it on the standard port with:
-
-```bash
-wfweb --rigctld-port 4532
-```
-
-Point your Hamlib client at "Hamlib NET rigctl" (`rigctl -m 2 -r 127.0.0.1:4532`). PTT requests route through the same path the web UI uses, so RADE EOO synthesis and packet TX coordination stay intact. The listener binds to `127.0.0.1` only — the Hamlib protocol is unauthenticated, so `--rigctld-bind-all` (which exposes PTT to your whole LAN) is opt-in. See [REST_API.md](REST_API.md) for details. Standalone has no rigctld (browsers can't open TCP listeners).
+The Server build includes a Hamlib `rigctld` TCP interface for tools such as WSJT-X and fldigi. This web application does not start that listener because the Hamlib protocol has no login support and would bypass the authenticated web control interface. Standalone has no rigctld (browsers can't open TCP listeners).
 
 ---
 
