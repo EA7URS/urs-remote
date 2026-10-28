@@ -23,7 +23,7 @@
 </head>
 <body>
 <main>
-  <header><h1>Editar usuario</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/admin.html">Volver al listado</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav></header>
+  <header><h1>Editar usuario</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/usage-profiles.html">Perfiles de tiempo</a><a href="/admin.html">Volver al listado</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav></header>
   <p id="notice" role="status" aria-live="polite"></p>
   <form id="editForm" hidden>
     <label>Indicativo / ID<input name="userId" required maxlength="32"></label>
@@ -35,6 +35,7 @@
     <label>Código postal (opcional)<input name="postalCode" maxlength="120"></label>
     <label>Provincia (opcional)<input name="province" maxlength="120"></label>
     <label>Perfil operativo<select name="operationalProfile"><option value="licensed">Usuario con licencia</option><option value="capture">Usuario de captación</option></select></label>
+    <label>Tiempos de uso autorizados<select name="usageProfileId" id="usageProfileId"><option value="">Sin límite</option></select></label>
     <button type="submit">Guardar cambios</button>
   </form>
 </main>
@@ -55,6 +56,11 @@ api('/api/v1/auth/me').then(async user => {
   const result = await api('/api/v1/admin/users');
   const selected = result.users.find(item => item.userId === userId);
   if (!selected) throw new Error('No se ha encontrado ese usuario.');
+  const profiles = await api('/api/v1/admin/usage-profiles');
+  for (const profile of profiles.profiles) {
+    const option = document.createElement('option'); option.value = profile.profileId; option.textContent = profile.name;
+    document.getElementById('usageProfileId').append(option);
+  }
   const form = document.getElementById('editForm');
   for (const [name, value] of Object.entries(selected)) {
     const field = form.elements.namedItem(name);

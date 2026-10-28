@@ -28,7 +28,7 @@
 <main>
   <header>
     <h1>Administración de usuarios</h1>
-    <nav aria-label="Navegación"><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav>
+    <nav aria-label="Navegación"><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/usage-profiles.html">Perfiles de tiempo</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav>
   </header>
   <p id="notice" role="status" aria-live="polite"></p>
   <section aria-labelledby="usersTitle">
@@ -62,7 +62,9 @@ async function loadUsers() {
     const role = document.createElement('span'); role.className = 'role';
     role.textContent = (user.isAdmin ? 'Administrador' : 'Usuario') + ' · ' +
       (user.operationalProfile === 'capture' ? 'Usuario de captación' : 'Usuario con licencia');
-    info.append(id, details, role); row.append(info);
+    const usage = document.createElement('span'); usage.className = 'muted';
+    usage.textContent = 'Tiempos de uso autorizados: ' + (user.usageProfileName || 'Sin límite');
+    info.append(id, details, role, usage); row.append(info);
     if (!user.isAdmin) {
       const promote = document.createElement('button'); promote.type = 'button'; promote.textContent = 'Promover a administrador';
       promote.addEventListener('click', async () => {
