@@ -1154,6 +1154,7 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         user.sessionExpiresAt = expiry;
         sendRestResponse(socket, 200,
                          QJsonObject{{"userId", user.userId}, {"isAdmin", user.isAdmin},
+                                     {"operationalProfile", user.operationalProfile},
                                      {"mustChangePassword", user.mustChangePassword}},
                          sessionSetCookie(token, tls, 8 * 60 * 60));
         return;
@@ -1168,8 +1169,38 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             sendRestResponse(socket, 200,
                              QJsonObject{{"userId", currentUser.userId},
                                          {"isAdmin", currentUser.isAdmin},
-                                         {"mustChangePassword", currentUser.mustChangePassword}});
+                                         {"operationalProfile", currentUser.operationalProfile},
+                                         {"canTransmit", currentUser.operationalProfile == QLatin1String("licensed")},
+                                         {"mustChangePassword", currentUser.mustChangePassword},
+                                         {"profile", userDatabase_.profile(currentUser.userId)}});
         }
+        return;
+    }
+
+    if (p == "/api/v1/auth/profile") {
+        if (method != "PUT") {
+            sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            return;
+        }
+        if (!currentUser.authenticated) {
+            sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
+            return;
+        }
+        if (!sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+        QString newUserId;
+        QString error;
+        if (!userDatabase_.updateOwnProfile(currentUser.userId, parseBody(), &newUserId, &error)) {
+            sendRestResponse(socket, error.contains(QStringLiteral("ya está asignado")) ? 409 : 400,
+                             QJsonObject{{"error", error}});
+            return;
+        }
+        // The current session remains valid after a callsign change. Reconnect
+        // sockets so their server-side identity is refreshed from SQLite.
+        closeUserWebSockets(currentUser.userId);
+        sendRestResponse(socket, 200, QJsonObject{{"profile", userDatabase_.profile(newUserId)}});
         return;
     }
 
@@ -1262,7 +1293,7 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             } else if (method == "POST") {
                 const QJsonObject input = parseBody();
                 QString error;
-                if (!userDatabase_.createUser(input.value("userId").toString(),
+                if (!userDatabase_.createUser(input,
                                               input.value("password").toString(), false, &error)) {
                     const int status = error == QLatin1String("That user ID already exists.") ? 409 : 400;
                     sendRestResponse(socket, status, QJsonObject{{"error", error}});
@@ -1288,6 +1319,21 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             }
             sendRestResponse(socket, 200, QJsonObject{{"userId", UserDatabase::normalizedUserId(userId)},
                                                       {"isAdmin", true}});
+            return;
+        }
+        const QString userPrefix = QStringLiteral("/api/v1/admin/users/");
+        if (method == "PUT" && p.startsWith(userPrefix)) {
+            const QString userId = p.mid(userPrefix.size());
+            QString newUserId;
+            QString error;
+            if (!userDatabase_.updateAdminUser(userId, parseBody(), &newUserId, &error)) {
+                sendRestResponse(socket, error.contains(QStringLiteral("ya está asignado")) ? 409 : 400,
+                                 QJsonObject{{"error", error}});
+                return;
+            }
+            closeUserWebSockets(userId);
+            sendRestResponse(socket, 200, QJsonObject{{"userId", newUserId},
+                                                      {"profile", userDatabase_.profile(newUserId)}});
             return;
         }
         sendRestResponse(socket, 404, QJsonObject{{"error", "Not found"}});
@@ -1707,6 +1753,11 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                 sendRestResponse(socket, 400, e); return;
             }
             bool on = obj["transmitting"].toBool();
+            if (on && currentUser.operationalProfile != QLatin1String("licensed")) {
+                sendRestResponse(socket, 403, QJsonObject{{"error", "Tu perfil no permite transmitir."},
+                                                          {"code", "transmit_denied"}});
+                return;
+            }
             queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(on), false, uchar(0)));
             QJsonObject resp; resp["status"] = "accepted";
             sendRestResponse(socket, 202, resp);
@@ -1911,6 +1962,11 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             }
             if (obj.contains("tuner")) {
                 uchar val = static_cast<uchar>(qBound(0, obj["tuner"].toInt(), 2));
+                if (val > 0 && currentUser.operationalProfile != QLatin1String("licensed")) {
+                    sendRestResponse(socket, 403, QJsonObject{{"error", "Tu perfil no permite transmitir."},
+                                                              {"code", "transmit_denied"}});
+                    return;
+                }
                 queue->addUnique(priorityImmediate, queueItem(funcTunerStatus, QVariant::fromValue<uchar>(val), false, 0));
             }
             if (obj.contains("compressor")) {
@@ -1979,6 +2035,11 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             if (text.isEmpty()) {
                 QJsonObject e; e["error"] = "Empty CW text";
                 sendRestResponse(socket, 400, e); return;
+            }
+            if (currentUser.operationalProfile != QLatin1String("licensed")) {
+                sendRestResponse(socket, 403, QJsonObject{{"error", "Tu perfil no permite transmitir."},
+                                                          {"code", "transmit_denied"}});
+                return;
             }
             if (obj.contains("wpm")) {
                 ushort wpm = static_cast<ushort>(qBound(6, obj["wpm"].toInt(), 48));
@@ -2211,6 +2272,10 @@ void webServer::onWsBinaryMessage(QByteArray message)
 
     if (msgType != 0x03) return; // Only handle TX audio (0x03)
 
+    // Binary audio is a transmit path too; do not rely on the browser's
+    // controls or on a preceding enableMic command for authorization.
+    if (!userDatabase_.canTransmit(wsUserIds_.value(pClient))) return;
+
     if (!txAudioConfigured) return;
 
     // Extract PCM data after 6-byte header: [0x03][0x00][seq_u16LE][reserved_u16LE][PCM...]
@@ -2421,6 +2486,34 @@ static bool labelIsRigCapture(const QString &label, const QString &rigName)
 void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
 {
     QString type = cmd["cmd"].toString();
+
+    const bool canTransmit = client && userDatabase_.canTransmit(wsUserIds_.value(client));
+    bool requestsTransmission = false;
+    if (type == QLatin1String("setPTT")) requestsTransmission = cmd.value("value").toBool();
+    else if (type == QLatin1String("enableMic")) requestsTransmission = cmd.value("value").toBool();
+    else if (type == QLatin1String("sendCW")) requestsTransmission = !cmd.value("text").toString().isEmpty();
+    else if (type == QLatin1String("setTuner")) requestsTransmission = cmd.value("value").toInt() > 0;
+    else if (type == QLatin1String("setBreakIn")) requestsTransmission = cmd.value("value").toInt() > 0;
+    else if (type == QLatin1String("aprsBeaconConfig")) requestsTransmission = cmd.value("enabled").toBool();
+    else if (type == QLatin1String("packetTx") || type == QLatin1String("aprsTxBeacon")
+             || type == QLatin1String("termConnect") || type == QLatin1String("termDisconnect")
+             || type == QLatin1String("termSend") || type == QLatin1String("termClose")
+             || type == QLatin1String("termFileSend") || type == QLatin1String("termFileAbort")
+             || type == QLatin1String("termXferAccept") || type == QLatin1String("termXferReject")
+             || type == QLatin1String("termRegister") || type == QLatin1String("termUnregister"))
+        requestsTransmission = true;
+    // rigctld has no authenticated account context, so it cannot prove a
+    // licensed role. Permit its unkey command but reject a new PTT request.
+    if ((type == QLatin1String("setPTT") && !client && requestsTransmission)
+            || (client && !canTransmit && requestsTransmission)) {
+        if (client) {
+            sendJsonTo(client, QJsonObject{{"type", "transmitDenied"},
+                                           {"message", "Tu perfil no permite transmitir. Contacta con un administrador si necesitas acceso de transmisión."}});
+        } else {
+            qWarning() << "Web: rejected rigctld PTT request without an authenticated user";
+        }
+        return;
+    }
 
     if (type == "qsoLogged") {
         QsoRecord r = QsoRecord::fromJson(cmd["qso"].toObject());
@@ -4189,6 +4282,7 @@ void webServer::sendCurrentState(QWebSocket *client)
 {
     QJsonObject info = buildInfoJson();
     info["type"] = "rigInfo";
+    info["canTransmit"] = userDatabase_.canTransmit(wsUserIds_.value(client));
     if (!audioConfigured && !audioErrorReason.isEmpty()) {
         info["audioError"] = audioErrorReason;
     }

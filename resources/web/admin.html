@@ -19,6 +19,7 @@
     button { padding: .7rem 1rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
     button.secondary { border: 1px solid #28545b; background: transparent; color: #b8d0d2; }
     .user-row { padding: .8rem 0; border-bottom: 1px solid #17434b; }
+    .user-row form { margin-top: .8rem; }
     #notice { min-height: 1.4rem; margin: .8rem 0; color: #ff9b8f; }
     @media (max-width: 480px) { header, .user-row { align-items: flex-start; flex-direction: column; } }
   </style>
@@ -34,6 +35,14 @@
   <form id="createForm">
     <label>Identificador<input id="newUserId" required maxlength="32" autocomplete="off"></label>
     <label>Contraseña temporal<input id="newUserPassword" type="password" required minlength="12" autocomplete="new-password"></label>
+    <label>Nombre<input name="firstName" required maxlength="120"></label>
+    <label>Apellidos<input name="lastName" required maxlength="120"></label>
+    <label>Email<input name="email" type="email" required maxlength="254"></label>
+    <label>Calle<input name="street" required maxlength="120"></label>
+    <label>Población<input name="city" required maxlength="120"></label>
+    <label>Código postal<input name="postalCode" required maxlength="120"></label>
+    <label>Provincia (opcional)<input name="province" maxlength="120"></label>
+    <label>Perfil operativo<select name="operationalProfile"><option value="licensed">Usuario con licencia</option><option value="capture">Usuario de captación</option></select></label>
     <button type="submit">Crear usuario</button>
   </form>
   <h2>Usuarios</h2>
@@ -59,8 +68,51 @@ async function loadUsers() {
     label.textContent = user.userId + (user.mustChangePassword ? ' · debe cambiar la contraseña' : '');
     const role = document.createElement('span');
     role.className = 'role';
-    role.textContent = user.isAdmin ? 'Administrador' : 'Usuario';
+    role.textContent = (user.isAdmin ? 'Administrador' : 'Usuario') + ' · ' +
+      (user.operationalProfile === 'capture' ? 'Usuario de captación' : 'Usuario con licencia');
     row.append(label, role);
+    const edit = document.createElement('form');
+    const fields = [
+      ['userId', 'Indicativo / ID', user.userId, 'text', true],
+      ['firstName', 'Nombre', user.firstName, 'text', true],
+      ['lastName', 'Apellidos', user.lastName, 'text', true],
+      ['email', 'Email', user.email, 'email', true],
+      ['street', 'Calle', user.street, 'text', true],
+      ['city', 'Población', user.city, 'text', true],
+      ['postalCode', 'Código postal', user.postalCode, 'text', true],
+      ['province', 'Provincia (opcional)', user.province, 'text', false]
+    ];
+    for (const [name, title, value, type, required] of fields) {
+      const field = document.createElement('label');
+      field.textContent = title;
+      const input = document.createElement('input');
+      input.name = name; input.type = type; input.value = value || '';
+      input.maxLength = name === 'email' ? 254 : 120;
+      input.required = required;
+      field.append(input); edit.append(field);
+    }
+    const profileLabel = document.createElement('label');
+    profileLabel.textContent = 'Perfil operativo';
+    const select = document.createElement('select'); select.name = 'operationalProfile';
+    for (const [value, title] of [['licensed', 'Usuario con licencia'], ['capture', 'Usuario de captación']]) {
+      const option = document.createElement('option'); option.value = value; option.textContent = title;
+      select.append(option);
+    }
+    select.value = user.operationalProfile || 'licensed';
+    profileLabel.append(select); edit.append(profileLabel);
+    const save = document.createElement('button'); save.type = 'submit'; save.textContent = 'Guardar cambios';
+    edit.append(save);
+    edit.addEventListener('submit', async event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(edit).entries());
+      try {
+        await api('/api/v1/admin/users/' + encodeURIComponent(user.userId), {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+        });
+        await loadUsers(); notice.textContent = 'Se ha actualizado ' + data.userId + '.';
+      } catch (error) { notice.textContent = error.message; }
+    });
+    row.append(edit);
     if (!user.isAdmin) {
       const promote = document.createElement('button');
       promote.type = 'button';
@@ -85,12 +137,14 @@ document.getElementById('createForm').addEventListener('submit', async event => 
   event.preventDefault();
   notice.textContent = '';
   try {
+    const form = event.target;
+    const profile = Object.fromEntries(new FormData(form).entries());
     const result = await api('/api/v1/admin/users', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: document.getElementById('newUserId').value,
+      body: JSON.stringify({ ...profile, userId: document.getElementById('newUserId').value,
                              password: document.getElementById('newUserPassword').value })
     });
-    event.target.reset();
+    form.reset();
     await loadUsers();
     notice.textContent = 'Se ha creado el usuario ' + result.userId + '.';
   } catch (error) { notice.textContent = error.message; }

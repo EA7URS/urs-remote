@@ -2291,6 +2291,11 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
 <link rel="stylesheet" href="js8-panel.css">
 </head>
 <body>
+<dialog id="transmitDeniedDialog" aria-labelledby="transmitDeniedTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
+    <h2 id="transmitDeniedTitle" style="margin-top:0; color:#38d1c5">Transmisión no permitida</h2>
+    <p id="transmitDeniedMessage">Tu perfil no permite transmitir. Contacta con un administrador si necesitas acceso de transmisión.</p>
+    <button type="button" onclick="document.getElementById('transmitDeniedDialog').close()">Entendido</button>
+</dialog>
 <!-- Startup Overlay -->
 <div id="startupOverlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #0a0a0a 100%); z-index: 9999; display: flex; flex-direction: column; justify-content: center; align-items: center; font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; padding: 24px;">
     <div style="text-align: center; max-width: 640px;">
@@ -3523,13 +3528,38 @@ function scheduleReconnect() {
 }
 
 function send(obj) {
+    if (!canTransmit && commandRequestsTransmission(obj)) {
+        showTransmitDenied();
+        return;
+    }
     if (wsTransport) wsTransport.sendCommand(obj);
+}
+
+var canTransmit = false;
+function commandRequestsTransmission(obj) {
+    if (!obj) return false;
+    var cmd = obj.cmd;
+    if (cmd === 'setPTT' || cmd === 'enableMic') return obj.value === true;
+    if (cmd === 'sendCW') return !!obj.text;
+    if (cmd === 'setTuner' || cmd === 'setBreakIn') return Number(obj.value) > 0;
+    if (cmd === 'aprsBeaconConfig') return obj.enabled === true;
+    return ['packetTx', 'aprsTxBeacon', 'termConnect', 'termDisconnect', 'termSend',
+        'termClose', 'termFileSend', 'termFileAbort', 'termXferAccept',
+        'termXferReject', 'termRegister', 'termUnregister'].indexOf(cmd) !== -1;
+}
+function showTransmitDenied(message) {
+    var dialog = document.getElementById('transmitDeniedDialog');
+    var text = document.getElementById('transmitDeniedMessage');
+    if (text && message) text.textContent = message;
+    if (dialog && !dialog.open && typeof dialog.showModal === 'function') dialog.showModal();
+    else if (!dialog || typeof dialog.showModal !== 'function') window.alert(message || 'Tu perfil no permite transmitir. Contacta con un administrador si necesitas acceso de transmisión.');
 }
 
 function txAudioReady() {
     return ws && ws.readyState === WebSocket.OPEN;
 }
 function sendTxAudio(frame) {
+    if (!canTransmit) { showTransmitDenied(); return; }
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(frame);
         Recorder.feedTx(frame, digiTxCtx ? digiTxCtx.sampleRate : 48000);
@@ -3542,8 +3572,16 @@ function sendTxAudio(frame) {
 function handleMessage(msg) {
     // Forward to read-only consumer modules before main state-machine switch.
     if (window.Packet && window.Packet.onMessage) window.Packet.onMessage(msg);
+    if (msg.type === 'transmitDenied') {
+        showTransmitDenied(msg.message);
+        return;
+    }
     switch (msg.type) {
         case 'rigInfo':
+            if (msg.canTransmit !== undefined) {
+                canTransmit = !!msg.canTransmit;
+                document.body.classList.toggle('receive-only', !canTransmit);
+            }
             if (msg.version) {
                 serverVersion = msg.version;
                 var el = document.getElementById('splashVersion');
@@ -6859,6 +6897,7 @@ function updateWarningVisibility() {
 }
 
 function handlePTTPress() {
+    if (!canTransmit) { showTransmitDenied(); return false; }
     // Skip audio/mic checks for CW mode (uses radio's internal keyer)
     var isCW = (currentMode === 'CW' || currentMode === 'CW-R');
     if (isCW) return true;
@@ -10879,6 +10918,7 @@ function digiRowClick(el, ev) {
 
 // Double-click on a DECODE row (All Decodes / Directed): run click logic then enable TX + arm.
 function digiRowDblClick(el, ev) {
+    if (!canTransmit) { showTransmitDenied(); return; }
     if (!checkDigiCallGrid()) return;
     // If a transmission is already in progress, abort it transparently so the
     // new selection takes over immediately (same slot if phase allows).
@@ -10921,6 +10961,7 @@ function toggleDigiCqParity() {
 
 // Start calling CQ: enable TX, arm the CQ message, use the user-selected parity
 function digiCallCq() {
+    if (!canTransmit) { showTransmitDenied(); return; }
     if (!checkDigiCallGrid()) return;
     var myCall = getMyCall();
     var myGrid = getMyGrid();
@@ -11687,6 +11728,7 @@ function initDigiFieldDaySettings() {
 }
 
 function executeDigiTx(slotPhase) {
+    if (!canTransmit) { showTransmitDenied(); return; }
     console.log('[DIGI TX] executeDigiTx: enabled=' + digiTxEnabled +
                 ' queued=' + JSON.stringify(digiTxQueued) +
                 ' lib=' + (window.ft8tsLib ? 'yes' : 'NO') +
@@ -11849,6 +11891,7 @@ function stopDigiTune() {
 }
 
 function startDigiTune(overrideFreq) {
+    if (!canTransmit) { showTransmitDenied(); return; }
     var txCtx = digiTxCtx;
     if (!txCtx || txCtx.state === 'closed') {
         console.warn('[DIGI] Tune: AudioContext not ready');
@@ -13089,6 +13132,7 @@ function initDigiHandlers() {
     var enableTxBtn = document.getElementById('digiEnableTxBtn');
     if (enableTxBtn) {
         enableTxBtn.addEventListener('click', function() {
+            if (!canTransmit && !digiTxEnabled) { showTransmitDenied(); return; }
             digiTxEnabled = !digiTxEnabled;
             this.classList.toggle('active', digiTxEnabled);
             if (digiTxEnabled) {
@@ -13148,6 +13192,7 @@ function initDigiHandlers() {
     var tuneBtn = document.getElementById('digiTuneBtn');
     if (tuneBtn) {
         tuneBtn.addEventListener('click', function() {
+            if (!canTransmit && !digiTuneActive) { showTransmitDenied(); return; }
             initDigiTxCtx();
             if (digiTuneActive) {
                 stopDigiTune();

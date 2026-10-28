@@ -5,7 +5,7 @@
 The wfview web server exposes a REST API over HTTP for scripting and integration with external tools. All radio control operations available via WebSocket are also available via REST.
 
 **Format:** JSON (`Content-Type: application/json`)
-**Authentication:** None (Phase 4)
+**Authentication:** Session cookie required for account and radio endpoints.
 **CORS:** `Access-Control-Allow-Origin: *` on all responses
 
 ## Ports
@@ -25,6 +25,32 @@ When SSL is not available on the host system, port 8080 is plain HTTP and port 8
 > **Microcontrollers (ESP32, Pico W, Arduino):** use port 8081 with plain HTTP. No TLS stack needed.
 
 > **Hamlib rigctld** (server build only): TCP, default port 4532, bound to `127.0.0.1`. Disabled by default — enable with `--rigctld-port 4532` or `RigCtldEnabled=true` in settings. Pass `--rigctld-bind-all` to listen on all interfaces (the Hamlib protocol is unauthenticated, so binding to a network interface hands PTT to anyone on the LAN). PTT requests route through the same path the WebSocket `setPTT` command uses, so RADE EOO synthesis and packet TX coordination stay intact. Use any Hamlib client (`rigctl`, fldigi, WSJT-X, POTACAT, gpredict) with `-m 2 -r 127.0.0.1:4532`.
+
+---
+
+## Accounts and transmission permissions
+
+The web application uses the `wfweb_session` cookie. Login is allowed over
+HTTPS, or over HTTP from localhost. Mutating account requests must have the
+same origin as the application.
+
+| Method | Endpoint | Action |
+|---|---|---|
+| `POST` | `/api/v1/auth/login` | Sign in with `userId` and `password` |
+| `GET` | `/api/v1/auth/me` | Return the current account, operational profile, and personal profile |
+| `PUT` | `/api/v1/auth/profile` | Update the current user's ID, name, and address; email and operational profile are read-only |
+| `POST` | `/api/v1/auth/logout` | End the current session |
+| `POST` | `/api/v1/auth/password` | Change the current user's password |
+| `GET` | `/api/v1/admin/users` | List account profiles (administrator only) |
+| `POST` | `/api/v1/admin/users` | Create an account with its profile (administrator only) |
+| `PUT` | `/api/v1/admin/users/{userId}` | Update any account profile, email, ID, and operational profile (administrator only) |
+
+An operational profile is either `licensed` (transmission permitted) or
+`capture` (receive and non-transmitting controls only). An unauthorized
+transmit request returns `403` with `{"code":"transmit_denied"}`. WebSocket
+transmit requests receive a `transmitDenied` message. The unauthenticated
+Hamlib `rigctld` protocol cannot identify an account, so its PTT-on, CW send,
+and tuner-on requests are rejected; PTT-off and CW stop remain available.
 
 ---
 
