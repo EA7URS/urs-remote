@@ -137,6 +137,8 @@ html, body {
 #connDot.connected { background: #0a0; }
 #accountUser { color: var(--text-dim); font-size: 10px; max-width: 8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-link, #logoutBtn { color: #7ddbd4; border: 1px solid #22545a; border-radius: 3px; padding: 2px 5px; background: #071719; font: 10px var(--font-mono); text-decoration: none; cursor: pointer; }
+.account-link.home-link { display: inline-flex; align-items: center; flex-shrink: 0; min-height: 26px; padding: 4px 8px; border-color: #38d1c5; color: #d5fffc; font: 600 11px system-ui, sans-serif; white-space: nowrap; }
+.account-link.home-link:hover, .account-link.home-link:focus-visible { background: #15343a; outline: 2px solid #38d1c5; outline-offset: 1px; }
 @media (max-width: 600px) { #accountUser { display: none; } }
 #powerBtn {
     width: 22px; height: 22px;
@@ -2382,7 +2384,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
         <span class="flex-space"></span>
         <span id="rigTag" title="Rig"></span>
         <span id="accountUser" title="Signed-in user"></span>
-        <a class="account-link" href="/home.html" aria-label="Volver al inicio">INICIO</a>
+        <a class="account-link home-link" href="/home.html" title="Volver a las tres opciones de cuenta">Volver al inicio</a>
         <a id="adminLink" class="account-link" href="/admin.html" hidden>USERS</a>
         <button id="logoutBtn" type="button">OUT</button>
         <button id="recBtn" class="rec-btn" title="Record">REC</button>
