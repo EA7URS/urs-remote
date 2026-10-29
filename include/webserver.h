@@ -272,6 +272,7 @@ private:
     void sendCurrentState(QWebSocket *client);
     void checkRadioUsageLimits();
     void stopRadioTransmissionForClient(QWebSocket *client);
+    bool expireReservationSessionIfNeeded(QWebSocket *client, qint64 now);
     QString otherRadioUserConnected(const QString &userId) const;
     void takeOverRadioConnections(const QString &userId);
     QString modeToString(modeInfo m);
@@ -297,6 +298,7 @@ private:
     QList<QWebSocket *> wsClients;
     QHash<QWebSocket *, QString> wsUserIds_;
     QHash<QWebSocket *, QString> wsUsageSessionIds_;
+    QHash<QWebSocket *, qint64> wsReservationEnds_;
     QHash<QWebSocket *, qint64> wsSessionExpiries_;
     QHash<QString, QString> dailyUsageWarningPeriods_;
     QHash<QString, QSet<int>> dailyUsageWarnings_;

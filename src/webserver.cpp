@@ -2418,6 +2418,8 @@ void webServer::onWsNewConnection()
     browserCount_ = wsClients.size();
     qInfo() << "Web client connected:" << user.userId << pSocket->peerAddress().toString();
     wsUsageSessionIds_.insert(pSocket, usageSession);
+    if (reservationOwner == user.userId)
+        wsReservationEnds_.insert(pSocket, activeReservation.value(QStringLiteral("endsAt")).toVariant().toLongLong());
     if (!usageQuotaTimer_) {
         usageQuotaTimer_ = new QTimer(this);
         usageQuotaTimer_->setInterval(1000);
@@ -2433,13 +2435,17 @@ void webServer::onWsTextMessage(QString message)
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
     if (!pClient || !wsClients.contains(pClient)) return;
-    if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (wsSessionExpiries_.value(pClient, 0) <= now) {
         pClient->close();
         return;
     }
+    if (expireReservationSessionIfNeeded(pClient, now)) return;
     const QString userId = wsUserIds_.value(pClient);
-    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QJsonObject activeReservation = userDatabase_.activeReservation(now);
     const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+    if (reservationOwner == userId)
+        wsReservationEnds_.insert(pClient, activeReservation.value(QStringLiteral("endsAt")).toVariant().toLongLong());
     if (!reservationOwner.isEmpty() && reservationOwner != userId
             && !userDatabase_.isAdministrator(userId)) {
         sendJsonTo(pClient, QJsonObject{{"type", "radioReserved"},
@@ -2513,6 +2519,20 @@ void webServer::stopRadioTransmissionForClient(QWebSocket *client)
     packetTxBusy = false;
 }
 
+bool webServer::expireReservationSessionIfNeeded(QWebSocket *client, qint64 now)
+{
+    const qint64 reservedUntil = wsReservationEnds_.value(client, 0);
+    if (!client || reservedUntil <= 0 || now < reservedUntil) return false;
+
+    stopRadioTransmissionForClient(client);
+    userDatabase_.endUsageSession(wsUsageSessionIds_.value(client), reservedUntil);
+    wsReservationEnds_.remove(client);
+    sendJsonTo(client, QJsonObject{{"type", "reservationEnded"},
+                                   {"message", "Tu periodo reservado ha terminado. La emisora vuelve a estar disponible."}});
+    client->close();
+    return true;
+}
+
 void webServer::onWsDisconnected()
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
@@ -2527,6 +2547,7 @@ void webServer::onWsDisconnected()
         wsClients.removeAll(pClient);
         wsUserIds_.remove(pClient);
         wsSessionExpiries_.remove(pClient);
+        wsReservationEnds_.remove(pClient);
         if (wsClients.isEmpty() && usageQuotaTimer_) usageQuotaTimer_->stop();
         browserCount_ = wsClients.size();
         pClient->deleteLater();
@@ -2602,8 +2623,11 @@ void webServer::checkRadioUsageLimits()
               .arg(reservationHolderLabel(activeReservation));
     for (QWebSocket *client : clients) {
         if (!wsClients.contains(client)) continue;
+        if (expireReservationSessionIfNeeded(client, now)) continue;
         const QString userId = wsUserIds_.value(client);
         const bool administrator = userDatabase_.isAdministrator(userId);
+        if (reservationOwner == userId)
+            wsReservationEnds_.insert(client, activeReservation.value(QStringLiteral("endsAt")).toVariant().toLongLong());
         if (!reservationOwner.isEmpty() && reservationOwner != userId && !administrator) {
             sendJsonTo(client, QJsonObject{{"type", "radioReserved"},
                                            {"message", reservationMessage}});
@@ -2685,13 +2709,17 @@ void webServer::onWsBinaryMessage(QByteArray message)
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
     if (!pClient || !wsClients.contains(pClient)) return;
-    if (wsSessionExpiries_.value(pClient, 0) <= QDateTime::currentSecsSinceEpoch()) {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (wsSessionExpiries_.value(pClient, 0) <= now) {
         pClient->close();
         return;
     }
+    if (expireReservationSessionIfNeeded(pClient, now)) return;
     const QString userId = wsUserIds_.value(pClient);
-    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QJsonObject activeReservation = userDatabase_.activeReservation(now);
     const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+    if (reservationOwner == userId)
+        wsReservationEnds_.insert(pClient, activeReservation.value(QStringLiteral("endsAt")).toVariant().toLongLong());
     if (!reservationOwner.isEmpty() && reservationOwner != userId
             && !userDatabase_.isAdministrator(userId)) {
         sendJsonTo(pClient, QJsonObject{{"type", "radioReserved"},
