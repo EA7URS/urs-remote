@@ -57,6 +57,8 @@ public:
                               QString *error = nullptr);
     void endUsageSession(const QString &sessionId);
     QString activeReservationOwner(qint64 now) const;
+    QJsonObject activeReservation(qint64 now) const;
+    QJsonArray upcomingReservations(qint64 now, qint64 through) const;
     bool isAdministrator(const QString &userId) const;
     QJsonArray reservations(const QString &userId) const;
     bool createReservation(const QString &userId, qint64 startsAt, qint64 endsAt,

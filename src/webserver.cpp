@@ -67,6 +67,13 @@ static QString sessionCookieValue(const QByteArray &headers)
     return QString();
 }
 
+static QString reservationHolderLabel(const QJsonObject &reservation)
+{
+    const QString callsign = reservation.value(QStringLiteral("userId")).toString();
+    const QString name = reservation.value(QStringLiteral("name")).toString().trimmed();
+    return name.isEmpty() ? callsign : callsign + QLatin1Char(' ') + name;
+}
+
 static bool sameRequestOrigin(const QByteArray &headers, bool tls)
 {
     const QByteArray originHeader = httpHeaderValue(headers, "Origin");
@@ -1182,19 +1189,26 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         } else {
             const QJsonObject reservation = userDatabase_.reservationStatus(currentUser.userId);
             const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
-            const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            const QJsonObject activeReservation = userDatabase_.activeReservation(now);
+            const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
             const bool canAccessRadio = currentUser.isAdmin
                     || (reservationOwner.isEmpty() ? usage.value(QStringLiteral("allowed")).toBool()
                                                    : reservationOwner == currentUser.userId);
             const QString radioAccessMessage = reservationOwner == currentUser.userId
                     ? QString() : (!reservationOwner.isEmpty()
-                                   ? QStringLiteral("La emisora está reservada por otro usuario en este horario.")
+                                   ? QStringLiteral("El acceso a la radio está reservado por %1.")
+                                     .arg(reservationHolderLabel(activeReservation))
                                    : usage.value(QStringLiteral("message")).toString());
+            const QJsonArray upcomingReservations = userDatabase_.upcomingReservations(
+                        now, now + 7 * 24 * 60 * 60);
             sendRestResponse(socket, 200,
                              QJsonObject{{"userId", currentUser.userId},
                                          {"isAdmin", currentUser.isAdmin},
                                          {"canAccessRadio", canAccessRadio},
                                          {"radioAccessMessage", radioAccessMessage},
+                                         {"upcomingReservations", upcomingReservations},
+                                         {"activeReservation", activeReservation},
                                          {"operationalProfile", currentUser.operationalProfile},
                                          {"canTransmit", currentUser.operationalProfile == QLatin1String("licensed")},
                                          {"maxReservationMinutes", currentUser.maxReservationMinutes},
@@ -1516,8 +1530,17 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
     }
 
     if (p.startsWith("/api/v1/radio/")) {
+        const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+        const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+        if (!currentUser.isAdmin && !reservationOwner.isEmpty()
+                && reservationOwner != currentUser.userId) {
+            sendRestResponse(socket, 409,
+                             QJsonObject{{"code", "radio_reserved"},
+                                         {"error", QStringLiteral("El acceso a la radio está reservado por %1.")
+                                          .arg(reservationHolderLabel(activeReservation))}});
+            return;
+        }
         const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
-        const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
         if (!usage.value(QStringLiteral("allowed")).toBool()
                 && !(currentUser.isAdmin || reservationOwner == currentUser.userId)) {
             sendRestResponse(socket, 403,
@@ -1526,7 +1549,8 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             return;
         }
         const QString activeOtherUser = otherRadioUserConnected(currentUser.userId);
-        if (!currentUser.isAdmin && reservationOwner != currentUser.userId && !activeOtherUser.isEmpty()) {
+        if (!currentUser.isAdmin && reservationOwner != currentUser.userId
+                && !activeOtherUser.isEmpty()) {
             sendRestResponse(socket, 409,
                              QJsonObject{{"code", "radio_busy"},
                                          {"error", "La radio está siendo utilizada por otro usuario."}});
@@ -2354,11 +2378,13 @@ void webServer::onWsNewConnection()
         return;
     }
 
-    const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
     const QString activeOtherUser = otherRadioUserConnected(user.userId);
     if (!user.isAdmin && !reservationOwner.isEmpty() && reservationOwner != user.userId) {
         rejectWebSocket(pSocket, QJsonObject{{"type", "radioReserved"},
-                                             {"message", "La emisora está reservada por otro usuario en este horario."}});
+                                             {"message", QStringLiteral("El acceso a la radio está reservado por %1.")
+                                              .arg(reservationHolderLabel(activeReservation))}});
         return;
     }
     if (!user.isAdmin && reservationOwner != user.userId && !activeOtherUser.isEmpty()) {
@@ -2411,11 +2437,21 @@ void webServer::onWsTextMessage(QString message)
         pClient->close();
         return;
     }
-    const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
-    const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+    const QString userId = wsUserIds_.value(pClient);
+    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+    if (!reservationOwner.isEmpty() && reservationOwner != userId
+            && !userDatabase_.isAdministrator(userId)) {
+        sendJsonTo(pClient, QJsonObject{{"type", "radioReserved"},
+                                        {"message", QStringLiteral("El acceso a la radio está reservado por %1.")
+                                         .arg(reservationHolderLabel(activeReservation))}});
+        pClient->close();
+        return;
+    }
+    const QJsonObject usage = userDatabase_.usageStatus(userId);
     if (!usage.value(QStringLiteral("allowed")).toBool()
-            && reservationOwner != wsUserIds_.value(pClient)
-            && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
+            && reservationOwner != userId
+            && !userDatabase_.isAdministrator(userId)) {
         stopRadioTransmissionForClient(pClient);
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
@@ -2521,6 +2557,12 @@ QString webServer::otherRadioUserConnected(const QString &userId) const
 void webServer::takeOverRadioConnections(const QString &userId)
 {
     const bool administrator = userDatabase_.isAdministrator(userId);
+    const QJsonObject activeReservation = administrator
+            ? QJsonObject() : userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QString reservationMessage = activeReservation.isEmpty()
+            ? QStringLiteral("Ha comenzado una reserva de otro usuario y la sesión se ha cerrado.")
+            : QStringLiteral("El acceso a la radio está reservado por %1.")
+              .arg(reservationHolderLabel(activeReservation));
     const QList<QWebSocket *> clients = wsClients;
     for (QWebSocket *client : clients) {
         if (!client || !wsClients.contains(client) || wsUserIds_.value(client) == userId)
@@ -2531,7 +2573,7 @@ void webServer::takeOverRadioConnections(const QString &userId)
                    ? QJsonObject{{"type", "radioControlTakenOver"},
                                  {"message", "Un administrador ha tomado el control de la radio y ha cerrado esta sesión."}}
                    : QJsonObject{{"type", "radioReserved"},
-                                 {"message", "Ha comenzado una reserva de otro usuario y la sesión se ha cerrado."}});
+                                 {"message", reservationMessage}});
         client->close();
     }
 }
@@ -2552,14 +2594,19 @@ void webServer::checkRadioUsageLimits()
 
     const QList<QWebSocket *> clients = wsClients;
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    const QString reservationOwner = userDatabase_.activeReservationOwner(now);
+    const QJsonObject activeReservation = userDatabase_.activeReservation(now);
+    const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+    const QString reservationMessage = activeReservation.isEmpty()
+            ? QStringLiteral("La emisora está reservada por otro usuario en este horario.")
+            : QStringLiteral("El acceso a la radio está reservado por %1.")
+              .arg(reservationHolderLabel(activeReservation));
     for (QWebSocket *client : clients) {
         if (!wsClients.contains(client)) continue;
         const QString userId = wsUserIds_.value(client);
         const bool administrator = userDatabase_.isAdministrator(userId);
         if (!reservationOwner.isEmpty() && reservationOwner != userId && !administrator) {
             sendJsonTo(client, QJsonObject{{"type", "radioReserved"},
-                                           {"message", "La emisora está reservada por otro usuario en este horario."}});
+                                           {"message", reservationMessage}});
             client->close();
             continue;
         }
@@ -2642,11 +2689,21 @@ void webServer::onWsBinaryMessage(QByteArray message)
         pClient->close();
         return;
     }
-    const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
+    const QString userId = wsUserIds_.value(pClient);
+    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
+    if (!reservationOwner.isEmpty() && reservationOwner != userId
+            && !userDatabase_.isAdministrator(userId)) {
+        sendJsonTo(pClient, QJsonObject{{"type", "radioReserved"},
+                                        {"message", QStringLiteral("El acceso a la radio está reservado por %1.")
+                                         .arg(reservationHolderLabel(activeReservation))}});
+        pClient->close();
+        return;
+    }
+    const QJsonObject usage = userDatabase_.usageStatus(userId);
     if (!usage.value(QStringLiteral("allowed")).toBool()
-            && userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch())
-                    != wsUserIds_.value(pClient)
-            && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
+            && reservationOwner != userId
+            && !userDatabase_.isAdministrator(userId)) {
         stopRadioTransmissionForClient(pClient);
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
