@@ -1112,11 +1112,16 @@ QString UserDatabase::startUsageSession(const QString &userId, QJsonObject *stat
 
 void UserDatabase::endUsageSession(const QString &sessionId)
 {
+    endUsageSession(sessionId, QDateTime::currentSecsSinceEpoch());
+}
+
+void UserDatabase::endUsageSession(const QString &sessionId, qint64 endedAt)
+{
     if (sessionId.isEmpty()) return;
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("UPDATE radio_usage_sessions SET ended_at = ? "
                                  "WHERE session_id = ? AND ended_at IS NULL"));
-    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    query.addBindValue(endedAt);
     query.addBindValue(sessionId);
     query.exec();
 }

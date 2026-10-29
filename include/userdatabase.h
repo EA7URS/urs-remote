@@ -56,6 +56,7 @@ public:
     QString startUsageSession(const QString &userId, QJsonObject *status,
                               QString *error = nullptr);
     void endUsageSession(const QString &sessionId);
+    void endUsageSession(const QString &sessionId, qint64 endedAt);
     QString activeReservationOwner(qint64 now) const;
     QJsonObject activeReservation(qint64 now) const;
     QJsonArray upcomingReservations(qint64 now, qint64 through) const;
