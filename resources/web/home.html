@@ -18,6 +18,15 @@
     nav a:hover, nav a:focus-visible { border-color: #38d1c5; background: #15343a; }
     nav a[aria-disabled="true"] { opacity: .55; cursor: not-allowed; border-color: #28545b; }
     nav a[aria-disabled="true"]:hover, nav a[aria-disabled="true"]:focus-visible { border-color: #28545b; background: #10272c; }
+    .schedule { margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid #17434b; }
+    .schedule h2 { margin: 0; color: #38d1c5; font-size: 1.2rem; }
+    .schedule-list { list-style: none; margin: .75rem 0 0; padding: 0; }
+    .schedule-list li { margin-top: .55rem; padding: .8rem 1rem; border: 1px solid #28545b; border-radius: .55rem; background: #10272c; }
+    .schedule-list li.active { border-color: #38d1c5; background: #123b3d; box-shadow: inset 3px 0 #38d1c5; }
+    .schedule-holder { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; font-weight: 650; }
+    .schedule-callsign { color: #70e0d8; font-family: monospace; }
+    .schedule-active { padding: .15rem .45rem; border-radius: 999px; color: #071114; background: #38d1c5; font-size: .75rem; }
+    .schedule-time { display: block; margin-top: .35rem; color: #a9bfc2; }
     button { margin-top: 1.5rem; padding: .65rem 1rem; border: 1px solid #28545b; border-radius: .45rem; background: transparent; color: #b8d0d2; font: inherit; cursor: pointer; }
     #notice { color: #ff9b8f; }
   </style>
@@ -32,6 +41,11 @@
     <a href="/reservations.html">Reservar tiempo de radio</a>
     <a id="radioLink" href="/index.html">Ir a la radio</a>
   </nav>
+  <section class="schedule" aria-labelledby="scheduleTitle">
+    <h2 id="scheduleTitle">Reservas de los próximos 7 días</h2>
+    <ol id="scheduleList" class="schedule-list" aria-live="polite"></ol>
+    <p id="scheduleEmpty" hidden>No hay reservas confirmadas en este periodo.</p>
+  </section>
   <p id="radioNotice" role="status" aria-live="polite" hidden></p>
   <p id="notice" role="status" aria-live="polite"></p>
   <button id="logout" type="button">Cerrar sesión</button>
@@ -42,6 +56,40 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   const user = await response.json();
   document.getElementById('user').textContent = user.userId;
   document.getElementById('adminLink').hidden = !user.isAdmin;
+  const scheduleList = document.getElementById('scheduleList');
+  const scheduleEmpty = document.getElementById('scheduleEmpty');
+  const reservations = user.upcomingReservations || [];
+  scheduleEmpty.hidden = reservations.length > 0;
+  for (const reservation of reservations) {
+    const row = document.createElement('li');
+    if (reservation.isActive) {
+      row.classList.add('active');
+      row.setAttribute('aria-current', 'true');
+    }
+    const holder = document.createElement('div');
+    holder.className = 'schedule-holder';
+    const callsign = document.createElement('span');
+    callsign.className = 'schedule-callsign';
+    callsign.textContent = reservation.userId;
+    holder.append(callsign);
+    if (reservation.name) {
+      const name = document.createElement('span');
+      name.textContent = reservation.name;
+      holder.append(name);
+    }
+    if (reservation.isActive) {
+      const active = document.createElement('span');
+      active.className = 'schedule-active';
+      active.textContent = 'En curso';
+      holder.append(active);
+    }
+    const time = document.createElement('time');
+    time.className = 'schedule-time';
+    time.dateTime = new Date(reservation.startsAt * 1000).toISOString();
+    time.textContent = `${new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(reservation.startsAt * 1000))} – ${new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(reservation.endsAt * 1000))}`;
+    row.append(holder, time);
+    scheduleList.append(row);
+  }
   const radioLink = document.getElementById('radioLink');
   const radioNotice = document.getElementById('radioNotice');
   if (!user.canAccessRadio) {
