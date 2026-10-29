@@ -37,11 +37,24 @@
     <label>Provincia (opcional)<input name="province" maxlength="120"></label>
     <label>Perfil operativo<select name="operationalProfile"><option value="licensed">Usuario con licencia</option><option value="capture">Usuario de captación</option></select></label>
     <label>Tiempos de uso autorizados<select id="usageProfileId" name="usageProfileId"><option value="">Sin límite</option></select></label>
+    <label for="reservationTimeValue">Tiempo máximo por reserva<input id="reservationTimeValue" type="number" min="0" step="1" inputmode="numeric"></label>
+    <label for="reservationTimeUnit">Unidad<select id="reservationTimeUnit"><option value="minutes">Minutos</option><option value="hours">Horas</option></select></label>
+    <p>Un valor vacío o cero impide realizar reservas.</p>
     <button type="submit">Crear usuario</button>
   </form>
 </main>
 <script>
 const notice = document.getElementById('notice');
+function readReservationMinutes() {
+  const rawValue = document.getElementById('reservationTimeValue').value.trim();
+  if (!rawValue) return 0;
+  const value = Number(rawValue);
+  const minutes = value * (document.getElementById('reservationTimeUnit').value === 'hours' ? 60 : 1);
+  if (!Number.isSafeInteger(value) || value < 0 || !Number.isSafeInteger(minutes)) {
+    throw new Error('El tiempo máximo por reserva debe ser un entero no negativo.');
+  }
+  return minutes;
+}
 async function api(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
   const result = await response.json().catch(() => ({}));
@@ -62,10 +75,14 @@ document.getElementById('createForm').addEventListener('submit', async event => 
   event.preventDefault(); notice.textContent = '';
   try {
     const form = event.target;
+    const data = Object.fromEntries(new FormData(form).entries());
+    data.maxReservationMinutes = readReservationMinutes();
+    data.usageProfileId = document.getElementById('usageProfileId').value
+      ? Number(document.getElementById('usageProfileId').value) : null;
+    data.userId = document.getElementById('newUserId').value;
+    data.password = document.getElementById('newUserPassword').value;
     const result = await api('/api/v1/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...Object.fromEntries(new FormData(form).entries()),
-        usageProfileId: document.getElementById('usageProfileId').value ? Number(document.getElementById('usageProfileId').value) : null,
-        userId: document.getElementById('newUserId').value, password: document.getElementById('newUserPassword').value }) });
+      body: JSON.stringify(data) });
     location.replace('/admin-edit.html?userId=' + encodeURIComponent(result.userId) + '&created=1');
   } catch (error) { notice.textContent = error.message; }
 });

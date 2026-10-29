@@ -46,6 +46,8 @@
     <label for="province">Provincia (opcional)</label>
     <input id="province" name="province" maxlength="120" autocomplete="address-level1">
     <p>Perfil operativo: <strong id="operationalProfile"></strong></p>
+    <p>Tiempo máximo por reserva: <strong id="maxReservationTime"></strong></p>
+    <p id="reservationAvailability" aria-live="polite"></p>
     <button type="submit">Guardar datos del perfil</button>
   </form>
   <section aria-labelledby="usageTitle">
@@ -79,6 +81,10 @@ function formatDuration(seconds) {
   if (secs && !hours) parts.push(secs + ' s');
   return parts.length ? parts.join(' ') : '0 min';
 }
+function formatReservationMinutes(minutes) {
+  if (minutes <= 0) return 'No puede realizar reservas';
+  return minutes % 60 === 0 ? (minutes / 60) + ' h' : minutes + ' min';
+}
 function renderUsage(usage, profileName) {
   document.getElementById('usageProfileName').textContent = 'Perfil de tiempo: ' + (profileName || usage.profileName || 'Sin límite');
   const target = document.getElementById('usagePeriods'); target.replaceChildren();
@@ -111,6 +117,11 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   }
   document.getElementById('operationalProfile').textContent = profile.operationalProfile === 'capture'
     ? 'Usuario de captación (sin transmisión)' : 'Usuario con licencia';
+  document.getElementById('maxReservationTime').textContent = formatReservationMinutes(profile.maxReservationMinutes || 0);
+  const effectiveReservationMinutes = Number(user.effectiveReservationMinutes) || 0;
+  document.getElementById('reservationAvailability').textContent = user.canReserve
+    ? 'Según tus tiempos de uso actuales, puedes reservar hasta ' + formatReservationMinutes(effectiveReservationMinutes) + '.'
+    : 'No tienes tiempo disponible para realizar reservas con los cupos de uso actuales.';
   renderUsage(user.usage || {}, user.usageProfileName);
 }).catch(() => location.replace('/login.html'));
 document.getElementById('profileForm').addEventListener('submit', async event => {
