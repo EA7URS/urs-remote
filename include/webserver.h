@@ -271,6 +271,7 @@ private:
     bool isFreeDVCompatibleMode(rigMode_t mk) const;
     void sendCurrentState(QWebSocket *client);
     void checkRadioUsageLimits();
+    void checkExpiredReservations();
     void stopRadioTransmissionForClient(QWebSocket *client);
     bool expireReservationSessionIfNeeded(QWebSocket *client, qint64 now);
     QString otherRadioUserConnected(const QString &userId) const;
@@ -303,6 +304,7 @@ private:
     QHash<QString, QString> dailyUsageWarningPeriods_;
     QHash<QString, QSet<int>> dailyUsageWarnings_;
     QTimer *usageQuotaTimer_ = nullptr;
+    QTimer *reservationExpiryTimer_ = nullptr;
     QHash<QString, QList<qint64>> failedLoginTimes_;
     UserDatabase userDatabase_;
     cachingQueue *queue = nullptr;

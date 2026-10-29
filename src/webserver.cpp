@@ -455,6 +455,11 @@ void webServer::init(quint16 httpPort, quint16 wsPort)
         restListen_ = ListenFailed;
         return;
     }
+    checkExpiredReservations();
+    reservationExpiryTimer_ = new QTimer(this);
+    reservationExpiryTimer_->setInterval(5000);
+    connect(reservationExpiryTimer_, &QTimer::timeout, this, &webServer::checkExpiredReservations);
+    reservationExpiryTimer_->start();
 
     connect(queue, SIGNAL(rigCapsUpdated(rigCapabilities*)), this, SLOT(receiveRigCaps(rigCapabilities*)));
     connect(queue, SIGNAL(cacheUpdated(cacheItem)), this, SLOT(receiveCache(cacheItem)));
@@ -1187,15 +1192,19 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         } else if (!currentUser.authenticated) {
             sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
         } else {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            checkExpiredReservations();
             const QJsonObject reservation = userDatabase_.reservationStatus(currentUser.userId);
             const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
-            const qint64 now = QDateTime::currentSecsSinceEpoch();
             const QJsonObject activeReservation = userDatabase_.activeReservation(now);
+            const QJsonObject missedReservation = userDatabase_.missedReservation(currentUser.userId, now);
             const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
-            const bool canAccessRadio = currentUser.isAdmin
-                    || (reservationOwner.isEmpty() ? usage.value(QStringLiteral("allowed")).toBool()
-                                                   : reservationOwner == currentUser.userId);
-            const QString radioAccessMessage = reservationOwner == currentUser.userId
+            const bool canAccessRadio = currentUser.isAdmin || (missedReservation.isEmpty()
+                    && (reservationOwner.isEmpty() ? usage.value(QStringLiteral("allowed")).toBool()
+                                                   : reservationOwner == currentUser.userId));
+            const QString radioAccessMessage = !missedReservation.isEmpty()
+                    ? QStringLiteral("Has perdido esta reserva porque no te conectaste a la radio durante los 10 minutos posteriores a su inicio. El tiempo reservado se ha descontado de tus cupos.")
+                    : reservationOwner == currentUser.userId
                     ? QString() : (!reservationOwner.isEmpty()
                                    ? QStringLiteral("El acceso a la radio está reservado por %1.")
                                      .arg(reservationHolderLabel(activeReservation))
@@ -1207,6 +1216,7 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                                          {"isAdmin", currentUser.isAdmin},
                                          {"canAccessRadio", canAccessRadio},
                                          {"radioAccessMessage", radioAccessMessage},
+                                         {"reservationMissed", !missedReservation.isEmpty()},
                                          {"upcomingReservations", upcomingReservations},
                                          {"activeReservation", activeReservation},
                                          {"operationalProfile", currentUser.operationalProfile},
@@ -1530,7 +1540,16 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
     }
 
     if (p.startsWith("/api/v1/radio/")) {
-        const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        checkExpiredReservations();
+        const QJsonObject missedReservation = userDatabase_.missedReservation(currentUser.userId, now);
+        if (!currentUser.isAdmin && !missedReservation.isEmpty()) {
+            sendRestResponse(socket, 409,
+                             QJsonObject{{"code", "reservation_missed"},
+                                         {"error", QStringLiteral("Has perdido esta reserva porque no te conectaste a la radio durante los 10 minutos posteriores a su inicio. El tiempo reservado se ha descontado de tus cupos.")}});
+            return;
+        }
+        const QJsonObject activeReservation = userDatabase_.activeReservation(now);
         const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
         if (!currentUser.isAdmin && !reservationOwner.isEmpty()
                 && reservationOwner != currentUser.userId) {
@@ -2378,7 +2397,15 @@ void webServer::onWsNewConnection()
         return;
     }
 
-    const QJsonObject activeReservation = userDatabase_.activeReservation(QDateTime::currentSecsSinceEpoch());
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    checkExpiredReservations();
+    const QJsonObject missedReservation = userDatabase_.missedReservation(user.userId, now);
+    if (!user.isAdmin && !missedReservation.isEmpty()) {
+        rejectWebSocket(pSocket, QJsonObject{{"type", "reservationMissed"},
+                                             {"message", QStringLiteral("Has perdido esta reserva porque no te conectaste a la radio durante los 10 minutos posteriores a su inicio. El tiempo reservado se ha descontado de tus cupos.")}});
+        return;
+    }
+    const QJsonObject activeReservation = userDatabase_.activeReservation(now);
     const QString reservationOwner = activeReservation.value(QStringLiteral("userId")).toString();
     const QString activeOtherUser = otherRadioUserConnected(user.userId);
     if (!user.isAdmin && !reservationOwner.isEmpty() && reservationOwner != user.userId) {
@@ -2703,6 +2730,13 @@ void webServer::checkRadioUsageLimits()
             }
         }
     }
+}
+
+void webServer::checkExpiredReservations()
+{
+    const int missed = userDatabase_.processExpiredReservations(QDateTime::currentSecsSinceEpoch());
+    if (missed > 0)
+        qInfo() << "Automatically released" << missed << "unattended radio reservation(s)";
 }
 
 void webServer::onWsBinaryMessage(QByteArray message)

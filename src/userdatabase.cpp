@@ -280,7 +280,7 @@ bool UserDatabase::createSchema(QString *error)
             "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, "
             "starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, "
             "status TEXT NOT NULL DEFAULT 'confirmed' CHECK(status IN ('confirmed', 'cancelled')), "
-            "created_at INTEGER NOT NULL, CHECK(ends_at > starts_at))"))) {
+            "created_at INTEGER NOT NULL, missed_at INTEGER, attended_at INTEGER, CHECK(ends_at > starts_at))"))) {
         if (error) *error = queryError(query);
         return false;
     }
@@ -289,6 +289,20 @@ bool UserDatabase::createSchema(QString *error)
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_reservations_start ON radio_reservations(status, starts_at, ends_at)"));
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_reservations_user_start ON radio_reservations(user_id, status, starts_at)"));
     if (!migrateSchema(error)) return false;
+    QSqlQuery recordArrivals(db_);
+    recordArrivals.prepare(QStringLiteral(
+        "UPDATE radio_reservations SET attended_at = starts_at "
+        "WHERE status = 'confirmed' AND missed_at IS NULL AND attended_at IS NULL "
+        "AND starts_at <= ? "
+        "AND EXISTS (SELECT 1 FROM radio_usage_sessions s "
+        "WHERE s.user_id = radio_reservations.user_id AND s.ended_at IS NULL "
+        "AND s.started_at <= radio_reservations.starts_at + 600)"));
+    const qint64 startupNow = QDateTime::currentSecsSinceEpoch();
+    recordArrivals.addBindValue(startupNow);
+    if (!recordArrivals.exec()) {
+        if (error) *error = queryError(recordArrivals);
+        return false;
+    }
     if (!query.exec(QStringLiteral("UPDATE radio_usage_sessions SET ended_at = started_at WHERE ended_at IS NULL"))) {
         if (error) *error = queryError(query);
         return false;
@@ -326,6 +340,24 @@ bool UserDatabase::migrateSchema(QString *error)
                         .arg(column.first, column.second))) {
             if (error) *error = queryError(alter);
             return false;
+        }
+    }
+
+    QSet<QString> reservationColumns;
+    QSqlQuery reservationInfo(db_);
+    if (!reservationInfo.exec(QStringLiteral("PRAGMA table_info(radio_reservations)"))) {
+        if (error) *error = queryError(reservationInfo);
+        return false;
+    }
+    while (reservationInfo.next()) reservationColumns.insert(reservationInfo.value(1).toString());
+    reservationInfo.finish();
+    for (const QString &column : {QStringLiteral("missed_at"), QStringLiteral("attended_at")}) {
+        if (!reservationColumns.contains(column)) {
+            QSqlQuery alter(db_);
+            if (!alter.exec(QStringLiteral("ALTER TABLE radio_reservations ADD COLUMN %1 INTEGER").arg(column))) {
+                if (error) *error = queryError(alter);
+                return false;
+            }
         }
     }
 
@@ -927,7 +959,7 @@ qint64 UserDatabase::usageSeconds(const QString &userId, qint64 periodStart,
     if (query.lastError().isValid()) return -1;
     query.finish();
     query.prepare(QStringLiteral("SELECT starts_at, ends_at FROM radio_reservations "
-                                 "WHERE user_id = ? AND status = 'confirmed' "
+                                 "WHERE user_id = ? AND (status = 'confirmed' OR missed_at IS NOT NULL) "
                                  "AND starts_at < ? AND ends_at > ?"));
     query.addBindValue(normalizedUserId(userId));
     query.addBindValue(periodEnd);
@@ -1096,9 +1128,23 @@ QString UserDatabase::startUsageSession(const QString &userId, QJsonObject *stat
                                  "VALUES(?, ?, ?, NULL)"));
     query.addBindValue(id);
     query.addBindValue(normalizedUserId(userId));
-    query.addBindValue(QDateTime::currentSecsSinceEpoch());
-    if (!query.exec() || !db_.commit()) {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    query.addBindValue(now);
+    if (!query.exec()) {
         if (error) *error = queryError(query).isEmpty() ? db_.lastError().text() : queryError(query);
+        db_.rollback();
+        return QString();
+    }
+    QSqlQuery arrival(db_);
+    arrival.prepare(QStringLiteral("UPDATE radio_reservations SET attended_at = ? "
+                                   "WHERE user_id = ? AND status = 'confirmed' AND missed_at IS NULL "
+                                   "AND starts_at <= ? AND starts_at + 600 >= ? AND attended_at IS NULL"));
+    arrival.addBindValue(now);
+    arrival.addBindValue(normalizedUserId(userId));
+    arrival.addBindValue(now);
+    arrival.addBindValue(now);
+    if (!arrival.exec() || !db_.commit()) {
+        if (error) *error = queryError(arrival).isEmpty() ? db_.lastError().text() : queryError(arrival);
         db_.rollback();
         return QString();
     }
@@ -1151,6 +1197,57 @@ QJsonObject UserDatabase::activeReservation(qint64 now) const
                        {"isActive", true}};
 }
 
+QJsonObject UserDatabase::missedReservation(const QString &userId, qint64 now) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT reservation_id, starts_at, ends_at FROM radio_reservations "
+                                 "WHERE user_id = ? AND missed_at IS NOT NULL "
+                                 "AND starts_at <= ? AND ends_at > ? ORDER BY starts_at DESC LIMIT 1"));
+    query.addBindValue(normalizedUserId(userId));
+    query.addBindValue(now);
+    query.addBindValue(now);
+    if (!query.exec() || !query.next()) return QJsonObject();
+    return QJsonObject{{"id", query.value(0).toLongLong()},
+                       {"startsAt", query.value(1).toLongLong()},
+                       {"endsAt", query.value(2).toLongLong()}};
+}
+
+int UserDatabase::processExpiredReservations(qint64 now)
+{
+    QSqlQuery arrivals(db_);
+    arrivals.prepare(QStringLiteral(
+        "UPDATE radio_reservations SET attended_at = starts_at "
+        "WHERE status = 'confirmed' AND missed_at IS NULL AND attended_at IS NULL "
+        "AND starts_at <= ? AND starts_at + 600 >= ? "
+        "AND EXISTS (SELECT 1 FROM radio_usage_sessions s "
+        "WHERE s.user_id = radio_reservations.user_id "
+        "AND s.started_at <= radio_reservations.starts_at + 600 "
+        "AND (s.ended_at IS NULL OR s.ended_at > radio_reservations.starts_at))"));
+    arrivals.addBindValue(now);
+    arrivals.addBindValue(now);
+    if (!arrivals.exec()) {
+        qWarning() << "Could not record radio reservation arrivals:" << arrivals.lastError().text();
+        return -1;
+    }
+    arrivals.finish();
+
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral(
+        "UPDATE radio_reservations SET status = 'cancelled', missed_at = starts_at + 600 "
+        "WHERE status = 'confirmed' AND starts_at + 600 < ? "
+        "AND attended_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM radio_usage_sessions s "
+        "WHERE s.user_id = radio_reservations.user_id "
+        "AND s.started_at <= radio_reservations.starts_at + 600 "
+        "AND (s.ended_at IS NULL OR s.ended_at > radio_reservations.starts_at))"));
+    query.addBindValue(now);
+    if (!query.exec()) {
+        qWarning() << "Could not process expired radio reservations:" << query.lastError().text();
+        return -1;
+    }
+    return query.numRowsAffected();
+}
+
 QJsonArray UserDatabase::upcomingReservations(qint64 now, qint64 through) const
 {
     QJsonArray reservations;
@@ -1189,16 +1286,17 @@ QJsonArray UserDatabase::reservations(const QString &userId) const
 {
     QJsonArray result;
     QSqlQuery query(db_);
-    query.prepare(QStringLiteral("SELECT reservation_id, starts_at, ends_at, status FROM radio_reservations "
+    query.prepare(QStringLiteral("SELECT reservation_id, starts_at, ends_at, status, missed_at FROM radio_reservations "
                                  "WHERE user_id = ? ORDER BY starts_at DESC"));
     query.addBindValue(normalizedUserId(userId));
     if (!query.exec()) return result;
     while (query.next()) {
         const qint64 start = query.value(1).toLongLong();
         const qint64 end = query.value(2).toLongLong();
+        const QString status = query.value(4).isNull() ? query.value(3).toString() : QStringLiteral("missed");
         result.append(QJsonObject{{"id", query.value(0).toLongLong()}, {"startsAt", start},
                                   {"endsAt", end}, {"durationMinutes", (end - start) / 60},
-                                  {"status", query.value(3).toString()}});
+                                  {"status", status}, {"charged", !query.value(4).isNull()}});
     }
     return result;
 }
@@ -1270,6 +1368,10 @@ bool UserDatabase::createReservation(const QString &userId, qint64 startsAt, qin
         if (error) *error = QStringLiteral("El intervalo debe ser futuro, válido y comenzar y terminar en un minuto exacto.");
         return false;
     }
+    if (startsAt - now < 24 * 60 * 60) {
+        if (error) *error = QStringLiteral("Las reservas deben realizarse con al menos 24 horas de antelación.");
+        return false;
+    }
     if (!db_.transaction()) {
         if (error) *error = db_.lastError().text();
         return false;
@@ -1333,12 +1435,12 @@ bool UserDatabase::cancelReservation(const QString &userId, qint64 reservationId
 {
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("UPDATE radio_reservations SET status = 'cancelled' "
-                                 "WHERE reservation_id = ? AND user_id = ? AND status = 'confirmed' AND starts_at > ?"));
+                                 "WHERE reservation_id = ? AND user_id = ? AND status = 'confirmed' AND starts_at >= ?"));
     query.addBindValue(reservationId);
     query.addBindValue(normalizedUserId(userId));
-    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    query.addBindValue(QDateTime::currentSecsSinceEpoch() + 30 * 60);
     if (!query.exec() || query.numRowsAffected() != 1) {
-        if (error) *error = QStringLiteral("Solo se pueden cancelar reservas futuras confirmadas.");
+        if (error) *error = QStringLiteral("Solo se pueden cancelar reservas confirmadas con al menos 30 minutos de antelación.");
         return false;
     }
     return true;

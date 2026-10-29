@@ -3621,14 +3621,14 @@ function handleMessage(msg) {
         else if (!warningDialog || typeof warningDialog.showModal !== 'function') window.alert(msg.message || 'Queda poco tiempo de uso diario autorizado.');
         return;
     }
-    if (msg.type === 'usageLimitDenied' || msg.type === 'reservationEnded') {
+    if (msg.type === 'usageLimitDenied' || msg.type === 'reservationEnded' || msg.type === 'reservationMissed') {
         usageLimitBlocked = true;
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         var usageDialog = document.getElementById('usageLimitDeniedDialog');
         var usageTitle = document.getElementById('usageLimitDeniedTitle');
         var usageMessage = document.getElementById('usageLimitDeniedMessage');
         var usageButton = usageDialog && usageDialog.querySelector('button');
-        if (usageTitle) usageTitle.textContent = msg.type === 'reservationEnded' ? 'Fin del tiempo reservado' : 'Tiempo de uso agotado';
+        if (usageTitle) usageTitle.textContent = msg.type === 'reservationMissed' ? 'Reserva perdida' : (msg.type === 'reservationEnded' ? 'Fin del tiempo reservado' : 'Tiempo de uso agotado');
         if (usageButton) usageButton.textContent = 'Volver al inicio';
         if (usageMessage && msg.message) usageMessage.textContent = msg.message;
         if (usageDialog && !usageDialog.open && typeof usageDialog.showModal === 'function') usageDialog.showModal();

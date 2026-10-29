@@ -28,7 +28,8 @@
 <body>
 <main>
   <header><h1>Reservar tiempo de radio</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a></nav></header>
-  <p>Elige un intervalo futuro. La reserva descuenta ese tiempo de tus cupos diario, semanal y mensual. El servidor comprobará cada periodo afectado antes de confirmarla.</p>
+  <p>Elige un intervalo que comience al menos 24 horas después de confirmarlo. La reserva descuenta ese tiempo de tus cupos diario, semanal y mensual. El servidor comprobará cada periodo afectado antes de confirmarla.</p>
+  <p>Las cancelaciones solo se permiten con al menos 30 minutos de antelación. Si no te conectas a la radio durante los 10 minutos posteriores al inicio, perderás la reserva y se mantendrá el cargo de tiempo.</p>
   <p id="quota" class="quota" aria-live="polite">Cargando los límites de tu perfil…</p>
   <p id="quotaPeriods" class="quota" aria-live="polite"></p>
   <form id="reservationForm">
@@ -74,12 +75,13 @@ function render(data) {
   for (const item of items) {
     const li = document.createElement('li');
     const info = document.createElement('span');
-    info.textContent = `${fmt(item.startsAt)} – ${fmt(item.endsAt)} · ${duration(item.durationMinutes)} · ${item.status === 'confirmed' ? 'Confirmada' : 'Cancelada'}`;
+    const state = item.status === 'confirmed' ? 'Confirmada' : item.status === 'missed' ? 'Perdida por ausencia · tiempo descontado' : 'Cancelada';
+    info.textContent = `${fmt(item.startsAt)} – ${fmt(item.endsAt)} · ${duration(item.durationMinutes)} · ${state}`;
     li.append(info);
-    if (item.status === 'confirmed' && item.startsAt * 1000 > Date.now()) {
+    if (item.status === 'confirmed' && item.startsAt * 1000 - Date.now() >= 30 * 60 * 1000) {
       const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancelar';
       cancel.addEventListener('click', async () => {
-        if (!confirm('¿Cancelar esta reserva? El tiempo volverá a tus cupos.')) return;
+        if (!confirm('¿Cancelar esta reserva? El tiempo reservado volverá a tus cupos.')) return;
         try { render(await request(`/api/v1/reservations/${item.id}`, { method: 'DELETE' })); showNotice('Reserva cancelada.', true); }
         catch (error) { showNotice(error.message); }
       });
@@ -101,7 +103,7 @@ $('reservationForm').addEventListener('submit', async event => {
   } catch (error) { showNotice(error.message); }
   finally { $('submit').disabled = Number(userData?.reservationStatus?.maxReservationMinutes || 0) <= 0; }
 });
-const min = new Date(Date.now() + 60000); min.setSeconds(0, 0);
+const min = new Date(Math.ceil((Date.now() + 24 * 60 * 60 * 1000) / 60000) * 60000);
 $('startsAt').min = $('endsAt').min = new Date(min.getTime() - min.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 load();
 </script>
