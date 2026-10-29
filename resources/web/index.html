@@ -2315,7 +2315,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
 <dialog id="usageLimitDeniedDialog" aria-labelledby="usageLimitDeniedTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
     <h2 id="usageLimitDeniedTitle" style="margin-top:0; color:#38d1c5">Tiempo de uso agotado</h2>
     <p id="usageLimitDeniedMessage">Has agotado el tiempo autorizado para usar la radio.</p>
-    <button type="button" onclick="document.getElementById('usageLimitDeniedDialog').close()">Entendido</button>
+    <button type="button" onclick="document.getElementById('usageLimitDeniedDialog').close()">Volver al inicio</button>
 </dialog>
 <dialog id="usageWarningDialog" aria-labelledby="usageWarningTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
     <h2 id="usageWarningTitle" style="margin-top:0; color:#38d1c5">Tiempo de uso diario</h2>
@@ -3099,6 +3099,9 @@ var isLan = false;
 var lanConnected = false;
 var reconnectTimer = null;
 var usageLimitBlocked = false;
+document.getElementById('usageLimitDeniedDialog').addEventListener('close', function () {
+    if (usageLimitBlocked) window.location.replace('/home.html');
+});
 var radioAccessBlocked = false;
 var defaultModes = ['LSB', 'USB', 'AM', 'CW', 'RTTY', 'FM', 'CW-R'];
 
@@ -3625,7 +3628,10 @@ function handleMessage(msg) {
         var usageMessage = document.getElementById('usageLimitDeniedMessage');
         if (usageMessage && msg.message) usageMessage.textContent = msg.message;
         if (usageDialog && !usageDialog.open && typeof usageDialog.showModal === 'function') usageDialog.showModal();
-        else if (!usageDialog || typeof usageDialog.showModal !== 'function') window.alert(msg.message || 'Has agotado el tiempo autorizado para usar la radio.');
+        else if (!usageDialog || typeof usageDialog.showModal !== 'function') {
+            window.alert(msg.message || 'Has agotado el tiempo autorizado para usar la radio.');
+            window.location.replace('/home.html');
+        }
         return;
     }
     if (msg.type === 'radioBusy' || msg.type === 'radioReserved' || msg.type === 'radioControlTakenOver') {
