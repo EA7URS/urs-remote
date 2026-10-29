@@ -19,6 +19,7 @@
 namespace {
 constexpr int PasswordIterations = 600000;
 constexpr int SessionLifetimeSeconds = 8 * 60 * 60;
+constexpr qint64 MaximumReservationMinutes = 2147483647LL;
 
 QByteArray hmacSha256(const QByteArray &key, const QByteArray &message)
 {
@@ -101,6 +102,26 @@ bool validatedUsageLimit(const QJsonObject &profile, const QString &field,
     if (!std::isfinite(number) || std::floor(number) != number || number < 1
             || number > maximumMinutes) {
         if (error) *error = QStringLiteral("Uno de los límites de tiempo no está dentro del intervalo permitido.");
+        return false;
+    }
+    if (minutes) *minutes = static_cast<qint64>(number);
+    return true;
+}
+
+bool validatedReservationTime(const QJsonValue &value, qint64 *minutes, QString *error)
+{
+    if (value.isUndefined() || value.isNull()
+            || (value.isString() && value.toString().trimmed().isEmpty())) {
+        if (minutes) *minutes = 0;
+        return true;
+    }
+    bool ok = false;
+    const double number = value.isString() ? value.toString().trimmed().toDouble(&ok)
+                                           : (value.isDouble() ? value.toDouble() : 0.0);
+    if (value.isDouble()) ok = true;
+    if (!ok || !std::isfinite(number) || std::floor(number) != number || number < 0
+            || number > MaximumReservationMinutes) {
+        if (error) *error = QStringLiteral("El tiempo máximo por reserva debe ser un entero no negativo de minutos.");
         return false;
     }
     if (minutes) *minutes = static_cast<qint64>(number);
@@ -221,6 +242,7 @@ bool UserDatabase::createSchema(QString *error)
             "city TEXT NOT NULL DEFAULT '', "
             "postal_code TEXT NOT NULL DEFAULT '', "
             "province TEXT NOT NULL DEFAULT '', "
+            "max_reservation_minutes INTEGER NOT NULL DEFAULT 0, "
             "created_at INTEGER NOT NULL)"))) {
         if (error) *error = queryError(query);
         return false;
@@ -281,7 +303,8 @@ bool UserDatabase::migrateSchema(QString *error)
         {QStringLiteral("street"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
         {QStringLiteral("city"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
         {QStringLiteral("postal_code"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
-        {QStringLiteral("province"), QStringLiteral("TEXT NOT NULL DEFAULT ''")}
+        {QStringLiteral("province"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("max_reservation_minutes"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")}
     };
     for (const auto &column : additions) {
         if (columns.contains(column.first)) continue;
@@ -399,7 +422,7 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("SELECT user_id, password_hash, is_admin, must_change_password, operational_profile, "
                                  "usage_profile_id, COALESCE((SELECT name FROM usage_profiles "
-                                 "WHERE profile_id = users.usage_profile_id), '') "
+                                 "WHERE profile_id = users.usage_profile_id), ''), max_reservation_minutes "
                                  "FROM users WHERE user_id = ?"));
     query.addBindValue(id);
     if (!query.exec()) return false;
@@ -419,6 +442,7 @@ bool UserDatabase::verifyCredentials(const QString &userId, const QString &passw
         user->operationalProfile = query.value(4).toString();
         user->usageProfileId = query.value(5).toLongLong();
         user->usageProfileName = query.value(6).toString();
+        user->maxReservationMinutes = query.value(7).toLongLong();
         user->authenticated = true;
     }
     return true;
@@ -457,7 +481,7 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
         "SELECT u.user_id, u.is_admin, u.must_change_password, s.expires_at, u.operational_profile, "
-        "u.usage_profile_id, COALESCE(p.name, '') "
+        "u.usage_profile_id, COALESCE(p.name, ''), u.max_reservation_minutes "
         "FROM sessions s JOIN users u ON u.user_id = s.user_id "
         "LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
         "WHERE s.token_hash = ? AND s.expires_at > ?"));
@@ -471,6 +495,7 @@ AuthUser UserDatabase::userForSession(const QString &token) const
     user.operationalProfile = query.value(4).toString();
     user.usageProfileId = query.value(5).toLongLong();
     user.usageProfileName = query.value(6).toString();
+    user.maxReservationMinutes = query.value(7).toLongLong();
     user.authenticated = true;
     return user;
 }
@@ -493,6 +518,9 @@ bool UserDatabase::createUser(const QJsonObject &profileData, const QString &pas
                               bool makeAdmin, QString *error)
 {
     if (!validProfile(profileData, true, error)) return false;
+    qint64 maxReservationMinutes = 0;
+    if (!validatedReservationTime(profileData.value(QStringLiteral("maxReservationMinutes")),
+                                  &maxReservationMinutes, error)) return false;
     qint64 usageProfileId = 0;
     if (!validateUsageAssignment(profileData.value(QStringLiteral("usageProfileId")),
                                  &usageProfileId, error)) return false;
@@ -504,8 +532,8 @@ bool UserDatabase::createUser(const QJsonObject &profileData, const QString &pas
     QSqlQuery query(db_);
     query.prepare(QStringLiteral(
         "INSERT INTO users(user_id, password_hash, is_admin, must_change_password, operational_profile, usage_profile_id, "
-        "first_name, last_name, email, street, city, postal_code, province, created_at) "
-        "VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        "first_name, last_name, email, street, city, postal_code, province, max_reservation_minutes, created_at) "
+        "VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(id);
     query.addBindValue(passwordHash(password));
     query.addBindValue(makeAdmin ? 1 : 0);
@@ -519,6 +547,7 @@ bool UserDatabase::createUser(const QJsonObject &profileData, const QString &pas
     query.addBindValue(profileData.value(QStringLiteral("city")).toString().trimmed());
     query.addBindValue(profileData.value(QStringLiteral("postalCode")).toString().trimmed());
     query.addBindValue(profileData.value(QStringLiteral("province")).toString().trimmed());
+    query.addBindValue(maxReservationMinutes);
     query.addBindValue(QDateTime::currentSecsSinceEpoch());
     if (!query.exec()) {
         if (error) *error = query.lastError().text().contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)
@@ -547,7 +576,7 @@ QJsonArray UserDatabase::users() const
     QSqlQuery query(db_);
     if (!query.exec(QStringLiteral("SELECT u.user_id, u.is_admin, u.must_change_password, u.operational_profile, "
                                    "u.first_name, u.last_name, u.email, u.street, u.city, u.postal_code, u.province, "
-                                   "u.usage_profile_id, COALESCE(p.name, '') "
+                                   "u.usage_profile_id, COALESCE(p.name, ''), u.max_reservation_minutes "
                                    "FROM users u LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
                                    "ORDER BY u.user_id COLLATE NOCASE")))
         return result;
@@ -567,7 +596,17 @@ QJsonArray UserDatabase::users() const
         user.insert(QStringLiteral("usageProfileId"), query.value(11).isNull()
                     ? QJsonValue(QJsonValue::Null) : QJsonValue(query.value(11).toLongLong()));
         user.insert(QStringLiteral("usageProfileName"), query.value(12).toString());
+        user.insert(QStringLiteral("maxReservationMinutes"), query.value(13).toLongLong());
         result.replace(result.size() - 1, user);
+    }
+    query.finish();
+    for (int i = 0; i < result.size(); ++i) {
+        QJsonObject user = result.at(i).toObject();
+        const QJsonObject reservation = reservationStatus(user.value(QStringLiteral("userId")).toString());
+        user.insert(QStringLiteral("effectiveReservationMinutes"),
+                    reservation.value(QStringLiteral("effectiveReservationMinutes")));
+        user.insert(QStringLiteral("canReserve"), reservation.value(QStringLiteral("canReserve")));
+        result.replace(i, user);
     }
     return result;
 }
@@ -576,12 +615,15 @@ QJsonObject UserDatabase::profile(const QString &userId) const
 {
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("SELECT u.user_id, u.operational_profile, u.first_name, u.last_name, u.email, "
-                                 "u.street, u.city, u.postal_code, u.province, u.usage_profile_id, COALESCE(p.name, '') "
+                                 "u.street, u.city, u.postal_code, u.province, u.usage_profile_id, COALESCE(p.name, ''), "
+                                 "u.max_reservation_minutes "
                                  "FROM users u LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
                                  "WHERE u.user_id = ?"));
     query.addBindValue(normalizedUserId(userId));
     if (!query.exec() || !query.next()) return QJsonObject();
-    return QJsonObject{{"userId", query.value(0).toString()},
+    const QString id = query.value(0).toString();
+    const qint64 maxReservationMinutes = query.value(11).toLongLong();
+    QJsonObject result{{"userId", id},
                        {"operationalProfile", query.value(1).toString()},
                        {"firstName", query.value(2).toString()},
                        {"lastName", query.value(3).toString()},
@@ -592,7 +634,46 @@ QJsonObject UserDatabase::profile(const QString &userId) const
                        {"province", query.value(8).toString()},
                        {"usageProfileId", query.value(9).isNull() ? QJsonValue(QJsonValue::Null)
                                                                     : QJsonValue(query.value(9).toLongLong())},
-                       {"usageProfileName", query.value(10).toString()}};
+                       {"usageProfileName", query.value(10).toString()},
+                       {"maxReservationMinutes", maxReservationMinutes}};
+    query.finish();
+    const QJsonObject reservation = reservationStatus(id);
+    result.insert(QStringLiteral("effectiveReservationMinutes"),
+                  reservation.value(QStringLiteral("effectiveReservationMinutes")));
+    result.insert(QStringLiteral("canReserve"), reservation.value(QStringLiteral("canReserve")));
+    return result;
+}
+
+QJsonObject UserDatabase::reservationStatus(const QString &userId) const
+{
+    const QString id = normalizedUserId(userId);
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT max_reservation_minutes FROM users WHERE user_id = ?"));
+    query.addBindValue(id);
+    if (!query.exec() || !query.next()) return QJsonObject();
+    const qint64 maximumMinutes = query.value(0).toLongLong();
+    query.finish();
+
+    qint64 remainingSeconds = maximumMinutes * 60;
+    const QJsonObject usage = usageStatus(id);
+    if (!usage.value(QStringLiteral("found")).toBool()
+            || !usage.value(QStringLiteral("allowed")).toBool()) {
+        remainingSeconds = 0;
+    } else {
+        const QStringList periods = {QStringLiteral("daily"), QStringLiteral("weekly"),
+                                     QStringLiteral("monthly")};
+        for (const QString &period : periods) {
+            const QJsonObject limit = usage.value(period).toObject();
+            if (limit.isEmpty() || limit.value(QStringLiteral("limitMinutes")).isNull()
+                    || limit.value(QStringLiteral("remainingSeconds")).isNull()) continue;
+            remainingSeconds = qMin(remainingSeconds,
+                                    limit.value(QStringLiteral("remainingSeconds")).toVariant().toLongLong());
+        }
+    }
+    const qint64 effectiveMinutes = qMax<qint64>(0, remainingSeconds) / 60;
+    return QJsonObject{{"maxReservationMinutes", maximumMinutes},
+                       {"effectiveReservationMinutes", effectiveMinutes},
+                       {"canReserve", effectiveMinutes > 0}};
 }
 
 bool UserDatabase::updateOwnProfile(const QString &userId, const QJsonObject &profileData,
@@ -622,6 +703,12 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
     const bool updateUsageProfile = administrator && profileData.contains(QStringLiteral("usageProfileId"));
     if (updateUsageProfile && !validateUsageAssignment(profileData.value(QStringLiteral("usageProfileId")),
                                                        &usageProfileId, error)) return false;
+    qint64 maxReservationMinutes = 0;
+    const bool updateReservationTime = administrator
+            && profileData.contains(QStringLiteral("maxReservationMinutes"));
+    if (updateReservationTime
+            && !validatedReservationTime(profileData.value(QStringLiteral("maxReservationMinutes")),
+                                         &maxReservationMinutes, error)) return false;
     if (!db_.transaction()) {
         if (error) *error = db_.lastError().text();
         return false;
@@ -633,6 +720,8 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
         sql += QStringLiteral(", email = ?, operational_profile = ?");
     if (updateUsageProfile)
         sql += QStringLiteral(", usage_profile_id = ?");
+    if (updateReservationTime)
+        sql += QStringLiteral(", max_reservation_minutes = ?");
     sql += QStringLiteral(" WHERE user_id = ?");
     update.prepare(sql);
     update.addBindValue(newId);
@@ -648,6 +737,8 @@ bool UserDatabase::updateProfile(const QString &userId, const QJsonObject &profi
     }
     if (updateUsageProfile)
         update.addBindValue(usageProfileId > 0 ? QVariant(usageProfileId) : QVariant());
+    if (updateReservationTime)
+        update.addBindValue(maxReservationMinutes);
     update.addBindValue(oldId);
     if (!update.exec() || update.numRowsAffected() != 1) {
         const QString dbError = queryError(update);

@@ -1160,11 +1160,15 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             return;
         }
         user.sessionExpiresAt = expiry;
+        const QJsonObject reservation = userDatabase_.reservationStatus(user.userId);
         sendRestResponse(socket, 200,
                          QJsonObject{{"userId", user.userId}, {"isAdmin", user.isAdmin},
                                      {"operationalProfile", user.operationalProfile},
                                      {"usageProfileId", user.usageProfileId > 0 ? QJsonValue(user.usageProfileId) : QJsonValue(QJsonValue::Null)},
                                      {"usageProfileName", user.usageProfileName},
+                                     {"maxReservationMinutes", user.maxReservationMinutes},
+                                     {"effectiveReservationMinutes", reservation.value(QStringLiteral("effectiveReservationMinutes"))},
+                                     {"canReserve", reservation.value(QStringLiteral("canReserve"))},
                                      {"mustChangePassword", user.mustChangePassword}},
                          sessionSetCookie(token, tls, 8 * 60 * 60));
         return;
@@ -1176,11 +1180,15 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         } else if (!currentUser.authenticated) {
             sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
         } else {
+            const QJsonObject reservation = userDatabase_.reservationStatus(currentUser.userId);
             sendRestResponse(socket, 200,
                              QJsonObject{{"userId", currentUser.userId},
                                          {"isAdmin", currentUser.isAdmin},
                                          {"operationalProfile", currentUser.operationalProfile},
                                          {"canTransmit", currentUser.operationalProfile == QLatin1String("licensed")},
+                                         {"maxReservationMinutes", currentUser.maxReservationMinutes},
+                                         {"effectiveReservationMinutes", reservation.value(QStringLiteral("effectiveReservationMinutes"))},
+                                         {"canReserve", reservation.value(QStringLiteral("canReserve"))},
                                          {"usageProfileId", currentUser.usageProfileId > 0 ? QJsonValue(currentUser.usageProfileId) : QJsonValue(QJsonValue::Null)},
                                          {"usageProfileName", currentUser.usageProfileName.isEmpty() ? QStringLiteral("Sin límite") : currentUser.usageProfileName},
                                          {"usage", userDatabase_.usageStatus(currentUser.userId)},

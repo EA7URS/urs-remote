@@ -11,6 +11,7 @@ struct AuthUser {
     QString operationalProfile = QStringLiteral("licensed");
     qint64 usageProfileId = 0;
     QString usageProfileName;
+    qint64 maxReservationMinutes = 0;
     bool isAdmin = false;
     bool mustChangePassword = false;
     qint64 sessionExpiresAt = 0;
@@ -42,6 +43,7 @@ public:
                           QString *newUserId, QString *error = nullptr);
     bool updateAdminUser(const QString &userId, const QJsonObject &profile,
                          QString *newUserId, QString *error = nullptr);
+    QJsonObject reservationStatus(const QString &userId) const;
     QJsonArray usageProfiles() const;
     bool createUsageProfile(const QJsonObject &profile, qint64 *profileId,
                             QString *error = nullptr);
