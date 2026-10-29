@@ -271,6 +271,7 @@ private:
     bool isFreeDVCompatibleMode(rigMode_t mk) const;
     void sendCurrentState(QWebSocket *client);
     void checkRadioUsageLimits();
+    void stopRadioTransmissionForClient(QWebSocket *client);
     QString otherRadioUserConnected(const QString &userId) const;
     void takeOverRadioConnections(const QString &userId);
     QString modeToString(modeInfo m);

@@ -1181,9 +1181,20 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             sendRestResponse(socket, 401, QJsonObject{{"error", "Login required."}});
         } else {
             const QJsonObject reservation = userDatabase_.reservationStatus(currentUser.userId);
+            const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
+            const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+            const bool canAccessRadio = currentUser.isAdmin
+                    || (reservationOwner.isEmpty() ? usage.value(QStringLiteral("allowed")).toBool()
+                                                   : reservationOwner == currentUser.userId);
+            const QString radioAccessMessage = reservationOwner == currentUser.userId
+                    ? QString() : (!reservationOwner.isEmpty()
+                                   ? QStringLiteral("La emisora está reservada por otro usuario en este horario.")
+                                   : usage.value(QStringLiteral("message")).toString());
             sendRestResponse(socket, 200,
                              QJsonObject{{"userId", currentUser.userId},
                                          {"isAdmin", currentUser.isAdmin},
+                                         {"canAccessRadio", canAccessRadio},
+                                         {"radioAccessMessage", radioAccessMessage},
                                          {"operationalProfile", currentUser.operationalProfile},
                                          {"canTransmit", currentUser.operationalProfile == QLatin1String("licensed")},
                                          {"maxReservationMinutes", currentUser.maxReservationMinutes},
@@ -1191,7 +1202,7 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
                                          {"canReserve", reservation.value(QStringLiteral("canReserve"))},
                                          {"usageProfileId", currentUser.usageProfileId > 0 ? QJsonValue(currentUser.usageProfileId) : QJsonValue(QJsonValue::Null)},
                                          {"usageProfileName", currentUser.usageProfileName.isEmpty() ? QStringLiteral("Sin límite") : currentUser.usageProfileName},
-                                         {"usage", userDatabase_.usageStatus(currentUser.userId)},
+                                         {"usage", usage},
                                          {"mustChangePassword", currentUser.mustChangePassword},
                                          {"profile", userDatabase_.profile(currentUser.userId)}});
         }
@@ -2405,6 +2416,7 @@ void webServer::onWsTextMessage(QString message)
     if (!usage.value(QStringLiteral("allowed")).toBool()
             && reservationOwner != wsUserIds_.value(pClient)
             && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
+        stopRadioTransmissionForClient(pClient);
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();
@@ -2422,6 +2434,49 @@ void webServer::onWsTextMessage(QString message)
     handleCommand(pClient, cmd);
 }
 
+void webServer::stopRadioTransmissionForClient(QWebSocket *client)
+{
+    const bool stopStationTx = client == pttClient || client == micActiveClient
+            || packetTxBusy || freedvTxActive;
+    if (stopStationTx && queue) {
+        queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(false), false, uchar(0)));
+        queue->del(funcALCMeter, 0);
+        releaseCompressorHold();
+    }
+    if (client == pttClient) {
+        pttClient = nullptr;
+        qInfo() << "Web: PTT released (usage limit reached)";
+    }
+    if (client == micActiveClient) {
+        micStatsLog("usage limit reached");
+        micDeviceLabel.clear();
+        usbTxReset();
+        if (dataOffModSaved && queue) {
+            queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(savedDataOffMod), false, 0));
+            dataOffModSaved = false;
+        }
+        micActiveClient = nullptr;
+    }
+    // The audio paths are station-wide. Stop pending digital audio and any
+    // packet drain before the quota modal is sent to the browser.
+    if (freedvTxActive) {
+        freedvTxBuffer.clear();
+        freedvTxActive = false;
+        if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
+        txAudioActive = false;
+        if (usbAudioOutput) {
+            usbAudioOutput->stop();
+            usbAudioOutputDevice = nullptr;
+        }
+    }
+    packetTxAwaitingIdle = false;
+    if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
+    if (packetUsbTxDrainTimer) packetUsbTxDrainTimer->stop();
+    packetUsbTxBuffer.clear();
+    packetUsbTxActive = false;
+    packetTxBusy = false;
+}
+
 void webServer::onWsDisconnected()
 {
     QWebSocket *pClient = qobject_cast<QWebSocket *>(sender());
@@ -2430,47 +2485,8 @@ void webServer::onWsDisconnected()
         // A browser that keyed the rig and vanished (phone lost the network,
         // tab killed) must not leave it transmitting until the rig's own
         // time-out timer, if any, fires.
-        if (pClient == pttClient) {
-            pttClient = nullptr;
-            if (queue) {
-                queue->add(priorityImmediate, queueItem(funcTransceiverStatus, QVariant::fromValue<bool>(false), false, uchar(0)));
-                queue->del(funcALCMeter, 0);
-                releaseCompressorHold();
-            }
-            qInfo() << "Web: PTT released (keying client disconnected)";
-        }
-        if (pClient == micActiveClient) {
-            micStatsLog("client disconnected");
-            micDeviceLabel.clear();
-            usbTxReset();
-        }
-        // Restore DATA MOD OFF if this client had mic active
-        if (pClient == micActiveClient && dataOffModSaved && queue) {
-            queue->addUnique(priorityImmediate, queueItem(funcDATAOffMod, QVariant::fromValue<rigInput>(savedDataOffMod), false, 0));
-            dataOffModSaved = false;
-            micActiveClient = nullptr;
-            qInfo() << "Web: Restored DATA MOD OFF setting (client disconnected)";
-        }
+        stopRadioTransmissionForClient(pClient);
         userDatabase_.endUsageSession(wsUsageSessionIds_.take(pClient));
-        // Stop FreeDV/RADE TX drain to prevent ALSA underruns
-        if (freedvTxActive) {
-            freedvTxBuffer.clear();
-            freedvTxActive = false;
-            if (freedvTxDrainTimer) freedvTxDrainTimer->stop();
-            txAudioActive = false;
-            if (usbAudioOutput) {
-                usbAudioOutput->stop();
-                usbAudioOutputDevice = nullptr;
-            }
-        }
-        // Cancel any pending PKT idle-driven unkey.  Clear the flag
-        // before any forced ALSA stop so a stray IdleState transition
-        // can't re-enter onUsbAudioOutputStateChanged.
-        packetTxAwaitingIdle = false;
-        if (packetTxIdleWatchdog) packetTxIdleWatchdog->stop();
-        if (packetUsbTxDrainTimer) packetUsbTxDrainTimer->stop();
-        packetUsbTxBuffer.clear();
-        packetUsbTxActive = false;
         audioClients.remove(pClient);
         wsClients.removeAll(pClient);
         wsUserIds_.remove(pClient);
@@ -2549,6 +2565,7 @@ void webServer::checkRadioUsageLimits()
         }
         const QJsonObject usage = userDatabase_.usageStatus(userId);
         if (!usage.value(QStringLiteral("allowed")).toBool() && reservationOwner != userId && !administrator) {
+            stopRadioTransmissionForClient(client);
             sendJsonTo(client, QJsonObject{{"type", "usageLimitDenied"},
                                            {"message", usage.value(QStringLiteral("message")).toString()}});
             client->close();
@@ -2630,6 +2647,7 @@ void webServer::onWsBinaryMessage(QByteArray message)
             && userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch())
                     != wsUserIds_.value(pClient)
             && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
+        stopRadioTransmissionForClient(pClient);
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();

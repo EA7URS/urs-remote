@@ -16,6 +16,8 @@
     nav { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); margin-top: 1.5rem; }
     nav a { min-height: 5rem; display: flex; align-items: center; padding: 1rem; border: 1px solid #28545b; border-radius: .6rem; color: #e5f2f2; background: #10272c; font-weight: 650; text-decoration: none; }
     nav a:hover, nav a:focus-visible { border-color: #38d1c5; background: #15343a; }
+    nav a[aria-disabled="true"] { opacity: .55; cursor: not-allowed; border-color: #28545b; }
+    nav a[aria-disabled="true"]:hover, nav a[aria-disabled="true"]:focus-visible { border-color: #28545b; background: #10272c; }
     button { margin-top: 1.5rem; padding: .65rem 1rem; border: 1px solid #28545b; border-radius: .45rem; background: transparent; color: #b8d0d2; font: inherit; cursor: pointer; }
     #notice { color: #ff9b8f; }
   </style>
@@ -28,8 +30,9 @@
     <a id="adminLink" href="/admin.html" hidden>Administración de usuarios</a>
     <a href="/profile.html">Administrar perfil</a>
     <a href="/reservations.html">Reservar tiempo de radio</a>
-    <a href="/index.html">Ir a la radio</a>
+    <a id="radioLink" href="/index.html">Ir a la radio</a>
   </nav>
+  <p id="radioNotice" role="status" aria-live="polite" hidden></p>
   <p id="notice" role="status" aria-live="polite"></p>
   <button id="logout" type="button">Cerrar sesión</button>
 </main>
@@ -39,6 +42,16 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   const user = await response.json();
   document.getElementById('user').textContent = user.userId;
   document.getElementById('adminLink').hidden = !user.isAdmin;
+  const radioLink = document.getElementById('radioLink');
+  const radioNotice = document.getElementById('radioNotice');
+  if (!user.canAccessRadio) {
+    radioLink.removeAttribute('href');
+    radioLink.setAttribute('aria-disabled', 'true');
+    radioLink.setAttribute('tabindex', '-1');
+    radioLink.textContent = 'Ir a la radio · acceso no disponible';
+    radioNotice.hidden = false;
+    radioNotice.textContent = user.radioAccessMessage || 'Has agotado el tiempo autorizado para usar la radio.';
+  }
 }).catch(() => location.replace('/login.html'));
 document.getElementById('logout').addEventListener('click', async () => {
   try {
