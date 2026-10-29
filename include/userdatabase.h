@@ -56,6 +56,13 @@ public:
     QString startUsageSession(const QString &userId, QJsonObject *status,
                               QString *error = nullptr);
     void endUsageSession(const QString &sessionId);
+    QString activeReservationOwner(qint64 now) const;
+    bool isAdministrator(const QString &userId) const;
+    QJsonArray reservations(const QString &userId) const;
+    bool createReservation(const QString &userId, qint64 startsAt, qint64 endsAt,
+                           qint64 *reservationId, QString *error = nullptr);
+    bool cancelReservation(const QString &userId, qint64 reservationId,
+                           QString *error = nullptr);
     bool canTransmit(const QString &userId) const;
     void revokeSessions(const QString &userId);
 
@@ -73,8 +80,12 @@ private:
                        bool administrator, QString *newUserId, QString *error);
     bool validateUsageAssignment(const QJsonValue &profileId, qint64 *id,
                                  QString *error) const;
+    bool reservationWithinUsageLimits(const QString &userId, qint64 startsAt,
+                                      qint64 endsAt, QString *error) const;
     qint64 usageSeconds(const QString &userId, qint64 periodStart,
-                        qint64 periodEnd, qint64 now) const;
+                        qint64 periodEnd, qint64 now,
+                        qint64 additionalStart = 0,
+                        qint64 additionalEnd = 0) const;
 
     QSqlDatabase db_;
     QString connectionName_;

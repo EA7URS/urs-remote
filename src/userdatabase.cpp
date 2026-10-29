@@ -13,6 +13,7 @@
 #include <QTime>
 #include <QUuid>
 #include <QVariant>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -273,8 +274,20 @@ bool UserDatabase::createSchema(QString *error)
         if (error) *error = queryError(query);
         return false;
     }
+    if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS radio_reservations ("
+            "reservation_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE, "
+            "starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'confirmed' CHECK(status IN ('confirmed', 'cancelled')), "
+            "created_at INTEGER NOT NULL, CHECK(ends_at > starts_at))"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id)"));
     query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_usage_user_start ON radio_usage_sessions(user_id, started_at)"));
+    query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_reservations_start ON radio_reservations(status, starts_at, ends_at)"));
+    query.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS radio_reservations_user_start ON radio_reservations(user_id, status, starts_at)"));
     if (!migrateSchema(error)) return false;
     if (!query.exec(QStringLiteral("UPDATE radio_usage_sessions SET ended_at = started_at WHERE ended_at IS NULL"))) {
         if (error) *error = queryError(query);
@@ -894,8 +907,10 @@ bool UserDatabase::deleteUsageProfile(qint64 profileId, QString *error)
 }
 
 qint64 UserDatabase::usageSeconds(const QString &userId, qint64 periodStart,
-                                  qint64 periodEnd, qint64 now) const
+                                  qint64 periodEnd, qint64 now,
+                                  qint64 additionalStart, qint64 additionalEnd) const
 {
+    QList<QPair<qint64, qint64>> intervals;
     QSqlQuery query(db_);
     query.prepare(QStringLiteral("SELECT started_at, ended_at FROM radio_usage_sessions "
                                  "WHERE user_id = ? AND started_at < ? "
@@ -904,12 +919,43 @@ qint64 UserDatabase::usageSeconds(const QString &userId, qint64 periodStart,
     query.addBindValue(periodEnd);
     query.addBindValue(periodStart);
     if (!query.exec()) return -1;
-    qint64 total = 0;
     while (query.next()) {
         const qint64 start = qMax(periodStart, query.value(0).toLongLong());
         const qint64 end = qMin(periodEnd, query.value(1).isNull() ? now : query.value(1).toLongLong());
-        if (end > start) total += end - start;
+        if (end > start) intervals.append({start, end});
     }
+    if (query.lastError().isValid()) return -1;
+    query.finish();
+    query.prepare(QStringLiteral("SELECT starts_at, ends_at FROM radio_reservations "
+                                 "WHERE user_id = ? AND status = 'confirmed' "
+                                 "AND starts_at < ? AND ends_at > ?"));
+    query.addBindValue(normalizedUserId(userId));
+    query.addBindValue(periodEnd);
+    query.addBindValue(periodStart);
+    if (!query.exec()) return -1;
+    while (query.next()) {
+        const qint64 start = qMax(periodStart, query.value(0).toLongLong());
+        const qint64 end = qMin(periodEnd, query.value(1).toLongLong());
+        if (end > start) intervals.append({start, end});
+    }
+    if (additionalEnd > additionalStart) {
+        const qint64 start = qMax(periodStart, additionalStart);
+        const qint64 end = qMin(periodEnd, additionalEnd);
+        if (end > start) intervals.append({start, end});
+    }
+    std::sort(intervals.begin(), intervals.end(), [](const QPair<qint64, qint64> &a,
+                                                     const QPair<qint64, qint64> &b) {
+        return a.first < b.first;
+    });
+    qint64 total = 0;
+    qint64 unionStart = 0, unionEnd = 0;
+    bool active = false;
+    for (const auto &interval : intervals) {
+        if (!active) { unionStart = interval.first; unionEnd = interval.second; active = true; }
+        else if (interval.first <= unionEnd) unionEnd = qMax(unionEnd, interval.second);
+        else { total += unionEnd - unionStart; unionStart = interval.first; unionEnd = interval.second; }
+    }
+    if (active) total += unionEnd - unionStart;
     return total;
 }
 
@@ -1073,6 +1119,183 @@ void UserDatabase::endUsageSession(const QString &sessionId)
     query.addBindValue(QDateTime::currentSecsSinceEpoch());
     query.addBindValue(sessionId);
     query.exec();
+}
+
+QString UserDatabase::activeReservationOwner(qint64 now) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT user_id FROM radio_reservations WHERE status = 'confirmed' "
+                                 "AND starts_at <= ? AND ends_at > ? ORDER BY starts_at LIMIT 1"));
+    query.addBindValue(now);
+    query.addBindValue(now);
+    return query.exec() && query.next() ? query.value(0).toString() : QString();
+}
+
+bool UserDatabase::isAdministrator(const QString &userId) const
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT is_admin FROM users WHERE user_id = ?"));
+    query.addBindValue(normalizedUserId(userId));
+    return query.exec() && query.next() && query.value(0).toBool();
+}
+
+QJsonArray UserDatabase::reservations(const QString &userId) const
+{
+    QJsonArray result;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT reservation_id, starts_at, ends_at, status FROM radio_reservations "
+                                 "WHERE user_id = ? ORDER BY starts_at DESC"));
+    query.addBindValue(normalizedUserId(userId));
+    if (!query.exec()) return result;
+    while (query.next()) {
+        const qint64 start = query.value(1).toLongLong();
+        const qint64 end = query.value(2).toLongLong();
+        result.append(QJsonObject{{"id", query.value(0).toLongLong()}, {"startsAt", start},
+                                  {"endsAt", end}, {"durationMinutes", (end - start) / 60},
+                                  {"status", query.value(3).toString()}});
+    }
+    return result;
+}
+
+bool UserDatabase::reservationWithinUsageLimits(const QString &userId, qint64 startsAt,
+                                                qint64 endsAt, QString *error) const
+{
+    QSqlQuery profileQuery(db_);
+    profileQuery.prepare(QStringLiteral("SELECT p.daily_limit_minutes, p.weekly_limit_minutes, "
+                                        "p.monthly_limit_minutes FROM users u "
+                                        "LEFT JOIN usage_profiles p ON p.profile_id = u.usage_profile_id "
+                                        "WHERE u.user_id = ?"));
+    profileQuery.addBindValue(normalizedUserId(userId));
+    if (!profileQuery.exec() || !profileQuery.next()) {
+        if (error) *error = QStringLiteral("No se ha encontrado la cuenta de usuario.");
+        return false;
+    }
+    const QVariant values[] = {profileQuery.value(0), profileQuery.value(1), profileQuery.value(2)};
+    const QString keys[] = {QStringLiteral("daily"), QStringLiteral("weekly"), QStringLiteral("monthly")};
+    const QString labels[] = {QStringLiteral("diario"), QStringLiteral("semanal"), QStringLiteral("mensual")};
+    const QDateTime localStart = QDateTime::fromSecsSinceEpoch(startsAt, Qt::LocalTime);
+    for (int kind = 0; kind < 3; ++kind) {
+        if (values[kind].isNull()) continue;
+        const qint64 limit = values[kind].toLongLong() * 60;
+        QDate periodDate = localStart.date();
+        QDateTime periodStart;
+        while (true) {
+            QDate baseDate = periodDate;
+            if (kind == 1) baseDate = periodDate.addDays(1 - periodDate.dayOfWeek());
+            else if (kind == 2) baseDate = QDate(periodDate.year(), periodDate.month(), 1);
+            periodStart = QDateTime(baseDate, QTime(0, 0), Qt::LocalTime);
+            QDate nextDate = baseDate;
+            if (kind == 0) nextDate = nextDate.addDays(1);
+            else if (kind == 1) nextDate = nextDate.addDays(7);
+            else nextDate = nextDate.addMonths(1);
+            const QDateTime periodEnd(nextDate, QTime(0, 0), Qt::LocalTime);
+            const qint64 periodStartSec = periodStart.toSecsSinceEpoch();
+            const qint64 periodEndSec = periodEnd.toSecsSinceEpoch();
+            const qint64 clippedStart = qMax(startsAt, periodStartSec);
+            const qint64 clippedEnd = qMin(endsAt, periodEndSec);
+            QSqlQuery reset(db_);
+            reset.prepare(QStringLiteral("SELECT reset_at FROM radio_usage_resets WHERE user_id = ? AND period = ?"));
+            reset.addBindValue(normalizedUserId(userId));
+            reset.addBindValue(keys[kind]);
+            if (!reset.exec()) {
+                if (error) *error = QStringLiteral("No se puede comprobar el tiempo autorizado.");
+                return false;
+            }
+            const qint64 effectiveStart = qMax(periodStartSec, reset.next() ? reset.value(0).toLongLong() : 0);
+            const qint64 used = usageSeconds(userId, effectiveStart, periodEndSec,
+                                             QDateTime::currentSecsSinceEpoch(), clippedStart, clippedEnd);
+            if (used < 0 || used > limit) {
+                if (error) *error = QStringLiteral("La reserva excede el tiempo autorizado %1 disponible.").arg(labels[kind]);
+                return false;
+            }
+            if (periodEndSec >= endsAt) break;
+            periodDate = nextDate;
+        }
+    }
+    return true;
+}
+
+bool UserDatabase::createReservation(const QString &userId, qint64 startsAt, qint64 endsAt,
+                                     qint64 *reservationId, QString *error)
+{
+    const QString id = normalizedUserId(userId);
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (id.isEmpty() || startsAt <= now || endsAt <= startsAt || startsAt % 60 || endsAt % 60) {
+        if (error) *error = QStringLiteral("El intervalo debe ser futuro, válido y comenzar y terminar en un minuto exacto.");
+        return false;
+    }
+    if (!db_.transaction()) {
+        if (error) *error = db_.lastError().text();
+        return false;
+    }
+    QSqlQuery userQuery(db_);
+    userQuery.prepare(QStringLiteral("SELECT max_reservation_minutes FROM users WHERE user_id = ?"));
+    userQuery.addBindValue(id);
+    if (!userQuery.exec() || !userQuery.next()) {
+        if (error) *error = QStringLiteral("No se ha encontrado la cuenta de usuario.");
+        db_.rollback();
+        return false;
+    }
+    const qint64 maxMinutes = userQuery.value(0).toLongLong();
+    const qint64 duration = endsAt - startsAt;
+    if (maxMinutes <= 0) {
+        if (error) *error = QStringLiteral("Tu perfil no permite realizar reservas.");
+        db_.rollback();
+        return false;
+    }
+    if (duration > maxMinutes * 60) {
+        if (error) *error = QStringLiteral("La duración supera el tiempo máximo por reserva de tu perfil.");
+        db_.rollback();
+        return false;
+    }
+    QSqlQuery conflict(db_);
+    conflict.prepare(QStringLiteral("SELECT 1 FROM radio_reservations WHERE status = 'confirmed' "
+                                    "AND starts_at < ? AND ends_at > ? LIMIT 1"));
+    conflict.addBindValue(endsAt);
+    conflict.addBindValue(startsAt);
+    if (!conflict.exec()) {
+        if (error) *error = queryError(conflict);
+        db_.rollback();
+        return false;
+    }
+    if (conflict.next()) {
+        if (error) *error = QStringLiteral("Ese intervalo ya está reservado.");
+        db_.rollback();
+        return false;
+    }
+    if (!reservationWithinUsageLimits(id, startsAt, endsAt, error)) {
+        db_.rollback();
+        return false;
+    }
+    QSqlQuery insert(db_);
+    insert.prepare(QStringLiteral("INSERT INTO radio_reservations(user_id, starts_at, ends_at, created_at) "
+                                  "VALUES(?, ?, ?, ?)"));
+    insert.addBindValue(id);
+    insert.addBindValue(startsAt);
+    insert.addBindValue(endsAt);
+    insert.addBindValue(now);
+    if (!insert.exec() || !db_.commit()) {
+        if (error) *error = queryError(insert).isEmpty() ? db_.lastError().text() : queryError(insert);
+        db_.rollback();
+        return false;
+    }
+    if (reservationId) *reservationId = insert.lastInsertId().toLongLong();
+    return true;
+}
+
+bool UserDatabase::cancelReservation(const QString &userId, qint64 reservationId, QString *error)
+{
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("UPDATE radio_reservations SET status = 'cancelled' "
+                                 "WHERE reservation_id = ? AND user_id = ? AND status = 'confirmed' AND starts_at > ?"));
+    query.addBindValue(reservationId);
+    query.addBindValue(normalizedUserId(userId));
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        if (error) *error = QStringLiteral("Solo se pueden cancelar reservas futuras confirmadas.");
+        return false;
+    }
+    return true;
 }
 
 bool UserDatabase::canTransmit(const QString &userId) const

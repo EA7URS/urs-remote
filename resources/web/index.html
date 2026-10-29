@@ -3628,13 +3628,13 @@ function handleMessage(msg) {
         else if (!usageDialog || typeof usageDialog.showModal !== 'function') window.alert(msg.message || 'Has agotado el tiempo autorizado para usar la radio.');
         return;
     }
-    if (msg.type === 'radioBusy' || msg.type === 'radioControlTakenOver') {
+    if (msg.type === 'radioBusy' || msg.type === 'radioReserved' || msg.type === 'radioControlTakenOver') {
         radioAccessBlocked = true;
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         var radioDialog = document.getElementById('radioAccessDialog');
         var radioTitle = document.getElementById('radioAccessTitle');
         var radioMessage = document.getElementById('radioAccessMessage');
-        if (radioTitle) radioTitle.textContent = msg.type === 'radioControlTakenOver' ? 'Control cedido al administrador' : 'Radio ocupada';
+        if (radioTitle) radioTitle.textContent = msg.type === 'radioControlTakenOver' ? 'Control cedido al administrador' : (msg.type === 'radioReserved' ? 'Radio reservada' : 'Radio ocupada');
         if (radioMessage && msg.message) radioMessage.textContent = msg.message;
         if (radioDialog && !radioDialog.open && typeof radioDialog.showModal === 'function') radioDialog.showModal();
         else if (!radioDialog || typeof radioDialog.showModal !== 'function') window.alert(msg.message || 'La radio está siendo utilizada por otro usuario.');

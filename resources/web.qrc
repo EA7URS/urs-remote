@@ -4,6 +4,7 @@
         <file alias="login.html">web/login.html</file>
         <file alias="home.html">web/home.html</file>
         <file alias="profile.html">web/profile.html</file>
+        <file alias="reservations.html">web/reservations.html</file>
         <file alias="admin.html">web/admin.html</file>
         <file alias="admin-create.html">web/admin-create.html</file>
         <file alias="admin-edit.html">web/admin-edit.html</file>

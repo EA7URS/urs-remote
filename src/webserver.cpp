@@ -876,7 +876,7 @@ void webServer::onHttpReadyRead()
 
     if (path == "/index.html" && (!pageUser.authenticated || pageUser.mustChangePassword))
         path = "/login.html";
-    if (path == "/home.html" || path == "/profile.html") {
+    if (path == "/home.html" || path == "/profile.html" || path == "/reservations.html") {
         if (!pageUser.authenticated || pageUser.mustChangePassword)
             path = "/login.html";
     }
@@ -1198,6 +1198,61 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
         return;
     }
 
+    if (p == "/api/v1/reservations" || p.startsWith(QStringLiteral("/api/v1/reservations/"))) {
+        if (!currentUser.authenticated || currentUser.mustChangePassword) {
+            sendRestResponse(socket, currentUser.authenticated ? 403 : 401,
+                             QJsonObject{{"error", "Login required."}});
+            return;
+        }
+        if (method == "GET" && p == "/api/v1/reservations") {
+            sendRestResponse(socket, 200,
+                             QJsonObject{{"reservations", userDatabase_.reservations(currentUser.userId)},
+                                         {"reservationStatus", userDatabase_.reservationStatus(currentUser.userId)},
+                                         {"usage", userDatabase_.usageStatus(currentUser.userId)}});
+            return;
+        }
+        if (!sameRequestOrigin(headerSection, tls)) {
+            sendRestResponse(socket, 403, QJsonObject{{"error", "Request origin not allowed."}});
+            return;
+        }
+        QString error;
+        if (method == "POST") {
+            const QJsonObject input = parseBody();
+            const qint64 startsAt = input.value(QStringLiteral("startsAt")).toVariant().toLongLong();
+            const qint64 endsAt = input.value(QStringLiteral("endsAt")).toVariant().toLongLong();
+            qint64 reservationId = 0;
+            if (!userDatabase_.createReservation(currentUser.userId, startsAt, endsAt,
+                                                 &reservationId, &error)) {
+                sendRestResponse(socket, error.contains(QStringLiteral("Ese intervalo")) ? 409 : 400,
+                                 QJsonObject{{"error", error}});
+                return;
+            }
+            sendRestResponse(socket, 201,
+                             QJsonObject{{"reservationId", reservationId},
+                                         {"reservations", userDatabase_.reservations(currentUser.userId)},
+                                         {"reservationStatus", userDatabase_.reservationStatus(currentUser.userId)},
+                                         {"usage", userDatabase_.usageStatus(currentUser.userId)}});
+            return;
+        }
+        const QString prefix = QStringLiteral("/api/v1/reservations/");
+        if (method == "DELETE" && p.startsWith(prefix)) {
+            bool ok = false;
+            const qint64 id = p.mid(prefix.size()).toLongLong(&ok);
+            if (!ok || id <= 0 || !userDatabase_.cancelReservation(currentUser.userId, id, &error)) {
+                sendRestResponse(socket, 400, QJsonObject{{"error", error.isEmpty()
+                                                            ? QStringLiteral("El identificador de reserva no es válido.") : error}});
+                return;
+            }
+            sendRestResponse(socket, 200,
+                             QJsonObject{{"reservations", userDatabase_.reservations(currentUser.userId)},
+                                         {"reservationStatus", userDatabase_.reservationStatus(currentUser.userId)},
+                                         {"usage", userDatabase_.usageStatus(currentUser.userId)}});
+            return;
+        }
+        sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+        return;
+    }
+
     if (p == "/api/v1/auth/profile") {
         if (method != "PUT") {
             sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
@@ -1451,20 +1506,23 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
 
     if (p.startsWith("/api/v1/radio/")) {
         const QJsonObject usage = userDatabase_.usageStatus(currentUser.userId);
-        if (!usage.value(QStringLiteral("allowed")).toBool()) {
+        const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+        if (!usage.value(QStringLiteral("allowed")).toBool()
+                && !(currentUser.isAdmin || reservationOwner == currentUser.userId)) {
             sendRestResponse(socket, 403,
                              QJsonObject{{"code", "usage_limit_exceeded"},
                                          {"error", usage.value(QStringLiteral("message")).toString()}});
             return;
         }
         const QString activeOtherUser = otherRadioUserConnected(currentUser.userId);
-        if (!currentUser.isAdmin && !activeOtherUser.isEmpty()) {
+        if (!currentUser.isAdmin && reservationOwner != currentUser.userId && !activeOtherUser.isEmpty()) {
             sendRestResponse(socket, 409,
                              QJsonObject{{"code", "radio_busy"},
                                          {"error", "La radio está siendo utilizada por otro usuario."}});
             return;
         }
-        if (currentUser.isAdmin && method != "GET" && !activeOtherUser.isEmpty())
+        if ((currentUser.isAdmin || reservationOwner == currentUser.userId)
+                && method != "GET" && !activeOtherUser.isEmpty())
             takeOverRadioConnections(currentUser.userId);
     }
 
@@ -2285,8 +2343,14 @@ void webServer::onWsNewConnection()
         return;
     }
 
+    const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
     const QString activeOtherUser = otherRadioUserConnected(user.userId);
-    if (!user.isAdmin && !activeOtherUser.isEmpty()) {
+    if (!user.isAdmin && !reservationOwner.isEmpty() && reservationOwner != user.userId) {
+        rejectWebSocket(pSocket, QJsonObject{{"type", "radioReserved"},
+                                             {"message", "La emisora está reservada por otro usuario en este horario."}});
+        return;
+    }
+    if (!user.isAdmin && reservationOwner != user.userId && !activeOtherUser.isEmpty()) {
         rejectWebSocket(pSocket, QJsonObject{{"type", "radioBusy"},
                                              {"message", "La radio está siendo utilizada por otro usuario. Inténtalo más tarde."}});
         return;
@@ -2295,7 +2359,7 @@ void webServer::onWsNewConnection()
     QJsonObject usage;
     QString usageError;
     const QString usageSession = userDatabase_.startUsageSession(user.userId, &usage, &usageError);
-    if (usageSession.isEmpty()) {
+    if (usageSession.isEmpty() && reservationOwner != user.userId && !user.isAdmin) {
         const QString message = usage.value(QStringLiteral("message")).toString().isEmpty()
                 ? (usageError.isEmpty() ? QStringLiteral("No se ha podido comprobar el tiempo autorizado. Inténtalo de nuevo.")
                                         : usageError)
@@ -2304,7 +2368,7 @@ void webServer::onWsNewConnection()
         return;
     }
 
-    if (user.isAdmin && !activeOtherUser.isEmpty())
+    if ((user.isAdmin || reservationOwner == user.userId) && !activeOtherUser.isEmpty())
         takeOverRadioConnections(user.userId);
 
     connect(pSocket, &QWebSocket::textMessageReceived, this, &webServer::onWsTextMessage);
@@ -2337,7 +2401,10 @@ void webServer::onWsTextMessage(QString message)
         return;
     }
     const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
-    if (!usage.value(QStringLiteral("allowed")).toBool()) {
+    const QString reservationOwner = userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch());
+    if (!usage.value(QStringLiteral("allowed")).toBool()
+            && reservationOwner != wsUserIds_.value(pClient)
+            && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();
@@ -2437,12 +2504,18 @@ QString webServer::otherRadioUserConnected(const QString &userId) const
 
 void webServer::takeOverRadioConnections(const QString &userId)
 {
+    const bool administrator = userDatabase_.isAdministrator(userId);
     const QList<QWebSocket *> clients = wsClients;
     for (QWebSocket *client : clients) {
         if (!client || !wsClients.contains(client) || wsUserIds_.value(client) == userId)
             continue;
-        sendJsonTo(client, QJsonObject{{"type", "radioControlTakenOver"},
-                                       {"message", "Un administrador ha tomado el control de la radio y ha cerrado esta sesión."}});
+        if (!administrator && userDatabase_.isAdministrator(wsUserIds_.value(client)))
+            continue;
+        sendJsonTo(client, administrator
+                   ? QJsonObject{{"type", "radioControlTakenOver"},
+                                 {"message", "Un administrador ha tomado el control de la radio y ha cerrado esta sesión."}}
+                   : QJsonObject{{"type", "radioReserved"},
+                                 {"message", "Ha comenzado una reserva de otro usuario y la sesión se ha cerrado."}});
         client->close();
     }
 }
@@ -2462,17 +2535,26 @@ void webServer::checkRadioUsageLimits()
     }
 
     const QList<QWebSocket *> clients = wsClients;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const QString reservationOwner = userDatabase_.activeReservationOwner(now);
     for (QWebSocket *client : clients) {
         if (!wsClients.contains(client)) continue;
-        const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(client));
-        if (!usage.value(QStringLiteral("allowed")).toBool()) {
+        const QString userId = wsUserIds_.value(client);
+        const bool administrator = userDatabase_.isAdministrator(userId);
+        if (!reservationOwner.isEmpty() && reservationOwner != userId && !administrator) {
+            sendJsonTo(client, QJsonObject{{"type", "radioReserved"},
+                                           {"message", "La emisora está reservada por otro usuario en este horario."}});
+            client->close();
+            continue;
+        }
+        const QJsonObject usage = userDatabase_.usageStatus(userId);
+        if (!usage.value(QStringLiteral("allowed")).toBool() && reservationOwner != userId && !administrator) {
             sendJsonTo(client, QJsonObject{{"type", "usageLimitDenied"},
                                            {"message", usage.value(QStringLiteral("message")).toString()}});
             client->close();
             continue;
         }
 
-        const QString userId = wsUserIds_.value(client);
         const QJsonObject daily = usage.value(QStringLiteral("daily")).toObject();
         if (daily.isEmpty() || daily.value(QStringLiteral("limitMinutes")).isNull()
                 || daily.value(QStringLiteral("remainingSeconds")).isNull()) {
@@ -2544,7 +2626,10 @@ void webServer::onWsBinaryMessage(QByteArray message)
         return;
     }
     const QJsonObject usage = userDatabase_.usageStatus(wsUserIds_.value(pClient));
-    if (!usage.value(QStringLiteral("allowed")).toBool()) {
+    if (!usage.value(QStringLiteral("allowed")).toBool()
+            && userDatabase_.activeReservationOwner(QDateTime::currentSecsSinceEpoch())
+                    != wsUserIds_.value(pClient)
+            && !userDatabase_.isAdministrator(wsUserIds_.value(pClient))) {
         sendJsonTo(pClient, QJsonObject{{"type", "usageLimitDenied"},
                                         {"message", usage.value(QStringLiteral("message")).toString()}});
         pClient->close();
