@@ -30,6 +30,7 @@
   <header><h1>Reservar tiempo de radio</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a></nav></header>
   <p>Elige un intervalo futuro. La reserva descuenta ese tiempo de tus cupos diario, semanal y mensual. El servidor comprobará cada periodo afectado antes de confirmarla.</p>
   <p id="quota" class="quota" aria-live="polite">Cargando los límites de tu perfil…</p>
+  <p id="quotaPeriods" class="quota" aria-live="polite"></p>
   <form id="reservationForm">
     <label>Desde <input id="startsAt" type="datetime-local" required step="60"></label>
     <label>Hasta <input id="endsAt" type="datetime-local" required step="60"></label>
@@ -44,6 +45,12 @@ const $ = id => document.getElementById(id);
 let userData = null;
 const fmt = seconds => new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(seconds * 1000));
 const duration = minutes => minutes >= 60 ? `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ''}` : `${minutes} min`;
+const remaining = value => {
+  if (!value || value.remainingSeconds == null) return 'sin límite';
+  const seconds = Math.max(0, Number(value.remainingSeconds));
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} min${seconds % 60 ? ` ${seconds % 60} s` : ''}`;
+};
 function showNotice(message, ok = false) { $('notice').textContent = message || ''; $('notice').style.color = ok ? '#70e0d8' : '#ff9b8f'; }
 async function request(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
@@ -59,6 +66,7 @@ function render(data) {
   $('quota').textContent = max > 0
     ? `Tiempo máximo por reserva: ${duration(max)}. Las reservas también deben caber en los cupos de cada periodo afectado.`
     : 'Tu perfil no permite realizar reservas. Contacta con un administrador para cambiar el límite.';
+  $('quotaPeriods').textContent = `Disponible ahora: diario ${remaining(data.usage?.daily)}, semanal ${remaining(data.usage?.weekly)} y mensual ${remaining(data.usage?.monthly)}. Al confirmar, se comprobarán los cupos de las fechas reservadas.`;
   $('submit').disabled = max <= 0;
   const list = $('reservationList'); list.replaceChildren();
   const items = data.reservations || [];
