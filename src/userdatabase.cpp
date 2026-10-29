@@ -1123,12 +1123,53 @@ void UserDatabase::endUsageSession(const QString &sessionId)
 
 QString UserDatabase::activeReservationOwner(qint64 now) const
 {
+    return activeReservation(now).value(QStringLiteral("userId")).toString();
+}
+
+QJsonObject UserDatabase::activeReservation(qint64 now) const
+{
     QSqlQuery query(db_);
-    query.prepare(QStringLiteral("SELECT user_id FROM radio_reservations WHERE status = 'confirmed' "
-                                 "AND starts_at <= ? AND ends_at > ? ORDER BY starts_at LIMIT 1"));
+    query.prepare(QStringLiteral("SELECT r.reservation_id, r.user_id, u.first_name, u.last_name, "
+                                 "r.starts_at, r.ends_at FROM radio_reservations r "
+                                 "JOIN users u ON u.user_id = r.user_id "
+                                 "WHERE r.status = 'confirmed' AND r.starts_at <= ? AND r.ends_at > ? "
+                                 "ORDER BY r.starts_at LIMIT 1"));
     query.addBindValue(now);
     query.addBindValue(now);
-    return query.exec() && query.next() ? query.value(0).toString() : QString();
+    if (!query.exec() || !query.next()) return QJsonObject();
+    const QString name = (query.value(2).toString() + QLatin1Char(' ') + query.value(3).toString()).trimmed();
+    return QJsonObject{{"id", query.value(0).toLongLong()},
+                       {"userId", query.value(1).toString()},
+                       {"name", name},
+                       {"startsAt", query.value(4).toLongLong()},
+                       {"endsAt", query.value(5).toLongLong()},
+                       {"isActive", true}};
+}
+
+QJsonArray UserDatabase::upcomingReservations(qint64 now, qint64 through) const
+{
+    QJsonArray reservations;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral("SELECT r.reservation_id, r.user_id, u.first_name, u.last_name, "
+                                 "r.starts_at, r.ends_at FROM radio_reservations r "
+                                 "JOIN users u ON u.user_id = r.user_id "
+                                 "WHERE r.status = 'confirmed' AND r.starts_at < ? AND r.ends_at > ? "
+                                 "ORDER BY r.starts_at ASC"));
+    query.addBindValue(through);
+    query.addBindValue(now);
+    if (!query.exec()) return reservations;
+    while (query.next()) {
+        const qint64 startsAt = query.value(4).toLongLong();
+        const qint64 endsAt = query.value(5).toLongLong();
+        const QString name = (query.value(2).toString() + QLatin1Char(' ') + query.value(3).toString()).trimmed();
+        reservations.append(QJsonObject{{"id", query.value(0).toLongLong()},
+                                        {"userId", query.value(1).toString()},
+                                        {"name", name},
+                                        {"startsAt", startsAt},
+                                        {"endsAt", endsAt},
+                                        {"isActive", startsAt <= now && endsAt > now}});
+    }
+    return reservations;
 }
 
 bool UserDatabase::isAdministrator(const QString &userId) const
