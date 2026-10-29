@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reservar tiempo · EA7URS Remote</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; padding: 2rem 1rem; }
+    main { width: min(100%, 48rem); margin: 0 auto; padding: 2rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    header, nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1, h2 { color: #38d1c5; } h1 { margin-top: 0; }
+    p, .muted { color: #a9bfc2; line-height: 1.5; }
+    nav a, a { color: #70e0d8; }
+    form { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+    label { display: grid; gap: .45rem; color: #c9dddd; }
+    input { min-height: 2.8rem; padding: .6rem; border: 1px solid #28545b; border-radius: .45rem; background: #071114; color: #e5f2f2; font: inherit; }
+    button { min-height: 2.8rem; align-self: end; padding: .65rem 1rem; border: 1px solid #38d1c5; border-radius: .45rem; background: #123b3d; color: #e5f2f2; font: inherit; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    ul { list-style: none; padding: 0; }
+    li { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .8rem; padding: 1rem 0; border-top: 1px solid #28545b; }
+    li button { min-height: 2.3rem; margin: 0; border-color: #815149; background: #392522; }
+    #notice { min-height: 1.5rem; color: #ff9b8f; }
+    .quota { padding: .8rem 1rem; border-left: 3px solid #38d1c5; background: #10272c; }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>Reservar tiempo de radio</h1><nav><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a></nav></header>
+  <p>Elige un intervalo futuro. La reserva descuenta ese tiempo de tus cupos diario, semanal y mensual. El servidor comprobará cada periodo afectado antes de confirmarla.</p>
+  <p id="quota" class="quota" aria-live="polite">Cargando los límites de tu perfil…</p>
+  <form id="reservationForm">
+    <label>Desde <input id="startsAt" type="datetime-local" required step="60"></label>
+    <label>Hasta <input id="endsAt" type="datetime-local" required step="60"></label>
+    <button id="submit" type="submit">Confirmar reserva</button>
+  </form>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <h2>Tus reservas</h2>
+  <ul id="reservationList"><li class="muted">Cargando…</li></ul>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let userData = null;
+const fmt = seconds => new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(seconds * 1000));
+const duration = minutes => minutes >= 60 ? `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ''}` : `${minutes} min`;
+function showNotice(message, ok = false) { $('notice').textContent = message || ''; $('notice').style.color = ok ? '#70e0d8' : '#ff9b8f'; }
+async function request(url, options = {}) {
+  const response = await fetch(url, { credentials: 'same-origin', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) { location.replace('/login.html'); throw new Error(''); }
+  if (!response.ok) throw new Error(data.error || 'No se pudo completar la operación.');
+  return data;
+}
+function render(data) {
+  userData = data;
+  const status = data.reservationStatus || {};
+  const max = Number(status.maxReservationMinutes || 0);
+  $('quota').textContent = max > 0
+    ? `Tiempo máximo por reserva: ${duration(max)}. Las reservas también deben caber en los cupos de cada periodo afectado.`
+    : 'Tu perfil no permite realizar reservas. Contacta con un administrador para cambiar el límite.';
+  $('submit').disabled = max <= 0;
+  const list = $('reservationList'); list.replaceChildren();
+  const items = data.reservations || [];
+  if (!items.length) { const li = document.createElement('li'); li.className = 'muted'; li.textContent = 'Todavía no tienes reservas.'; list.append(li); return; }
+  for (const item of items) {
+    const li = document.createElement('li');
+    const info = document.createElement('span');
+    info.textContent = `${fmt(item.startsAt)} – ${fmt(item.endsAt)} · ${duration(item.durationMinutes)} · ${item.status === 'confirmed' ? 'Confirmada' : 'Cancelada'}`;
+    li.append(info);
+    if (item.status === 'confirmed' && item.startsAt * 1000 > Date.now()) {
+      const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancelar';
+      cancel.addEventListener('click', async () => {
+        if (!confirm('¿Cancelar esta reserva? El tiempo volverá a tus cupos.')) return;
+        try { render(await request(`/api/v1/reservations/${item.id}`, { method: 'DELETE' })); showNotice('Reserva cancelada.', true); }
+        catch (error) { showNotice(error.message); }
+      });
+      li.append(cancel);
+    }
+    list.append(li);
+  }
+}
+async function load() { try { render(await request('/api/v1/reservations')); } catch (error) { showNotice(error.message); } }
+$('reservationForm').addEventListener('submit', async event => {
+  event.preventDefault(); showNotice('');
+  const start = new Date($('startsAt').value).getTime() / 1000;
+  const end = new Date($('endsAt').value).getTime() / 1000;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) { showNotice('Indica las horas de inicio y fin.'); return; }
+  $('submit').disabled = true;
+  try {
+    const data = await request('/api/v1/reservations', { method: 'POST', body: JSON.stringify({ startsAt: start, endsAt: end }) });
+    render(data); showNotice('Reserva confirmada. El tiempo ya se ha descontado de tus cupos.', true); event.target.reset();
+  } catch (error) { showNotice(error.message); }
+  finally { $('submit').disabled = Number(userData?.reservationStatus?.maxReservationMinutes || 0) <= 0; }
+});
+const min = new Date(Date.now() + 60000); min.setSeconds(0, 0);
+$('startsAt').min = $('endsAt').min = new Date(min.getTime() - min.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+load();
+</script>
+</body>
+</html>
