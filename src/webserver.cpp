@@ -18,7 +18,9 @@
 #include <QDateTime>
 #include <QHostInfo>
 #include <QNetworkRequest>
+#include <QSet>
 #include <QUrl>
+#include <algorithm>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -885,6 +887,7 @@ void webServer::onHttpReadyRead()
     if (path == "/home") path = "/home.html";
     if (path == "/profile") path = "/profile.html";
     if (path == "/admin") path = "/admin.html";
+    if (path == "/allowed-bands") path = "/allowed-bands.html";
 
     if (path == "/index.html" && (!pageUser.authenticated || pageUser.mustChangePassword))
         path = "/login.html";
@@ -893,7 +896,8 @@ void webServer::onHttpReadyRead()
             path = "/login.html";
     }
     const bool adminPage = path == "/admin.html" || path == "/admin-create.html"
-            || path == "/admin-edit.html" || path == "/usage-profiles.html";
+            || path == "/admin-edit.html" || path == "/usage-profiles.html"
+            || path == "/allowed-bands.html";
     if (adminPage) {
         if (!pageUser.authenticated || pageUser.mustChangePassword) {
             path = "/login.html";
@@ -1414,6 +1418,60 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             }
             return;
         }
+        if (p == "/api/v1/admin/bands") {
+            if (!rigCaps) {
+                sendRestResponse(socket, 503, QJsonObject{{"error", "Rig not connected"}});
+                return;
+            }
+            if (method == "GET") {
+                QJsonObject response;
+                addBandCaps(response);
+                const QJsonObject policy = userDatabase_.allowedBandPolicy();
+                response["configured"] = policy.value("configured").toBool();
+                response["allowedBands"] = policy.value("allowedBands").toArray();
+                sendRestResponse(socket, 200, response);
+            } else if (method == "PUT") {
+                QJsonArray requested = parseBody().value("allowedBands").toArray();
+                QJsonObject caps;
+                addBandCaps(caps);
+                QSet<int> available;
+                for (const QJsonValue &value : caps.value("bands").toArray())
+                    available.insert(value.toObject().value("num").toInt());
+                QSet<int> selected;
+                bool valid = true;
+                for (const QJsonValue &value : requested) {
+                    const int band = value.toInt(-1);
+                    if (!value.isDouble() || band < 0 || value.toDouble() != double(band)
+                            || !available.contains(band)) {
+                        valid = false;
+                        break;
+                    }
+                    selected.insert(band);
+                }
+                if (!valid || selected.isEmpty()) {
+                    sendRestResponse(socket, 400, QJsonObject{{"error", "Selecciona al menos una banda disponible de la emisora."}});
+                    return;
+                }
+                QJsonArray normalized;
+                QList<int> sorted = selected.values();
+                std::sort(sorted.begin(), sorted.end());
+                for (int band : sorted) normalized.append(band);
+                QString error;
+                if (!userDatabase_.saveAllowedBands(normalized, &error)) {
+                    sendRestResponse(socket, 400, QJsonObject{{"error", error}});
+                    return;
+                }
+                const qint64 current = activeRadioFrequency();
+                if (current > 0 && !isFrequencyAllowed(current))
+                    rejectBandAttempt(current, bandForFrequency(current), nullptr, true);
+                else
+                    bandRecoveryPending_ = false;
+                sendRestResponse(socket, 200, QJsonObject{{"configured", true}, {"allowedBands", normalized}});
+            } else {
+                sendRestResponse(socket, 405, QJsonObject{{"error", "Method not allowed"}});
+            }
+            return;
+        }
         const QString usageProfilePrefix = QStringLiteral("/api/v1/admin/usage-profiles/");
         if (p.startsWith(usageProfilePrefix)) {
             bool idOk = false;
@@ -1813,6 +1871,13 @@ void webServer::handleRestRequest(QTcpSocket *socket, const QString &method,
             if (hz == 0) {
                 QJsonObject e; e["error"] = "Invalid frequency";
                 sendRestResponse(socket, 400, e); return;
+            }
+            if (!isFrequencyAllowed(qint64(hz))) {
+                rejectBandAttempt(qint64(hz), bandForFrequency(qint64(hz)));
+                sendRestResponse(socket, 409, QJsonObject{{"code", "band_restricted"},
+                    {"error", "La banda solicitada no está permitida. La emisora volverá a 14.100 MHz."},
+                    {"fallbackHz", 14100000}});
+                return;
             }
             freqt f;
             f.Hz = hz;
@@ -3056,6 +3121,10 @@ void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
     else if (type == "setFrequency") {
         quint64 hz = cmd["value"].toVariant().toULongLong();
         if (hz > 0) {
+            if (!isFrequencyAllowed(qint64(hz))) {
+                rejectBandAttempt(qint64(hz), bandForFrequency(qint64(hz)), client);
+                return;
+            }
             freqt f;
             f.Hz = hz;
             f.MHzDouble = hz / 1.0E6;
@@ -3078,7 +3147,14 @@ void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
         if (rigCaps && rigCaps->manufacturer == manufIcom
                 && rigCaps->commands.contains(funcBandStackReg) && bsr > 0) {
             for (const bandType &b : rigCaps->bands) {
-                if (b.bsr == bsr) { known = true; break; }
+                if (b.bsr == bsr) {
+                    known = true;
+                    if (!isBandAllowed(int(b.band))) {
+                        rejectBandAttempt(0, int(b.band), client);
+                        return;
+                    }
+                    break;
+                }
             }
         }
         if (!known) {
@@ -3160,6 +3236,11 @@ void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
             return;
         }
         bool wantB = (vfoName == "B");
+        const qint64 targetFrequency = cachedFrequencyForReceiver(wantB ? 1 : 0);
+        if (targetFrequency > 0 && !isFrequencyAllowed(targetFrequency)) {
+            rejectBandAttempt(targetFrequency, bandForFrequency(targetFrequency), client);
+            return;
+        }
         vfo_t v;
         if (rigCaps && rigCaps->hasCommand29)
             v = wantB ? vfoSub : vfoMain;
@@ -3180,6 +3261,11 @@ void webServer::handleCommand(QWebSocket *client, const QJsonObject &cmd)
         requestVfoUpdate();
     }
     else if (type == "swapVFO") {
+        const qint64 inactiveFrequency = cachedFrequencyForReceiver(activeReceiver == 0 ? 1 : 0);
+        if (inactiveFrequency > 0 && !isFrequencyAllowed(inactiveFrequency)) {
+            rejectBandAttempt(inactiveFrequency, bandForFrequency(inactiveFrequency), client);
+            return;
+        }
         // IC-7300/7100/705/etc use VFO Swap A/B; IC-7610/785x/9700/905 use Swap M/S.
         funcs swapFunc = funcNone;
         if (rigCaps) {
@@ -5142,6 +5228,24 @@ void webServer::receiveCache(cacheItem item)
         break;
     }
 
+    funcs reportedFunc = item.command;
+    if (reportedFunc == funcFreqTR || reportedFunc == funcSelectedFreq || reportedFunc == funcFreq)
+        reportedFunc = funcFreq;
+    if (reportedFunc == funcFreq || reportedFunc == funcFreqGet || reportedFunc == funcFreqSet) {
+        const freqt reported = item.value.value<freqt>();
+        const bool isActive = (rigCaps && rigCaps->hasCommand29)
+                ? item.receiver == activeReceiver : true;
+        if (isActive && reported.Hz == 14100000) {
+            bandRecoveryPending_ = false;
+        } else if (isActive && reported.Hz > 0 && !isFrequencyAllowed(qint64(reported.Hz))) {
+            if (!bandRecoveryPending_
+                    || QDateTime::currentSecsSinceEpoch() - bandRecoveryStartedAt_ > 10) {
+                rejectBandAttempt(qint64(reported.Hz), bandForFrequency(qint64(reported.Hz)), nullptr, true);
+            }
+            return;
+        }
+    }
+
     if (wsClients.isEmpty()) return;
 
     QJsonObject update;
@@ -5974,6 +6078,10 @@ void webServer::sendMemoryError(QWebSocket *client, const QString &error)
 void webServer::applyMemoryToVfo(qint64 hz, quint8 modeReg, quint8 filter, quint8 datamode)
 {
     if (!queue || !rigCaps) return;
+    if (hz > 0 && !isFrequencyAllowed(hz)) {
+        rejectBandAttempt(hz, bandForFrequency(hz), nullptr, true);
+        return;
+    }
     const uchar rx = rigCaps->hasCommand29
                    ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
     const vfoCommandType t = queue->getVfoCommand(vfoA, rx, true);
@@ -6117,6 +6225,14 @@ bool webServer::recallMemoryOnRig(int channel, int group, QString *error)
                  : funcNone;
 
     const quint32 key = (quint32(group) << 16) | quint32(channel);
+    auto cachedMemory = memories.constFind(key);
+    if (cachedMemory != memories.constEnd() && cachedMemory.value().frequency.Hz > 0
+            && !isFrequencyAllowed(qint64(cachedMemory.value().frequency.Hz))) {
+        const qint64 hz = qint64(cachedMemory.value().frequency.Hz);
+        rejectBandAttempt(hz, bandForFrequency(hz), nullptr, true);
+        if (error) *error = "La frecuencia de la memoria pertenece a una banda no permitida.";
+        return false;
+    }
     bool cmd29 = rigCaps->hasCommand29;
     uchar rx = cmd29 ? (queue->getState().vfo == vfoSub ? 1 : 0) : 0;
 
@@ -6170,6 +6286,11 @@ bool webServer::recallMemoryOnRig(int channel, int group, QString *error)
                 bandHz = it.value().frequency.Hz;
             }
             if (bandHz > 0) {
+                if (!isFrequencyAllowed(qint64(bandHz))) {
+                    rejectBandAttempt(qint64(bandHz), bandForFrequency(qint64(bandHz)), nullptr, true);
+                    if (error) *error = "La banda del grupo de memoria no está permitida.";
+                    return false;
+                }
                 freqt f;
                 f.Hz = bandHz;
                 f.MHzDouble = bandHz / 1.0E6;
@@ -6250,6 +6371,94 @@ void webServer::addBandCaps(QJsonObject &o) const
         bands.append(bo);
     }
     o["bands"] = bands;
+}
+
+bool webServer::bandPolicyConfigured() const
+{
+    return userDatabase_.allowedBandPolicy().value("configured").toBool();
+}
+
+bool webServer::isBandAllowed(int band) const
+{
+    const QJsonObject policy = userDatabase_.allowedBandPolicy();
+    if (!policy.value("configured").toBool()) return true;
+    for (const QJsonValue &value : policy.value("allowedBands").toArray())
+        if (value.toInt(-1) == band) return true;
+    return false;
+}
+
+int webServer::bandForFrequency(qint64 hz) const
+{
+    if (!rigCaps || hz <= 0) return -1;
+    for (const bandType &band : rigCaps->bands) {
+        if (band.band != bandUnknown && band.highFreq > band.lowFreq
+                && quint64(hz) >= band.lowFreq && quint64(hz) <= band.highFreq)
+            return int(band.band);
+    }
+    return -1;
+}
+
+bool webServer::isFrequencyAllowed(qint64 hz) const
+{
+    if (!bandPolicyConfigured() || hz == 14100000) return true;
+    const int band = bandForFrequency(hz);
+    return band >= 0 && isBandAllowed(band);
+}
+
+qint64 webServer::cachedFrequencyForReceiver(uchar receiver) const
+{
+    if (!queue || !rigCaps) return 0;
+    const vfoCommandType command = rigCaps->hasCommand29
+            ? queue->getVfoCommand(vfoA, receiver, false)
+            : queue->getVfoCommand(receiver ? vfoB : vfoA, 0, false);
+    cacheItem cached = queue->getCache(command.freqFunc, command.receiver);
+    if (!cached.value.isValid()) cached = queue->getCache(funcSelectedFreq, command.receiver);
+    if (!cached.value.isValid()) cached = queue->getCache(funcFreq, command.receiver);
+    if (!cached.value.isValid()) return 0;
+    return qint64(cached.value.value<freqt>().Hz);
+}
+
+qint64 webServer::activeRadioFrequency() const
+{
+    return cachedFrequencyForReceiver(rigCaps && rigCaps->hasCommand29 ? activeReceiver : 0);
+}
+
+void webServer::tuneToFrequency(qint64 hz)
+{
+    if (!queue || !rigCaps || hz <= 0) return;
+    freqt frequency;
+    frequency.Hz = quint64(hz);
+    frequency.MHzDouble = double(hz) / 1.0E6;
+    frequency.VFO = activeVFO;
+    const uchar receiver = rigCaps->hasCommand29 ? activeReceiver : 0;
+    const vfoCommandType command = queue->getVfoCommand(vfoA, receiver, true);
+    queue->addUnique(priorityImmediate, queueItem(command.freqFunc,
+        QVariant::fromValue<freqt>(frequency), false, command.receiver));
+}
+
+void webServer::rejectBandAttempt(qint64 requestedHz, int requestedBand,
+                                  QWebSocket *client, bool automatic)
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const bool alreadyRecovering = bandRecoveryPending_
+            && now - bandRecoveryStartedAt_ <= 10;
+    if (!alreadyRecovering) {
+        bandRecoveryPending_ = true;
+        bandRecoveryRequestedHz_ = requestedHz;
+        bandRecoveryStartedAt_ = now;
+        tuneToFrequency(14100000);
+    }
+    if (automatic && alreadyRecovering) return;
+
+    QString message = QStringLiteral("La banda solicitada no está permitida.");
+    if (requestedHz > 0)
+        message = QStringLiteral("La frecuencia solicitada no pertenece a una banda permitida.");
+    message += QStringLiteral(" La emisora volverá a 14.100 MHz.");
+    const QJsonObject notice{{"type", "bandRestricted"}, {"message", message},
+                             {"requestedHz", requestedHz}, {"requestedBand", requestedBand},
+                             {"fallbackHz", 14100000}};
+    if (client) sendJsonTo(client, notice);
+    else sendJsonToAll(notice);
 }
 
 // The bottom bar of the browser's meter is switchable: SWR (default), ALC,

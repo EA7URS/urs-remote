@@ -37,6 +37,7 @@
   <p>Elige qué quieres hacer.</p>
   <nav aria-label="Opciones de la cuenta">
     <a id="adminLink" href="/admin.html" hidden>Administración de usuarios</a>
+    <a id="bandAdminLink" href="/allowed-bands.html" hidden>Bandas permitidas</a>
     <a href="/profile.html">Administrar perfil</a>
     <a href="/reservations.html">Reservar tiempo de radio</a>
     <a id="radioLink" href="/index.html">Ir a la radio</a>
@@ -61,6 +62,7 @@ fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(async response => 
   const user = await response.json();
   document.getElementById('user').textContent = user.userId;
   document.getElementById('adminLink').hidden = !user.isAdmin;
+  document.getElementById('bandAdminLink').hidden = !user.isAdmin;
   const scheduleList = document.getElementById('scheduleList');
   const scheduleEmpty = document.getElementById('scheduleEmpty');
   const reservations = user.upcomingReservations || [];

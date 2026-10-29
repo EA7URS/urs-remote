@@ -9,6 +9,7 @@
         <file alias="admin-create.html">web/admin-create.html</file>
         <file alias="admin-edit.html">web/admin-edit.html</file>
         <file alias="usage-profiles.html">web/usage-profiles.html</file>
+        <file alias="allowed-bands.html">web/allowed-bands.html</file>
         <file alias="access-denied.html">web/access-denied.html</file>
         <file alias="favicon.svg">web-shared/favicon.svg</file>
         <file alias="packet.js">web-shared/packet.js</file>

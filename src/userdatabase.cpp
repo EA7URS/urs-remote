@@ -5,6 +5,7 @@
 #include <QDate>
 #include <QFile>
 #include <QJsonObject>
+#include <QJsonDocument>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSqlError>
@@ -271,6 +272,14 @@ bool UserDatabase::createSchema(QString *error)
             "period TEXT NOT NULL CHECK(period IN ('daily', 'weekly', 'monthly')), "
             "reset_at INTEGER NOT NULL, "
             "PRIMARY KEY(user_id, period))"))) {
+        if (error) *error = queryError(query);
+        return false;
+    }
+    if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS station_band_policy ("
+            "policy_id INTEGER PRIMARY KEY CHECK(policy_id = 1), "
+            "allowed_bands TEXT NOT NULL, "
+            "updated_at INTEGER NOT NULL)"))) {
         if (error) *error = queryError(query);
         return false;
     }
@@ -1068,6 +1077,53 @@ QJsonObject UserDatabase::usageStatus(const QString &userId) const
         }
     }
     return status;
+}
+
+QJsonObject UserDatabase::allowedBandPolicy() const
+{
+    QSqlQuery query(db_);
+    if (!query.exec(QStringLiteral("SELECT allowed_bands, updated_at FROM station_band_policy WHERE policy_id = 1")))
+        return QJsonObject{{"configured", false}, {"allowedBands", QJsonArray()}};
+    if (!query.next())
+        return QJsonObject{{"configured", false}, {"allowedBands", QJsonArray()}};
+    const QJsonDocument document = QJsonDocument::fromJson(query.value(0).toByteArray());
+    const QJsonArray bands = document.isArray() ? document.array() : QJsonArray();
+    return QJsonObject{{"configured", true}, {"allowedBands", bands},
+                       {"updatedAt", query.value(1).toLongLong()}};
+}
+
+bool UserDatabase::saveAllowedBands(const QJsonArray &bands, QString *error)
+{
+    QSet<int> unique;
+    for (const QJsonValue &value : bands) {
+        if (!value.isDouble() || value.toDouble() < 0
+                || value.toDouble() != double(value.toInt(-1))) {
+            if (error) *error = QStringLiteral("La selección de bandas no es válida.");
+            return false;
+        }
+        unique.insert(value.toInt());
+    }
+    if (unique.isEmpty()) {
+        if (error) *error = QStringLiteral("Selecciona al menos una banda permitida.");
+        return false;
+    }
+    QJsonArray normalized;
+    QList<int> sorted = unique.values();
+    std::sort(sorted.begin(), sorted.end());
+    for (int band : sorted) normalized.append(band);
+
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral(
+        "INSERT INTO station_band_policy(policy_id, allowed_bands, updated_at) VALUES(1, ?, ?) "
+        "ON CONFLICT(policy_id) DO UPDATE SET allowed_bands = excluded.allowed_bands, "
+        "updated_at = excluded.updated_at"));
+    query.addBindValue(QJsonDocument(normalized).toJson(QJsonDocument::Compact));
+    query.addBindValue(QDateTime::currentSecsSinceEpoch());
+    if (!query.exec()) {
+        if (error) *error = queryError(query);
+        return false;
+    }
+    return true;
 }
 
 bool UserDatabase::resetUsagePeriod(const QString &userId, const QString &period,

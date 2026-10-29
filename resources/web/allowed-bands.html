@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EA7URS Remote · Bandas permitidas</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #071114; color: #e5f2f2; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: start center; padding: 1rem; }
+    main { width: min(100%, 52rem); margin: 2rem auto; padding: 1.5rem; border: 1px solid #17434b; border-radius: 1rem; background: #0d1d22; box-shadow: 0 1rem 4rem #0008; }
+    header, nav { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1, h2 { color: #38d1c5; } h1 { margin: 0; font-size: 1.5rem; }
+    h2 { margin-top: 1.8rem; font-size: 1.1rem; }
+    nav { flex-wrap: wrap; } a { color: #48cfc4; }
+    p { color: #a9bfc2; line-height: 1.5; }
+    #bandList { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .6rem; }
+    .band { display: flex; align-items: center; gap: .7rem; padding: .8rem; border: 1px solid #28545b; border-radius: .5rem; background: #10272c; }
+    .band input { width: 1.15rem; height: 1.15rem; accent-color: #12a99f; }
+    .band span { display: grid; gap: .15rem; } .band small { color: #a9bfc2; }
+    button { margin-top: 1.2rem; padding: .65rem .9rem; border: 0; border-radius: .45rem; background: #12a99f; color: #031415; font: inherit; font-weight: 700; cursor: pointer; }
+    button.secondary { border: 1px solid #28545b; background: transparent; color: #b8d0d2; }
+    #notice { min-height: 1.4rem; color: #ff9b8f; }
+    @media (max-width: 560px) { header { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Bandas permitidas</h1>
+    <nav aria-label="Navegación"><a href="/home.html">Inicio</a><a href="/index.html">Control de radio</a><a href="/admin.html">Administrar usuarios</a><button id="logout" class="secondary" type="button">Cerrar sesión</button></nav>
+  </header>
+  <p>Selecciona las bandas en las que se permite operar. Las frecuencias se validan en el servidor según los rangos que anuncia la emisora conectada. Si no se ha guardado una política, todas las bandas están permitidas.</p>
+  <p id="rigStatus" role="status" aria-live="polite"></p>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <form id="bandsForm">
+    <h2>Bandas de la emisora</h2>
+    <div id="bandList" aria-live="polite"></div>
+    <button id="save" type="submit">Guardar bandas permitidas</button>
+  </form>
+</main>
+<script>
+const notice = document.getElementById('notice');
+async function api(url, options = {}) {
+  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  const result = await response.json().catch(() => ({}));
+  if (response.status === 401) { location.replace('/login.html'); throw new Error('Inicia sesión para continuar.'); }
+  if (response.status === 403) { location.replace('/home.html'); throw new Error('Se requiere acceso de administrador.'); }
+  if (!response.ok) throw new Error(result.error || 'La solicitud ha fallado.');
+  return result;
+}
+function render(data) {
+  const list = document.getElementById('bandList');
+  list.replaceChildren();
+  const bands = data.bands || [];
+  document.getElementById('rigStatus').textContent = bands.length
+    ? 'Bandas detectadas: ' + bands.length + (data.configured ? '' : '. Aún no hay una política guardada; el acceso actual es libre.')
+    : 'La emisora conectada no ha anunciado bandas disponibles.';
+  document.getElementById('save').disabled = !bands.length;
+  for (const band of bands) {
+    const label = document.createElement('label'); label.className = 'band';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.name = 'band'; input.value = String(band.num);
+    input.checked = !data.configured || (data.allowedBands || []).includes(band.num);
+    const text = document.createElement('span');
+    const name = document.createElement('strong'); name.textContent = band.name || ('Banda ' + band.num);
+    const range = document.createElement('small'); range.textContent = (band.start / 1000000).toFixed(3) + '–' + (band.end / 1000000).toFixed(3) + ' MHz';
+    text.append(name, range); label.append(input, text); list.append(label);
+  }
+}
+api('/api/v1/auth/me').then(user => {
+  if (!user.isAdmin) { location.replace('/home.html'); return; }
+  return api('/api/v1/admin/bands').then(render);
+}).catch(error => { notice.textContent = error.message; });
+document.getElementById('bandsForm').addEventListener('submit', async event => {
+  event.preventDefault(); notice.textContent = '';
+  const allowedBands = Array.from(document.querySelectorAll('input[name="band"]:checked'), input => Number(input.value));
+  try {
+    await api('/api/v1/admin/bands', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowedBands }) });
+    const current = await api('/api/v1/admin/bands'); render(current);
+    notice.textContent = 'Se han guardado las bandas permitidas.';
+  } catch (error) { notice.textContent = error.message; }
+});
+document.getElementById('logout').addEventListener('click', async () => {
+  try { await api('/api/v1/auth/logout', { method: 'POST' }); } finally { location.replace('/login.html'); }
+});
+</script>
+</body>
+</html>

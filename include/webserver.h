@@ -276,6 +276,15 @@ private:
     bool expireReservationSessionIfNeeded(QWebSocket *client, qint64 now);
     QString otherRadioUserConnected(const QString &userId) const;
     void takeOverRadioConnections(const QString &userId);
+    bool bandPolicyConfigured() const;
+    bool isBandAllowed(int band) const;
+    bool isFrequencyAllowed(qint64 hz) const;
+    int bandForFrequency(qint64 hz) const;
+    qint64 cachedFrequencyForReceiver(uchar receiver) const;
+    qint64 activeRadioFrequency() const;
+    void tuneToFrequency(qint64 hz);
+    void rejectBandAttempt(qint64 requestedHz, int requestedBand,
+                           QWebSocket *client = nullptr, bool automatic = false);
     QString modeToString(modeInfo m);
     // JSON for a cached rig value, or null when the rig had nothing to report
     // (blank memory channel): Hz == 0 / a default modeInfo / filter 0xff.
@@ -305,6 +314,9 @@ private:
     QHash<QString, QSet<int>> dailyUsageWarnings_;
     QTimer *usageQuotaTimer_ = nullptr;
     QTimer *reservationExpiryTimer_ = nullptr;
+    bool bandRecoveryPending_ = false;
+    qint64 bandRecoveryRequestedHz_ = 0;
+    qint64 bandRecoveryStartedAt_ = 0;
     QHash<QString, QList<qint64>> failedLoginTimes_;
     UserDatabase userDatabase_;
     cachingQueue *queue = nullptr;

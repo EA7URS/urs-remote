@@ -2289,7 +2289,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
 }
 </style>
 <style>
-#transmitDeniedDialog, #usageLimitDeniedDialog, #usageWarningDialog, #radioAccessDialog {
+#transmitDeniedDialog, #usageLimitDeniedDialog, #usageWarningDialog, #radioAccessDialog, #bandRestrictedDialog {
     position: fixed;
     inset: auto;
     top: 50%;
@@ -2300,7 +2300,7 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
     max-height: min(85vh, 32rem);
     overflow: auto;
 }
-#transmitDeniedDialog::backdrop, #usageLimitDeniedDialog::backdrop, #usageWarningDialog::backdrop, #radioAccessDialog::backdrop { background: rgba(0, 0, 0, .72); }
+#transmitDeniedDialog::backdrop, #usageLimitDeniedDialog::backdrop, #usageWarningDialog::backdrop, #radioAccessDialog::backdrop, #bandRestrictedDialog::backdrop { background: rgba(0, 0, 0, .72); }
 </style>
 <!-- JS8 messenger panel styles — shared with the standalone build via
      resources/web-shared/js8-panel.css. -->
@@ -2326,6 +2326,11 @@ body.ui-locked .softBtn:not(.ptt-btn):not(.key-btn) { opacity: 0.4; }
     <h2 id="radioAccessTitle" style="margin-top:0; color:#38d1c5">Radio ocupada</h2>
     <p id="radioAccessMessage">Otro usuario está utilizando el control de radio.</p>
     <button type="button" onclick="document.getElementById('radioAccessDialog').close()">Entendido</button>
+</dialog>
+<dialog id="bandRestrictedDialog" aria-labelledby="bandRestrictedTitle" style="max-width:min(90vw, 26rem); border:1px solid #38d1c5; border-radius:12px; padding:1.5rem; background:#0d1d22; color:#e5f2f2; box-shadow:0 1rem 4rem #000b">
+    <h2 id="bandRestrictedTitle" style="margin-top:0; color:#38d1c5">Banda no permitida</h2>
+    <p id="bandRestrictedMessage">La banda solicitada no está permitida. La emisora volverá a 14.100 MHz.</p>
+    <button type="button" onclick="document.getElementById('bandRestrictedDialog').close()">Entendido</button>
 </dialog>
 <!-- Startup Overlay -->
 <div id="startupOverlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #0a0a0a 100%); z-index: 9999; display: flex; flex-direction: column; justify-content: center; align-items: center; font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; padding: 24px;">
@@ -3611,6 +3616,14 @@ function handleMessage(msg) {
     if (window.Packet && window.Packet.onMessage) window.Packet.onMessage(msg);
     if (msg.type === 'transmitDenied') {
         showTransmitDenied(msg.message);
+        return;
+    }
+    if (msg.type === 'bandRestricted') {
+        var bandDialog = document.getElementById('bandRestrictedDialog');
+        var bandMessage = document.getElementById('bandRestrictedMessage');
+        if (bandMessage && msg.message) bandMessage.textContent = msg.message;
+        if (bandDialog && !bandDialog.open && typeof bandDialog.showModal === 'function') bandDialog.showModal();
+        else if (!bandDialog || typeof bandDialog.showModal !== 'function') window.alert(msg.message || 'La banda solicitada no está permitida.');
         return;
     }
     if (msg.type === 'usageWarning') {
