@@ -1083,7 +1083,8 @@ QJsonObject UserDatabase::allowedBandPolicy() const
 {
     QSqlQuery query(db_);
     if (!query.exec(QStringLiteral("SELECT allowed_bands, updated_at FROM station_band_policy WHERE policy_id = 1")))
-        return QJsonObject{{"configured", false}, {"allowedBands", QJsonArray()}};
+        return QJsonObject{{"configured", true}, {"allowedBands", QJsonArray()},
+                           {"error", queryError(query)}};
     if (!query.next())
         return QJsonObject{{"configured", false}, {"allowedBands", QJsonArray()}};
     const QJsonDocument document = QJsonDocument::fromJson(query.value(0).toByteArray());
