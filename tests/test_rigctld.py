@@ -1,10 +1,32 @@
-"""Test the Hamlib rigctld emulation over TCP."""
+"""rigctld (Hamlib TCP) contract with the authenticated web interface.
+
+Since the login landed (#3) wfweb refuses to open the rigctld TCP port: the
+Hamlib protocol has no authentication, so listening there would bypass the
+web login. The server logs "rigctld disabled while the authenticated web
+interface is enabled" and carries on without it.
+
+Two halves:
+
+1. The pre-auth protocol tests, kept but skipped. The Hamlib parser code is
+   still in the tree, so deleting this coverage would hide regressions in
+   code that can come back (an authenticated variant or an explicit no-auth
+   mode). They include the SIGSEGV regression (commands without result
+   labels) and the IC-7300 Selected/Unselected VFO slots (#147). To run them
+   again, bring rigctld back and drop the skip marker.
+
+2. The non-exposure contract that replaced them: even with --rigctld-port
+   passed, nothing listens on the port, and the log pins the refusal as
+   deliberate.
+"""
 
 import re
 import socket
 import time
 
 import pytest
+
+rigctld_off = pytest.mark.skip(
+    reason="rigctld disabled while the authenticated web interface is on (#3)")
 
 
 def _rigctl(port, command, timeout=5.0):
@@ -27,6 +49,7 @@ def _rigctl(port, command, timeout=5.0):
         return lines
 
 
+@rigctld_off
 def test_get_freq(wfweb_instance, rigctld_port):
     """Sanity check: a regular get answers with a frequency and RPRT 0."""
     lines = _rigctl(rigctld_port, "+\\get_freq")
@@ -35,6 +58,7 @@ def test_get_freq(wfweb_instance, rigctld_port):
     assert lines[-1] == "RPRT 0"
 
 
+@rigctld_off
 @pytest.mark.parametrize("command", [
     "+\\get_clock", "\\get_clock",
     "+\\wait_morse", "\\wait_morse",
@@ -48,13 +72,13 @@ def test_command_without_result_labels_does_not_crash(wfweb_instance, rigctld_po
     assert proc.poll() is None, "wfweb exited"
 
 
+@rigctld_off
 def test_stop_morse_still_accepted(wfweb_instance, rigctld_port):
     """stop_morse has no result labels either but must keep working."""
     proc, _ = wfweb_instance
     lines = _rigctl(rigctld_port, "+\\stop_morse")
     assert lines[-1] == "RPRT 0"
     assert proc.poll() is None, "wfweb exited"
-
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +111,7 @@ def _poll_until(predicate, timeout=10.0):
     pytest.fail("condition not met in time")
 
 
+@rigctld_off
 def test_get_freq_reports_the_dial_in_integer_hz(wfweb_7300_instance, mock_radio_7300, rigctld_7300_port):
     """f follows the dial (the polled slot, not the last set) and prints the
     integer Hamlib prints; pat parses it with Atoi and rejected '160000.000000'."""
@@ -97,11 +122,13 @@ def test_get_freq_reports_the_dial_in_integer_hz(wfweb_7300_instance, mock_radio
     _poll_rigctl(rigctld_7300_port, "f", lambda l: l and l[0] == "14074000")
 
 
+@rigctld_off
 def test_get_vfo_names_the_operating_vfo(wfweb_7300_instance, rigctld_7300_port):
     """v answers VFOA on a server where no client has selected a VFO yet."""
     assert _rigctl(rigctld_7300_port, "v") == ["VFOA"]
 
 
+@rigctld_off
 def test_set_mode_pktusb_puts_the_rig_in_data_mode(wfweb_7300_instance, mock_radio_7300, rigctld_7300_port):
     """M PKTUSB goes out as 26 00 <USB> <data=1> <filter>, so WSJT-X / pat can
     put the rig in USB-D through wfweb; m reads PKTUSB back from the poll."""
@@ -114,6 +141,7 @@ def test_set_mode_pktusb_puts_the_rig_in_data_mode(wfweb_7300_instance, mock_rad
     _poll_rigctl(rigctld_7300_port, "m", lambda l: l and l[0] == "USB")
 
 
+@rigctld_off
 def test_quit_is_acknowledged(wfweb_7300_instance, rigctld_7300_port):
     """q answers RPRT 0 before the socket closes (Hamlib's close waits for it)."""
     with socket.create_connection(("127.0.0.1", rigctld_7300_port), timeout=5) as s:
@@ -125,3 +153,34 @@ def test_quit_is_acknowledged(wfweb_7300_instance, rigctld_7300_port):
                 break
             buf += chunk
     assert buf == b"RPRT 0\n"
+
+
+# ---------------------------------------------------------------------------
+# Non-exposure contract while auth is on
+# ---------------------------------------------------------------------------
+
+
+def _port_listens(port, timeout=2.0):
+    """True when something accepts a TCP connection on 127.0.0.1:port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def test_rigctld_port_stays_closed(wfweb_instance, rigctld_port):
+    """The requested rigctld port accepts no connections while auth is on."""
+    assert not _port_listens(rigctld_port)
+
+
+def test_rigctld_port_stays_closed_7300(wfweb_7300_instance, rigctld_7300_port):
+    """Same contract on the IC-7300 instance (its own requested port)."""
+    assert not _port_listens(rigctld_7300_port)
+
+
+def test_server_log_records_rigctld_disabled(wfweb_instance):
+    """The log pins the refusal as deliberate, not a silent bind failure."""
+    proc, _web_port = wfweb_instance
+    with open(proc.output_path, encoding="utf-8", errors="replace") as fh:
+        assert "rigctld disabled" in fh.read()

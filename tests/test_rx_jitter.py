@@ -35,10 +35,12 @@ def test_server_serves_rx_jitter(wfweb_instance):
 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     _, web_port = wfweb_instance
+    # Since the login landed, "/" is the landing page (home.html); the radio
+    # UI lives at /index.html behind the session.
     pages = {}
     for scheme in ("https", "http"):
         try:
-            for name in ("", "rx-jitter.js"):
+            for name in ("index.html", "rx-jitter.js"):
                 r = requests.get(f"{scheme}://127.0.0.1:{web_port}/{name}", timeout=5, verify=False)
                 assert r.status_code == 200, (scheme, name, r.status_code)
                 pages[name] = r.text
@@ -46,5 +48,5 @@ def test_server_serves_rx_jitter(wfweb_instance):
         except requests.exceptions.ConnectionError:
             continue
     assert pages, "web port unreachable over https and http"
-    assert 'src="rx-jitter.js"' in pages[""]
+    assert 'src="rx-jitter.js"' in pages["index.html"]
     assert "class WfJitterBuffer" in pages["rx-jitter.js"]

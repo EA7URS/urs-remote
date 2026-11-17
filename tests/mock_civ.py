@@ -29,6 +29,7 @@ CMD_MODE_SET = 0x06
 CMD_LEVEL = 0x14
 CMD_FUNC = 0x16
 CMD_METER = 0x15
+CMD_TRANSCEIVER = 0x1C  # sub 0x00: RX/TX state (PTT); sub 0x01: tuner
 CMD_POWER_CTRL = 0x18
 CMD_TRANSCEIVER_ID = 0x19
 CMD_RX_FREQ = 0x25
@@ -123,6 +124,7 @@ class CivRadioBase:
         self._swr: int = 10
         self._alc: int = 0
         self._power_meter: int = 0
+        self._ptt: bool = False  # TX state last written as CI-V 1C 00 <on>
 
         # Emulate a blank memory channel: a real IC-705 answers the frequency
         # and mode reads with a single 0xFF data byte instead of BCD digits.
@@ -134,6 +136,11 @@ class CivRadioBase:
     # ------------------------------------------------------------------
     # State setters (for test setup)
     # ------------------------------------------------------------------
+
+    @property
+    def frequency(self) -> int:
+        """Current dial frequency in Hz: the last value written over CI-V."""
+        return self._frequency
 
     def set_frequency(self, hz: int) -> None:
         self._frequency = hz
@@ -150,6 +157,14 @@ class CivRadioBase:
 
     def set_s_meter(self, value: int) -> None:
         self._s_meter = value
+
+    @property
+    def ptt(self) -> bool:
+        """Transmit state as a real radio holds it: the last 1C 00 write.
+        The server's REST /ptt cache is its own belief; this property is the
+        state a test can trust when it needs proof the radio itself stopped
+        transmitting."""
+        return self._ptt
 
     # ------------------------------------------------------------------
     # CI-V frame builders
@@ -235,6 +250,17 @@ class CivRadioBase:
                 return self.civ_ack(to, frm)
             return self.civ_frame(to, frm, CMD_FUNC, sub=SUB_COMPRESSOR,
                                   data=bytes([self.compressor]))
+
+        if cmd == CMD_TRANSCEIVER:
+            # 1C 00 <00|01> sets RX/TX; a bare 1C 00 reads the state back.
+            # Sub 0x01 (tuner) is acknowledged but not emulated.
+            if len(payload) >= 2 and payload[0] == 0x00:
+                self._ptt = payload[1] == 0x01
+                return self.civ_ack(to, frm)
+            if len(payload) == 1 and payload[0] == 0x00:
+                return self.civ_frame(to, frm, CMD_TRANSCEIVER, sub=0x00,
+                                      data=bytes([0x01 if self._ptt else 0x00]))
+            return self.civ_ack(to, frm)
 
         if cmd == CMD_POWER_CTRL:
             return self.civ_ack(to, frm)
